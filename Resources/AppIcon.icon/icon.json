@@ -1,0 +1,62 @@
+{
+  "fill": {
+    "automatic-gradient": "srgb:0.95500,0.95500,0.96500,1.00000"
+  },
+  "groups": [
+    {
+      "name": "Bubble",
+      "layers": [
+        {
+          "image-name": "Bubble.svg",
+          "name": "Bubble",
+          "position": {
+            "scale": 1,
+            "translation-in-points": [
+              0,
+              0
+            ]
+          }
+        }
+      ],
+      "lighting": "combined",
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.38
+      },
+      "specular": true,
+      "translucency": {
+        "enabled": true,
+        "value": 0.22
+      }
+    },
+    {
+      "name": "Prompt",
+      "layers": [
+        {
+          "image-name": "Prompt.svg",
+          "name": "Prompt",
+          "position": {
+            "scale": 1,
+            "translation-in-points": [
+              0,
+              0
+            ]
+          }
+        }
+      ],
+      "lighting": "combined",
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.44
+      },
+      "specular": true,
+      "translucency": {
+        "enabled": true,
+        "value": 0.18
+      }
+    }
+  ],
+  "supported-platforms": {
+    "squares": "shared"
+  }
+}
