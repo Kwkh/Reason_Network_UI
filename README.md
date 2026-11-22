@@ -2,23 +2,37 @@
 
 SwiftUI 原生消息控制台。界面不使用 WebView，不启动浏览器、HTTP 服务或 Python。系统要求 macOS 14+，工程使用 Xcode 26.5 验证。
 
-## 运行
+## 安装与首次配置
 
-打开 `Reason Network.xcodeproj`，选择共享 Scheme **Reason Network**，Run。
-工程默认使用本机临时签名，不需要修改 Apple Developer 账号或生成证书。
+从 [GitHub Releases](https://github.com/Kwkh/Reason_Network_UI/releases) 下载 Universal DMG，将 App 拖入 Applications。当前预览包使用本地临时签名，尚未完成 Developer ID 签名与公证；首次打开可能需要在系统设置 → 隐私与安全性中允许。系统没有允许入口时，可从源码在 Xcode 中运行。请勿关闭 Gatekeeper。
 
-本机需要已经安装并配置 `~/.local/bin/reason-network`，Codex 会话需要已接入 Reason Network。App 不代替官方后台服务，也不创建新的 UI 身份。
+首次启动自动检查官方后台、登录服务、Codex 接入与 Network 状态；已配置的机器直接进入聊天。新机流程：
+
+1. **安装并配置**：下载官方 `reason-network 0.12.17`，使用内置固定 SHA-256 校验，安装到 `~/.local/bin`，再调用官方 `setup` 配置已安装的代理 MCP / hooks 与登录后台服务，无需 sudo。
+2. **加入 Network**：在 App 内粘贴邀请链接、完整邀请行或四词一次性代码，填写名称。邀请方需要在线；同一身份的新机器请向原机器获取一次性代码。已有团队不会被替换；状态不明时先重新检查。
+3. **进入聊天**：重启 Codex 并在目标对话中发一条消息，会话即可出现。已配置但尚无在线会话时也可进入 UI。
+
+可从右上角状态面板的「环境配置」重新打开引导。安装失败可重试；加入超时后会重新检查成员状态，不自动重发。邀请凭证不保存到偏好设置，错误输出会隐藏完整邀请。
+
+同时支持 `~/.local/bin/reason-network` 和官方 Reason CLI 的 `~/.reason/bin/reason-network`；已有后台不会被覆盖。App 不创建 UI 专属会话，不迁移旧机器的会话或聊天缓存。当前主要面向 Codex，会话本身的即时推送仍由官方接入负责。
+
+## 从源码运行
+
+打开 `Reason Network.xcodeproj`，选择共享 Scheme **Reason Network**，Run。工程使用本机临时签名，不需要 Apple Developer 账号；Icon Composer 资源使用 Xcode 26.5 验证。
 
 ```sh
 xcodebuild -project 'Reason Network.xcodeproj' -scheme 'Reason Network' -configuration Release -derivedDataPath /tmp/reason-network-build build
 ./Tests/run-checks.sh
+./Tools/package-release.sh /tmp/reason-network-release
 ```
+
+打包脚本构建 arm64 / x86_64，检查架构与签名，并生成 DMG 和 `.sha256`。后台采用已验证的固定版本与内置摘要；更新后台版本时须同时更新两种架构的摘要并验证官方 CLI / 数据库兼容性。
 
 ## 界面与行为
 
-- 左上角切换队友会话，优先显示公开的 doing 标题，下方保留地址。这不是读取对方完整聊天或确认其侧边栏标题。
+- 使用工具栏的侧栏按钮展开或收起会话列表。侧栏顶部可切换本机会话，列表按队友分组，支持键盘选择；右侧标题下方显示所选会话的地址。切换时消息区短暂交叉淡化，并响应系统的减少动态效果设置。这不是读取对方完整聊天或确认其侧边栏标题。
 - 右上角在线状态打开设备面板：本机会话选择、push/turn/pull 接收模式、设备名、在线状态、连接方式及延迟；诊断可展开并刷新。
-- 消息按本机会话＋队友会话隔离，最近 100 条可见；切换时分别保留草稿。⌘ Return 发送，⌘ R 刷新。
+- 消息按本机会话＋队友会话隔离，最近 100 条可见；切换时分别保留草稿。Enter 发送、Shift + Enter 换行，⌘ R 刷新；长草稿在输入框内原生滚动。
 - 目录及消息约每 3 秒更新。App 的显示刷新与 Codex 的即时消息接收是独立机制；它不会把一个 pull 会话伪装为 push。
 - 只显示明确收集到的投递结果；已排队／已投递不等于对方已读。超时不自动重发。
 
@@ -32,13 +46,14 @@ Reason 引擎数据库 `~/.reason/network/network.db` 以 SQLite **只读**方�
 ## 结构
 
 - `ReasonNetworkApp.swift` / `ContentView.swift`：原生窗口与 SwiftUI 控件。
+- `SetupService.swift` / `SetupModel.swift` / `SetupView.swift`：环境检查、官方后台校验安装和首次配置界面。
 - `NetworkModel.swift`：主线程可观察状态，防止旧会话响应串入当前聊天。
 - `ReasonService.swift`：后台 actor，调用官方 CLI，接入现有缓存；发送前核验本机身份与接收会话。
 - `SQLiteStore.swift` / `TranscriptMirror.swift`：原生 SQLite 与只读日志镜像，无第三方运行时。
 - `Resources/AppIcon.icon`：当前实际编译的 Icon Composer 分层图标；`Assets/Bubble.svg` 与 `Assets/Prompt.svg` 是 1024×1024 画布的两层前景，`icon.json` 定义背景与材质。`Tools/Icon.swift` 和旧 PNG / ICNS 仅保留作绘制与对比参考。
 - `Tests/CoreChecks.swift`：隔离临时目录＋模拟 CLI，检查只读访问、held 消息排除、会话隔离、发送参数／正文、日志增量与半行恢复。不会向真实队友发测试消息。
 
-此本机配套工具需要访问用户目录内已配置的 CLI、数据库及日志，因此未开启 App Sandbox；仅供本机临时签名运行，不是已经完成公证或 App Store 发布的安装包。
+此配套工具需要访问用户目录内的 CLI、数据库及日志，因此未开启 App Sandbox。当前 DMG 为未公证的本地签名预览包，不是 App Store 安装包。
 
 ## 图标适配检查（2026-11-22）
 

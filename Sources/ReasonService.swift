@@ -3,13 +3,11 @@ import Darwin
 
 actor ReasonService {
     private let home: URL
-    private let executable: URL
     private var cache: SQLiteStore?
     private let mirror: TranscriptMirror
     private var migrated = false
     init(home: URL = FileManager.default.homeDirectoryForCurrentUser) {
         self.home = home
-        executable = home.appendingPathComponent(".local/bin/reason-network")
         mirror = TranscriptMirror(root: home.appendingPathComponent(".codex/sessions"))
     }
     func snapshot(local: String, peer: String) throws -> Snapshot {
@@ -91,7 +89,7 @@ actor ReasonService {
     }
     // Files avoid pipe-capacity deadlocks; the private temporary directory is removed after every command.
     private func run(_ arguments: [String], input: String? = nil, timeout: TimeInterval = 15) throws -> String {
-        guard FileManager.default.isExecutableFile(atPath: executable.path) else { throw NetworkError("未找到 Reason Network。请先安装并配置 ~/.local/bin/reason-network。") }
+        guard let executable = NetworkPaths.executable(home: home) else { throw NetworkError("未找到 Reason Network。请打开环境配置安装后台。") }
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("reason-native-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: folder) }

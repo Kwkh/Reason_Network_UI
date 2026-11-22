@@ -32,7 +32,7 @@ struct Device: Decodable, Identifiable, Equatable {
         return "在线 · " + route + (rttMs.map { " \(Int($0)) ms" } ?? "")
     }
 }
-struct Directory: Decodable {
+struct Directory: Decodable, Equatable {
     let team: String?
     let person: String
     let machine: String
@@ -62,6 +62,36 @@ struct Message: Identifiable, Equatable {
         return result.isEmpty ? "" : "已发送"
     }
 }
+// The service returns the latest 100 messages. While reading, replacing that window
+// can move or evict the visible paragraph. Keep at most one displayed window.
+struct ConversationReadingWindow {
+    private(set) var messages: [Message] = []
+    private(set) var hasPendingUpdate = false
+
+    /// Returns true when the view should pin the new layout to its bottom edge.
+    mutating func receive(_ latest: [Message], atBottom: Bool) -> Bool {
+        if latest == messages {
+            hasPendingUpdate = false
+            return false
+        }
+        if messages.isEmpty || latest.isEmpty || atBottom {
+            show(latest)
+            return !latest.isEmpty
+        }
+        if latest.starts(with: messages) {
+            show(latest)
+        } else {
+            hasPendingUpdate = true
+        }
+        return false
+    }
+
+    mutating func show(_ latest: [Message]) {
+        messages = latest
+        hasPendingUpdate = false
+    }
+}
+
 struct Snapshot {
     let directory: Directory
     let localSessions: [LocalSession]

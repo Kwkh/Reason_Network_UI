@@ -5,12 +5,15 @@ final class NetworkModel: ObservableObject {
     @Published var directory: Directory?
     @Published var locals: [LocalSession] = []
     @Published var messages: [Message] = []
+    @Published private(set) var waitingForHistory = true
     @Published var conversations: [String] = []
-    @Published var selectedLocal: String { didSet { UserDefaults.standard.set(selectedLocal, forKey: "selectedLocal"); changedConversation() } }
-    @Published var selectedPeer: String { didSet { UserDefaults.standard.set(selectedPeer, forKey: "selectedPeer"); changedConversation() } }
+    @Published var selectedLocal: String { didSet { guard oldValue != selectedLocal else { return }; UserDefaults.standard.set(selectedLocal, forKey: "selectedLocal"); changedConversation() } }
+    @Published var selectedPeer: String { didSet { guard oldValue != selectedPeer else { return }; UserDefaults.standard.set(selectedPeer, forKey: "selectedPeer"); changedConversation() } }
     @Published var drafts: [String: String] = [:]
     @Published var sending = false
-    @Published var refreshing = false
+    @Published private(set) var sentCount = 0
+    private var refreshing = false
+    private var refreshWaiters: [CheckedContinuation<Void, Never>] = []
     @Published var notice = ""
     @Published var error: String?
     @Published var mirrorWarning: String?
@@ -22,7 +25,7 @@ final class NetworkModel: ObservableObject {
     private var messageCache: [String: [Message]] = [:]
     init(service: ReasonService = ReasonService()) {
         self.service = service
-        selectedLocal = UserDefaults.standard.string(forKey: "selectedLocal") ?? "websites-codex"
+        selectedLocal = UserDefaults.standard.string(forKey: "selectedLocal") ?? ""
         selectedPeer = UserDefaults.standard.string(forKey: "selectedPeer") ?? ""
     }
     var conversationKey: String { selectedLocal + "/" + selectedPeer }
@@ -57,29 +60,50 @@ final class NetworkModel: ObservableObject {
         }
     }
     private func changedConversation() {
-        messages = messageCache[conversationKey] ?? []
+        let cached = messageCache[conversationKey]
+        waitingForHistory = cached == nil
+        messages = cached ?? []
         notice = ""
         Task { await refresh() }
     }
     func refresh() async {
-        guard !refreshing else { requestAgain = true; return }
+        guard !refreshing else {
+            requestAgain = true
+            await withCheckedContinuation { refreshWaiters.append($0) }
+            return
+        }
         refreshing = true
+        defer {
+            refreshing = false
+            let waiters = refreshWaiters
+            refreshWaiters.removeAll(keepingCapacity: true)
+            for waiter in waiters { waiter.resume() }
+        }
         repeat {
             requestAgain = false
             let local = selectedLocal, peer = selectedPeer
             do {
                 let snapshot = try await service.snapshot(local: local, peer: peer)
-                directory = snapshot.directory
-                locals = snapshot.localSessions
-                error = nil; mirrorWarning = snapshot.mirrorWarning
                 guard local == selectedLocal, peer == selectedPeer else { requestAgain = true; continue }
-                conversations = snapshot.conversations
+                if directory != snapshot.directory { directory = snapshot.directory }
+                if locals != snapshot.localSessions { locals = snapshot.localSessions }
+                if selectedLocal.isEmpty, let first = snapshot.localSessions.first {
+                    selectedLocal = first.name
+                    requestAgain = true
+                    continue
+                }
+                if error != nil { error = nil }
+                if mirrorWarning != snapshot.mirrorWarning { mirrorWarning = snapshot.mirrorWarning }
+                if waitingForHistory { waitingForHistory = false }
+                if conversations != snapshot.conversations { conversations = snapshot.conversations }
                 messageCache[conversationKey] = snapshot.messages
                 if messages != snapshot.messages { messages = snapshot.messages }
                 if selectedPeer.isEmpty, let first = peers.first { selectedPeer = first.address; requestAgain = true }
-            } catch { self.error = error.localizedDescription }
+            } catch {
+                guard local == selectedLocal, peer == selectedPeer else { requestAgain = true; continue }
+                self.error = error.localizedDescription
+            }
         } while requestAgain && !Task.isCancelled
-        refreshing = false
     }
     func send() async {
         guard canSend else { return }
@@ -90,6 +114,7 @@ final class NetworkModel: ObservableObject {
             if drafts[key] == body { drafts[key] = "" }
             if key == conversationKey { notice = status }
             await refresh()
+            if key == conversationKey { sentCount += 1 }
         } catch {
             if key == conversationKey { notice = error.localizedDescription + "；请确认投递状态后再重试。" }
         }

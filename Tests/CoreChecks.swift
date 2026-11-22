@@ -5,7 +5,33 @@ struct CoreChecks {
     static func expect(_ value: @autoclosure () throws -> Bool, _ message: String) throws {
         guard try value() else { throw NetworkError("FAIL: " + message) }
     }
+    static func checkReadingWindow() throws {
+        func sample(_ id: Int) -> Message {
+            Message(id: String(id), at: Double(id), local: "local", peer: "peer", direction: "in",
+                    body: "Message \(id)", result: "")
+        }
+
+        var window = ConversationReadingWindow()
+        let initial = (1...99).map(sample)
+        let full = initial + [sample(100)]
+        let next = (2...101).map(sample)
+        try expect(window.receive(initial, atBottom: false), "first load follows latest")
+        try expect(!window.receive(full, atBottom: false) && window.messages == full,
+                   "pure append leaves the reading position alone")
+        try expect(!window.receive(next, atBottom: false) && window.messages == full && window.hasPendingUpdate,
+                   "dropping the oldest row during reading preserves the displayed window")
+        let burst = (202...301).map(sample)
+        try expect(!window.receive(burst, atBottom: false) && window.messages == full,
+                   "a burst with no overlap still preserves the paragraph")
+        window.show(burst)
+        try expect(window.messages == burst && !window.hasPendingUpdate, "jump shows the latest snapshot")
+        try expect(!window.receive(burst, atBottom: true), "identical polling never scrolls")
+        try expect(window.receive(next, atBottom: true) && window.messages == next, "pinned view follows replacement")
+        try expect(!window.receive([], atBottom: false) && window.messages.isEmpty, "empty history clears visible rows")
+    }
+
     static func main() async throws {
+        try checkReadingWindow()
         let fm = FileManager.default
         let home = fm.temporaryDirectory.appendingPathComponent("reason-native-checks-" + UUID().uuidString)
         try fm.createDirectory(at: home, withIntermediateDirectories: true)
