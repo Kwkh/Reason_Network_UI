@@ -1,0 +1,328 @@
+diff --git a/src/daemon/directory.rs b/src/daemon/directory.rs
+--- a/src/daemon/directory.rs
++++ b/src/daemon/directory.rs
+@@ -147,7 +147,12 @@
+             rows.push(row);
+         }
+         if unmanaged {
+-            for c in claude.iter().filter(|c| !matched.contains(&c.pid)) {
++            for c in claude.iter().filter(|c| {
++                !matched.contains(&c.pid)
++                    && !c.session_id
++                        .as_ref()
++                        .is_some_and(|id| g.paused.contains(&format!("{}:{id}", agent::CLAUDE_CODE)))
++            }) {
+                 let cwd = c.cwd.clone().unwrap_or_default();
+                 let name = c.label().unwrap_or_else(|| format!("claude-{}", c.pid));
+                 let mut row = self.row(&name, agent::CLAUDE_CODE, &cwd, gits.get(&cwd));
+@@ -221,7 +226,11 @@
+ 
+     /// Claude Code sessions outside the folders that are off.
+     fn shared(&self, mut claude: Vec<ClaudeSession>) -> Vec<ClaudeSession> {
+-        claude.retain(|c| !c.cwd.as_deref().is_some_and(|d| self.cfg.off_in(d)));
++        let g = self.inner.lock().unwrap();
++        claude.retain(|c| {
++            !c.cwd.as_deref().is_some_and(|d| self.cfg.off_in(d))
++                && !c.session_id.as_ref().is_some_and(|id| g.paused.contains(&format!("{}:{id}", agent::CLAUDE_CODE)))
++        });
+         claude
+     }
+ 
+@@ -229,7 +238,7 @@
+     fn remembered(&self, g: &super::Inner) -> Vec<Remembered> {
+         let live: HashSet<&str> = g.live.values().map(|l| l.name.as_str()).collect();
+         let mut known = g.store.sessions().unwrap_or_default();
+-        known.retain(|r| !live.contains(r.name.as_str()) && !self.cfg.off_in(&r.cwd));
++        known.retain(|r| !live.contains(r.name.as_str()) && !self.cfg.off_in(&r.cwd) && !g.paused.contains(&r.key));
+         known
+     }
+ 
+diff --git a/src/daemon/mail.rs b/src/daemon/mail.rs
+--- a/src/daemon/mail.rs
++++ b/src/daemon/mail.rs
+@@ -610,7 +610,7 @@
+             self.prune(&mut g);
+             let key = g.live.iter().find(|(_, l)| l.name == name).map(|(k, _)| k.clone());
+             let remembered = if key.is_none() { g.store.session_by_name(name)? } else { None };
+-            if key.is_none() && remembered.as_ref().is_none_or(|r| self.cfg.off_in(&r.cwd)) {
++            if key.is_none() && remembered.as_ref().is_none_or(|r| self.cfg.off_in(&r.cwd) || g.paused.contains(&r.key)) {
+                 return Ok(("refused".into(), format!("no session called {} on {}", msg.to, self.machine)));
+             }
+             if g.store.has(&msg.id)? {
+diff --git a/src/daemon/mod.rs b/src/daemon/mod.rs
+--- a/src/daemon/mod.rs
++++ b/src/daemon/mod.rs
+@@ -72,7 +72,7 @@
+     }
+     tokio::spawn(crate::migrate::run(log));
+     tokio::spawn(daemon.clone().relays_loop());
+-    if update::allowed(daemon.cfg.auto_update) {
++    if std::env::var_os("REASON_NETWORK_LOCAL_PARTICIPATION").is_none() && update::allowed(daemon.cfg.auto_update) {
+         tokio::spawn(daemon.clone().update_loop());
+     }
+     loop {
+@@ -134,6 +134,7 @@
+ 
+ struct Inner {
+     store: Store,
++    paused: HashSet<String>,
+     live: HashMap<String, Live>,
+     conns: HashMap<u64, mpsc::UnboundedSender<String>>,
+     next_conn: u64,
+@@ -204,6 +205,7 @@
+     }
+ 
+     fn with(cfg: Config, store: Store, key: SecretKey) -> Result<Self> {
++        let paused = store.paused_sessions()?;
+         let team: Option<TeamState> =
+             store.get("team")?.and_then(|s| serde_json::from_str(&s).ok()).map(TeamState::without_odd_names);
+         // In a team, who we are is what the signed roster says, whatever the config file says.
+@@ -215,6 +217,7 @@
+             cfg,
+             inner: Mutex::new(Inner {
+                 store,
++                paused,
+                 live: HashMap::new(),
+                 conns: HashMap::new(),
+                 next_conn: 0,
+@@ -313,6 +316,14 @@
+ 
+     async fn handle(self: &Arc<Self>, conn: u64, req: Request) -> Result<Value> {
+         Ok(match req {
++            Request::SessionParticipation => {
++                let g = self.inner.lock().unwrap();
++                json!({ "version": 1, "paused": g.paused })
++            }
++            Request::SetSessionParticipation { key, paused } => {
++                self.set_session_participation(&key, paused)?;
++                json!({ "paused": paused })
++            }
+             Request::Register { session } => {
+                 let git = self.git(&session.cwd).await;
+                 json!(self.register(Some(conn), session, git)?)
+diff --git a/src/daemon/sessions.rs b/src/daemon/sessions.rs
+--- a/src/daemon/sessions.rs
++++ b/src/daemon/sessions.rs
+@@ -26,8 +26,37 @@
+ pub(super) const FORGET_MS: i64 = 24 * 3_600_000;
+ /// A session in a folder that is off counts as mid-turn this long after its last prompt or tool call.
+ const OFF_TURN_MS: i64 = 10 * 60_000;
++const SESSION_PAUSED: &str = "this session was disconnected from Reason Network by its user";
+ 
+ impl Daemon {
++    pub(super) fn set_session_participation(&self, key: &str, paused: bool) -> Result<()> {
++        let mut g = self.inner.lock().unwrap();
++        if paused && !g.live.contains_key(key) && g.store.session_by_key(key)?.is_none() {
++            bail!("this session is not registered");
++        }
++        if !paused && g.paused.contains(key)
++            && let Some(session) = g.store.session_by_key(key)?
++        {
++            g.store.touch_session(&session.name, util::now_ms())?;
++        }
++        g.store.set_session_paused(key, paused)?;
++        if paused {
++            g.paused.insert(key.to_owned());
++            if let Some(live) = g.live.remove(key) {
++                let busy = live.status.as_ref().is_some_and(|(status, _)| status == "busy");
++                g.off.insert(key.to_owned(), (busy, util::now_ms()));
++            }
++        } else {
++            g.paused.remove(key);
++            g.off.remove(key);
++        }
++        g.codex_watch.remove(key);
++        drop(g);
++        self.arrived.notify_waiters();
++        self.presence_changed();
++        Ok(())
++    }
++
+     /// How fast hooks let us reach an agent's session (`push_failed`: its push channel didn't work).
+     fn hook_tier(&self, agent: &str, push_failed: bool) -> Tier {
+         match agent {
+@@ -66,6 +95,9 @@
+         let mut g = self.inner.lock().unwrap();
+         let g = &mut *g;
+         let key = reg.key.clone();
++        if g.paused.contains(&key) {
++            bail!(SESSION_PAUSED);
++        }
+         // Its hooks said its folder is off (an MCP server several sessions share can't know its folder).
+         if g.off.contains_key(&key) {
+             bail!(OFF_HERE);
+@@ -238,12 +270,14 @@
+     /// Before `key` takes `name`: a session that kept the name until it lapsed is forgotten, with the mail it never
+     /// read, which is never another session's. A session known only by its process leaves its mail to the name.
+     fn take_over(&self, g: &mut Inner, name: &str, key: &str) -> Result<()> {
+-        if let Some(r) = g.store.session_by_name(name)?
+-            && r.key != key
+-            && r.kept()
+-        {
+-            log(&format!("{} lapsed: a new session takes the name", self.addr(name)));
+-            g.store.forget_session(&r, &self.person)?;
++        if let Some(r) = g.store.session_by_name(name)? && r.key != key {
++            if g.paused.contains(&r.key) {
++                bail!("this name is reserved for a disconnected session");
++            }
++            if r.kept() {
++                log(&format!("{} lapsed: a new session takes the name", self.addr(name)));
++                g.store.forget_session(&r, &self.person)?;
++            }
+         }
+         Ok(())
+     }
+@@ -322,26 +356,25 @@
+         let key = format!("{agent}:{session_id}");
+         let now = util::now_ms();
+         // In a folder that is off, by any folder the agent names: never a session here, only noted as off.
+-        if cwd.iter().chain(&dirs).any(|d| self.cfg.off_in(d)) {
++        let folder_off = cwd.iter().chain(&dirs).any(|d| self.cfg.off_in(d));
++        {
+             let mut g = self.inner.lock().unwrap();
+-            if let Some(l) = g.live.remove(&key) {
+-                let _ = g.store.touch_session(&l.name, now);
+-                self.presence_changed();
+-            }
+-            match event {
+-                "end" => {
+-                    g.off.remove(&key);
++            let session_paused = g.paused.contains(&key);
++            if folder_off || session_paused {
++                if let Some(l) = g.live.remove(&key) {
++                    let _ = g.store.touch_session(&l.name, now);
++                    self.presence_changed();
+                 }
+-                "doing" => {}
+-                _ => {
+-                    g.off.insert(key, (matches!(event, "prompt" | "tool"), now));
++                match event {
++                    "end" => { g.off.remove(&key); }
++                    "doing" => {}
++                    _ => { g.off.insert(key, (matches!(event, "prompt" | "tool"), now)); }
+                 }
+-            }
+-            // Hooks print nothing either way; `listen --as` says why.
+-            bail!(OFF_HERE);
+-        }
+-        // Only in folders that are on (again): it left the one that is off.
+-        self.inner.lock().unwrap().off.remove(&key);
++                if session_paused { bail!(SESSION_PAUSED); }
++                bail!(OFF_HERE);
++            }
++            g.off.remove(&key);
++        }
+         if event == "end" {
+             let mut g = self.inner.lock().unwrap();
+             // Gemini's MCP server outlives a conversation (`/clear`): its hooks say when one ends.
+@@ -620,7 +653,8 @@
+     let live =
+         |n: &str| n == person || g.live.iter().any(|(k, l)| l.name == n && *k != reg.key) || elsewhere.live.contains(n);
+     let free = |n: &str| -> Result<bool> {
+-        let kept_here = g.store.session_by_name(n)?.is_some_and(|r| r.key != reg.key && holds(&r));
++        let kept_here = g.store.session_by_name(n)?
++            .is_some_and(|r| r.key != reg.key && (g.paused.contains(&r.key) || holds(&r)));
+         Ok(!live(n) && !kept_here && !elsewhere.kept.contains(n))
+     };
+     let asked = reg.name.as_deref().map(util::slug).filter(|s| !s.is_empty());
+@@ -730,6 +764,43 @@
+             files: Vec::new(),
+         };
+         d.inner.lock().unwrap().store.insert(&mut m, false).unwrap();
++    }
++
++    #[tokio::test]
++    async fn paused_session_rejects_hooks_and_mcp_until_explicitly_resumed() {
++        let d = std::sync::Arc::new(super::super::test_daemon(Default::default()));
++        let selected = claude("selected");
++        let nearby = claude("nearby");
++        let address = join(&d, selected.clone()).address;
++        let nearby_address = join(&d, nearby).address;
++        mail(&d, "waiting", address.split_once('/').unwrap().1);
++
++        d.set_session_participation(&selected.key, true).unwrap();
++        let result = d.register_quiet(Some(conn_of(&selected.key)), selected.clone(), GitInfo::default());
++        assert!(result.is_err());
++        let hook = HookCall {
++            agent: selected.agent.clone(),
++            event: "prompt".into(),
++            session_id: "selected".into(),
++            cwd: Some(selected.cwd.clone()),
++            pid: None,
++            mail: true,
++            transcript: None,
++            doing: None,
++            name: None,
++            dirs: Vec::new(),
++            keep: false,
++        };
++        assert!(d.hook(hook).await.is_err());
++        let directory = d.who(None, None, true).await.unwrap();
++        assert!(!directory.sessions.iter().any(|s| s.address == address));
++        assert!(directory.sessions.iter().any(|s| s.address == nearby_address));
++        assert!(d.inner.lock().unwrap().store.paused_sessions().unwrap().contains(&selected.key));
++
++        d.set_session_participation(&selected.key, false).unwrap();
++        let resumed = join(&d, selected);
++        assert_eq!(resumed.address, address);
++        assert_eq!(resumed.unread, 1);
+     }
+ 
+     #[test]
+diff --git a/src/proto.rs b/src/proto.rs
+--- a/src/proto.rs
++++ b/src/proto.rs
+@@ -90,6 +90,11 @@
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ #[serde(tag = "op", rename_all = "snake_case")]
+ pub enum Request {
++    SessionParticipation,
++    SetSessionParticipation {
++        key: String,
++        paused: bool,
++    },
+     Register {
+         session: SessionReg,
+     },
+diff --git a/src/store.rs b/src/store.rs
+--- a/src/store.rs
++++ b/src/store.rs
+@@ -115,6 +115,7 @@
+     mailbox INTEGER NOT NULL DEFAULT 0
+ );
+ CREATE INDEX IF NOT EXISTS sessions_key ON sessions (key);
++CREATE TABLE IF NOT EXISTS paused_sessions (key TEXT PRIMARY KEY NOT NULL);
+ CREATE TABLE IF NOT EXISTS counts (
+     day TEXT PRIMARY KEY,
+     sent INTEGER NOT NULL DEFAULT 0,
+@@ -522,12 +523,29 @@
+         Ok(())
+     }
+ 
++    pub fn paused_sessions(&self) -> Result<HashSet<String>> {
++        let mut statement = self.db.prepare("SELECT key FROM paused_sessions")?;
++        let rows = statement.query_map([], |row| row.get(0))?;
++        Ok(rows.collect::<rusqlite::Result<_>>()?)
++    }
++
++    pub fn set_session_paused(&self, key: &str, paused: bool) -> Result<()> {
++        let sql = if paused {
++            "INSERT OR IGNORE INTO paused_sessions(key) VALUES (?1)"
++        } else {
++            "DELETE FROM paused_sessions WHERE key = ?1"
++        };
++        self.db.execute(sql, [key])?;
++        Ok(())
++    }
++
+     /// Forgets the sessions not seen since `before`, other than `live` ones and the person's own mailboxes (`mailbox`), and
+     /// deletes the mail they never read, so a session that takes the name later doesn't get it (see `forget_session`).
+     pub fn forget_sessions(&self, before: i64, live: &HashSet<&str>, person: &str) -> Result<()> {
+         let mut st = self
+             .db
+-            .prepare_cached(&format!("SELECT {SESSION_COLS} FROM sessions WHERE last_seen < ?1 AND mailbox = 0"))?;
++            .prepare_cached(&format!("SELECT {SESSION_COLS} FROM sessions WHERE last_seen < ?1 AND mailbox = 0
++                                      AND key NOT IN (SELECT key FROM paused_sessions)"))?;
+         let gone: Vec<Remembered> = st.query_map([before], remembered)?.collect::<rusqlite::Result<_>>()?;
+         for r in gone.iter().filter(|r| !live.contains(r.name.as_str())) {
+             self.forget_session(r, person)?;

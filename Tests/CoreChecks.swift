@@ -36,7 +36,7 @@ struct CoreChecks {
 import json,sys,pathlib
 home=pathlib.Path(__file__).resolve().parents[2]
 if sys.argv[1]=='who':
- print(json.dumps({'team':'fixture','person':'me','machine':'fixture-mac','sessions':[{'address':'peer/remote','name':'remote','person':'peer','doing':'Remote title','tier':'push'}],'machines':[{'person':'me','machine':'fixture-mac','endpoint':'fixture','is_me':True,'online':True}]}))
+ print(json.dumps({'team':'fixture','person':'me','machine':'fixture-mac','sessions':[{'address':'peer/remote','name':'remote','person':'peer','doing':'Remote title','tier':'push'},{'address':'me/local','name':'local','person':'me','machine':'fixture-mac','agent':'codex','tier':'push'}],'machines':[{'person':'me','machine':'fixture-mac','endpoint':'fixture','is_me':True,'online':True}]}))
 elif sys.argv[1]=='send':
  (home/'sent.json').write_text(json.dumps({'args':sys.argv[2:],'body':sys.stdin.read()}))
  print('queued\nmessage id 01234567890123456789012345')
@@ -128,6 +128,22 @@ elif sys.argv[1] in ('stop','setup'):
     }
 
     static func checkConsole(home: URL, service: ReasonService) async throws {
+        let firstID = "127C3D3A-EDB3-4E45-AC68-6ED87BA77B06"
+        let secondID = "336CBFC5-259F-45B8-8880-E40513F32EC6"
+        let state = try SQLiteStore(home.appendingPathComponent(".codex/state_5.sqlite"), readOnly: false)
+        _ = try state.rows("CREATE TABLE threads(id TEXT,title TEXT,name TEXT,cwd TEXT,rollout_path TEXT,updated_at INTEGER,archived INTEGER)")
+        let work = home.appendingPathComponent("fixture-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        let transcript = home.appendingPathComponent(".codex/sessions/selected.jsonl")
+        try Data().write(to: transcript)
+        _ = try state.rows("INSERT INTO threads VALUES(?,?,?,?,?,100,0)", [firstID, "原始标题", "选中的会话", work.path, transcript.path])
+        _ = try state.rows("INSERT INTO threads VALUES(?,?,?,?,?,90,1)", [secondID, "同目录会话", "", work.path, ""])
+        let gemini = home.appendingPathComponent(".gemini/tmp/project/chats", isDirectory: true)
+        try FileManager.default.createDirectory(at: gemini, withIntermediateDirectories: true)
+        try Data(#"{"sessionId":"f30283ca19","kind":"session"}"#.utf8).write(to: gemini.appendingPathComponent("session.jsonl"))
+        let engine = try SQLiteStore(home.appendingPathComponent(".reason/network/network.db"), readOnly: false)
+        _ = try engine.rows("ALTER TABLE sessions ADD COLUMN cwd TEXT DEFAULT '/'")
+        _ = try engine.rows("ALTER TABLE sessions ADD COLUMN tier TEXT DEFAULT 'push'")
         let legacy = home.appendingPathComponent("Library/Application Support/Reason Network Console/history.json")
         let record: [String: Any] = ["id": "sent:old-console-send", "teamID": "fixture-team", "peer": "peer/remote",
                                      "body": "legacy console message", "date": 0, "outgoing": false, "status": "已收到", "unread": true,
@@ -141,6 +157,7 @@ elif sys.argv[1] in ('stop','setup'):
 import json, pathlib, socket, sqlite3, sys
 home = pathlib.Path(sys.argv[1])
 state = home / '.reason/network'
+paused = set()
 with socket.socket(socket.AF_UNIX) as server:
  server.bind(str(state / 'network.sock'))
  server.listen()
@@ -150,11 +167,23 @@ with socket.socket(socket.AF_UNIX) as server:
   with sock, sock.makefile('rb') as reader:
    request = json.loads(reader.readline())
    op = request['op']
-   assert op in ('team', 'hook') or request['key'] == 'cli:reason-network-console'
+   assert op in ('team', 'hook', 'session_participation', 'set_session_participation') or request['key'] == 'cli:reason-network-console'
    if op == 'team': result = {'team_id': 'fixture-team', 'relay_connected': True, 'udp': {'port': 41641}}
    elif op == 'hook':
-    assert request['session_id'] == 'reason-network-console'
-    result = {'address': 'me/console'}
+    if request['agent'] == 'cli':
+     assert request['session_id'] == 'reason-network-console'
+     assert request['event'] == 'stop' and request['pid'] == int(sys.argv[2])
+     result = {'address': 'me/console'}
+    else:
+     with (home / 'manual-joins.jsonl').open('a') as file:
+      file.write(json.dumps(request)+'\n')
+     result = {'address': 'me/selected-chat'}
+   elif op == 'session_participation':
+    result = {'version':1, 'paused':sorted(paused)}
+   elif op == 'set_session_participation':
+    if request['paused']: paused.add(request['key'])
+    else: paused.discard(request['key'])
+    result = {'paused':request['paused']}
    elif op == 'inbox':
     assert request['peek']
     result = {'messages':[{'id':'console-reply', 'from':'peer/remote', 'body':'reply to console',
@@ -169,7 +198,7 @@ with socket.socket(socket.AF_UNIX) as server:
 """#.write(to: serverScript, atomically: true, encoding: .utf8)
         let server = Process()
         server.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        server.arguments = [serverScript.path, home.path]
+        server.arguments = [serverScript.path, home.path, String(ProcessInfo.processInfo.processIdentifier)]
         let exited = DispatchSemaphore(value: 0)
         server.terminationHandler = { _ in exited.signal() }
         let stopServer = {
@@ -184,6 +213,23 @@ with socket.socket(socket.AF_UNIX) as server:
             try await Task.sleep(for: .milliseconds(25))
         }
         try expect(FileManager.default.fileExists(atPath: ready.path), "socket fixture ready")
+        let inventory = try await service.personalSessions()
+        let localChats = inventory.filter { $0.nativeID != nil }
+        try expect(localChats.count == 2 && localChats.first?.title == "选中的会话" && localChats.last?.archived == true,
+                   "both same-folder Codex sessions are listed with title and archive state")
+        try expect(inventory.contains { $0.agent == "gemini" && !$0.canJoin }, "abbreviated Gemini identity is listed without claiming it can be resumed")
+        let address = try await service.joinPersonalSession("codex:" + firstID)
+        try expect(address == "me/selected-chat", "join reports the address returned by the daemon")
+        let joinLog = try String(contentsOf: home.appendingPathComponent("manual-joins.jsonl"), encoding: .utf8)
+        let event = try JSONSerialization.jsonObject(with: Data(joinLog.utf8)) as? [String: Any]
+        try expect(event?["session_id"] as? String == firstID && event?["transcript"] as? String == transcript.resolvingSymlinksInPath().path &&
+                   event?["mail"] as? Bool == false && !joinLog.contains(secondID), "only the explicitly selected identity is sent to the daemon")
+        let left = try await service.leavePersonalSession("codex:fixture")
+        try expect(left == "me/local", "exit returns the selected address")
+        let afterLeaving = try await service.personalSessions()
+        try expect(afterLeaving.first { $0.id == "codex:fixture" }?.connection == .paused("me/local"), "paused status comes from the daemon")
+        let resumed = try await service.joinPersonalSession("codex:fixture")
+        try expect(resumed == "me/local", "a connection-key-only session can be allowed to reconnect")
         let codex = try await service.snapshot(local: "local", peer: "peer/remote")
         try expect(codex.consoleUnread == 2 && codex.team?.udp?.port == 41641, "console mail and diagnostic details available while using Codex")
         let page = try await service.snapshot(local: "console", peer: "peer/remote", limit: 1)

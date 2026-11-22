@@ -242,6 +242,19 @@ private struct ConversationSidebar: View {
 
         VStack(spacing: 0) {
             search(matches: matches).padding(.horizontal, 12).padding(.top, 14).padding(.bottom, 12)
+            Button { model.open(.personalSessions) } label: {
+                HStack(spacing: 8) {
+                    Label("我的会话", systemImage: "person.crop.rectangle")
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.right").font(.system(size: 8)).foregroundStyle(.secondary)
+                }
+                .font(.system(size: 12, weight: .medium))
+                .padding(.horizontal, 9).padding(.vertical, 7)
+                .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 7))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 12).padding(.bottom, 8)
 
             if people.isEmpty {
                 Text(searching ? "没有找到匹配的对话" : "暂无可选对话")

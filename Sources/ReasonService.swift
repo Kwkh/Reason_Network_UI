@@ -18,7 +18,9 @@ actor ReasonService {
         var locals = try engine.rows("SELECT name,key,doing FROM sessions WHERE agent='codex' AND attached=1 ORDER BY last_seen DESC").map { row in
             LocalSession(name: row["name"] ?? "", key: row["key"] ?? "", doing: directory.sessions.first { $0.person == directory.person && $0.name == row["name"] }?.doing ?? row["doing"])
         }
-        locals.append(.console)
+        let paused = try pausedSessionKeys(engine)
+        locals.removeAll { paused.contains($0.key) }
+        if !paused.contains(LocalSession.console.key) { locals.append(.console) }
         let cache = try store()
         var warning: String?
         let hasFiles = try engine.rows("PRAGMA table_info(messages)").contains { $0["name"] == "files" }
@@ -39,11 +41,13 @@ actor ReasonService {
                 do { try importConsoleHistory(teamID: teamID, mailbox: consoleMailbox, cache: cache) }
                 catch { warning = "独立控制台旧记录暂未导入：" + error.localizedDescription }
             }
-            do {
-                address = try console.register()
-                try console.sync(into: cache, mailbox: consoleMailbox)
+            if !paused.contains(LocalSession.console.key), try consoleIsEnabled() {
+                do {
+                    address = try console.register()
+                    try console.sync(into: cache, mailbox: consoleMailbox)
+                }
+                catch { warning = "独立控制台收件箱暂未同步：" + error.localizedDescription }
             }
-            catch { warning = "独立控制台收件箱暂未同步：" + error.localizedDescription }
         }
         let mailbox = local == LocalSession.console.name ? consoleMailbox : local
         if local == LocalSession.console.name && viewingConversation && !peer.isEmpty {
@@ -70,6 +74,7 @@ actor ReasonService {
         let key: String
         let mailbox: String
         if local == LocalSession.console.name {
+            guard try consoleIsEnabled() else { throw NetworkError("请在「我的会话」中重新接入独立控制台。") }
             let teamID = try? console.team().networkID
             mailbox = consoleKey(teamID: teamID, directory: directory)
             _ = try console.register()
@@ -106,6 +111,126 @@ actor ReasonService {
     }
     func diagnose() throws -> String { try run(["doctor"]) }
     func engineVersion() throws -> String { try run(["--version"]) }
+    func personalSessions() throws -> [PersonalSession] {
+        let directory = try? directory()
+        let participation = try? participationState()
+        let discovered = try PersonalSessionCatalog(home: home).discover()
+        var sessions = Dictionary(discovered.map { ($0.id, $0) },
+                                  uniquingKeysWith: { $0.updated > $1.updated ? $0 : $1 })
+        let enginePath = home.appendingPathComponent(".reason/network/network.db")
+        let knownRecords: [[String: String]]
+        if FileManager.default.fileExists(atPath: enginePath.path) {
+            let engine = try SQLiteStore(enginePath, readOnly: true)
+            knownRecords = try engine.rows("SELECT key,agent,name,cwd,doing,last_seen FROM sessions WHERE attached=1 OR tier!='none'")
+        } else {
+            knownRecords = []
+        }
+        for row in knownRecords {
+            guard let key = row["key"], let agent = row["agent"], let name = row["name"] else { continue }
+            let current = directory?.sessions.first {
+                $0.person == directory?.person && $0.machine == directory?.machine &&
+                $0.name == name && $0.agent == agent && $0.tier != "none"
+            }
+            let address = current?.id ?? directory.map { $0.person + "/" + name } ?? name
+            var item = sessions[key] ?? PersonalSession(id: key, agent: agent, title: row["doing"]?.nonEmpty ?? name,
+                                                         cwd: row["cwd"], updated: Date(timeIntervalSince1970: (Double(row["last_seen"] ?? "") ?? 0) / 1000))
+            item.canManageParticipation = participation != nil
+            if participation?.paused.contains(key) == true {
+                item.connection = .paused(address)
+            } else if current?.offline == false {
+                item.connection = .online(address)
+            } else {
+                item.connection = .offline(address)
+            }
+            sessions[key] = item
+        }
+        return sessions.values.sorted { ($0.updated, $0.id) > ($1.updated, $1.id) }
+    }
+    func joinPersonalSession(_ key: String) throws -> String {
+        guard let chosen = try personalSessions().first(where: { $0.id == key }), chosen.canJoin else {
+            throw NetworkError("这个会话还需要在原工具中打开，或已经在线。")
+        }
+        if case .paused = chosen.connection {
+            return try resumePersonalSession(chosen)
+        }
+        return try registerPersonalSession(chosen)
+    }
+    private func registerPersonalSession(_ chosen: PersonalSession) throws -> String {
+        if chosen.id == LocalSession.console.key {
+            let address = try console.register()
+            try setConsoleEnabled(true)
+            return address
+        }
+        guard let nativeID = chosen.nativeID, let cwd = chosen.cwd else {
+            throw NetworkError("这个会话需要在原工具中打开。")
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: cwd, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw NetworkError("会话的项目目录已不存在，无法接入。")
+        }
+        var payload: [String: Any] = ["op": "hook", "event": "stop", "agent": chosen.agent,
+                                      "session_id": nativeID, "cwd": cwd, "mail": false]
+        if let transcript = chosen.transcript { payload["transcript"] = transcript.path }
+        struct JoinReply: Decodable { let address: String? }
+        let reply = try console.decode(payload, as: JoinReply.self)
+        guard let address = reply.address?.nonEmpty else { throw NetworkError("引擎没有返回会话地址。") }
+        return address
+    }
+    func leavePersonalSession(_ key: String) throws -> String {
+        guard let chosen = try personalSessions().first(where: { $0.id == key }), chosen.canLeave else {
+            throw NetworkError("当前后台服务不支持退出该会话。")
+        }
+        let address: String
+        switch chosen.connection {
+        case .online(let value), .offline(let value): address = value
+        case .notJoined, .paused: throw NetworkError("该会话已经退出。")
+        }
+        try setParticipation(key, paused: true)
+        if key == LocalSession.console.key { try setConsoleEnabled(false) }
+        return address
+    }
+
+    private func resumePersonalSession(_ session: PersonalSession) throws -> String {
+        guard case .paused(let address) = session.connection else {
+            throw NetworkError("该会话无需恢复接入。")
+        }
+        try setParticipation(session.id, paused: false)
+        guard session.supportsImmediateJoin else { return address }
+        do {
+            return try registerPersonalSession(session)
+        } catch {
+            try setParticipation(session.id, paused: true)
+            throw error
+        }
+    }
+
+    private struct ParticipationState: Decodable { let version: Int; let paused: Set<String> }
+    private func participationState() throws -> ParticipationState {
+        let state = try console.decode(["op": "session_participation"], as: ParticipationState.self)
+        guard state.version == 1 else { throw NetworkError("后台服务的会话管理版本不兼容。") }
+        return state
+    }
+    private func setParticipation(_ key: String, paused: Bool) throws {
+        _ = try console.request(["op": "set_session_participation", "key": key, "paused": paused])
+        guard try participationState().paused.contains(key) == paused else {
+            throw NetworkError("后台服务没有确认会话状态，请刷新后重试。")
+        }
+    }
+    private func pausedSessionKeys(_ engine: SQLiteStore) throws -> Set<String> {
+        guard !(try engine.rows("SELECT name FROM sqlite_master WHERE type='table' AND name='paused_sessions'")).isEmpty else {
+            return []
+        }
+        return Set(try engine.rows("SELECT key FROM paused_sessions").compactMap { $0["key"] })
+    }
+
+    private func consoleIsEnabled() throws -> Bool {
+        let setting = try store().rows("SELECT value FROM ui_settings WHERE key='console_enabled'").first
+        return setting?["value"] != "0"
+    }
+    private func setConsoleEnabled(_ enabled: Bool) throws {
+        _ = try store().rows("INSERT OR REPLACE INTO ui_settings(key,value) VALUES('console_enabled',?)",
+                             [enabled ? "1" : "0"])
+    }
     func selfTest() throws -> Data {
         let network = try directory()
         let team = try console.team()
@@ -119,7 +244,10 @@ actor ReasonService {
         _ = try run(["stop"], timeout: 30)
         _ = try directory()
     }
-    func repair() throws { _ = try run(["setup"], timeout: 45) }
+    func repair() throws {
+        let args = (try? participationState()) == nil ? ["setup"] : ["setup", "--no-service"]
+        _ = try run(args, timeout: 45)
+    }
     func inviteLink() throws -> String {
         let output = try run(["link"])
         guard let link = TranscriptMirror.match(#"(https://reasonmachines\.com/network/join/[^\s]+)"#, in: output) else {
@@ -183,6 +311,7 @@ actor ReasonService {
         let file = folder.appendingPathComponent("messages.sqlite3")
         let database = try SQLiteStore(file, readOnly: false)
         try database.prepareEvents()
+        _ = try database.rows("CREATE TABLE IF NOT EXISTS ui_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
         let hasLegacy = try database.rows("SELECT name FROM sqlite_master WHERE type='table' AND name='messages'")
         if !hasLegacy.isEmpty {

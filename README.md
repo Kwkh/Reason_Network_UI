@@ -21,12 +21,14 @@ xcodebuild -project 'Reason Network.xcodeproj' -scheme 'Reason Network' -configu
 - ⌘ Return 发送，⌘ R 刷新。不同本机与队友会话有各自的草稿、附件和发送选项。历史区先显示最近 100 条，可继续加载更早的记录。接收的附件可在 Finder 中查看位置。
 - 侧栏底部可打开概览、会话目录和设置，也可用 ⌘1、⌘2、⌘4 打开，按 ⌘3 返回聊天。
 - 概览显示账号验证状态、在线会话、设备和控制台未读。会话目录按联系人和 Agent 分组，支持离线筛选、查看设备与项目详情和复制会话地址。
+- 「我的会话」（⌘5）显示这台 Mac 的 Codex（含归档）、Claude Code、Gemini CLI、Cursor、DeepSeek Harness 历史和引擎已经发现的会话。可逐条加入具有有效会话标识和工作目录的本地会话。其他会话可在原工具中打开。
+- 手动加入只登记所选会话。支持按会话管理的后台可使用「退出」停止指定会话登记和收件，保留地址和现有消息。重新接入会解除退出。对于只有进程标识的会话，可允许原工具重新连接。官方原版后台可继续浏览和手动加入会话。按会话退出需要[构建并配置兼容后台](Engine/README.md)。
 - 设置可查看引擎版本、中继和 UDP 端口、后台日志，运行并复制诊断，或复制邀请链接、重启服务、修复接入。重启和修复会先确认。
 
 ## 数据
 
 - 继续使用 wkh 版的 `~/.reason/network/local-ui/messages.sqlite3`，首次打开时升级缓存结构并保留原有记录。
-- App 打开时同步独立控制台，并读取旧控制台的 `~/Library/Application Support/Reason Network Console/history.json` 中与当前网络 ID 匹配的记录。新消息持久化后才确认收取，打开该对话才清除 App 未读标记。关闭 App 时只结束控制台会话，Reason Network 服务继续运行。
+- App 打开时同步独立控制台，并读取旧控制台的 `~/Library/Application Support/Reason Network Console/history.json` 中与当前网络 ID 匹配的记录。新消息持久化后才确认收取，打开该对话才清除 App 未读标记。退出 App 后，后台根据进程状态将独立控制台标记为离线。
 - Codex 身份的收件记录从引擎数据库只读获取，打开界面不会改变 Codex 的未读状态。已发记录只读取支持的成功发送日志，复杂工具调用和较早日志可能不完整。
 - App 依赖官方 CLI 和本机守护进程。数据库及日志格式随版本变化时可能需要适配。附件由引擎保留，过期后界面仍可能显示文件名。
 

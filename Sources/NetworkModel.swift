@@ -6,6 +6,7 @@ final class NetworkModel: ObservableObject {
     enum UtilityPage: String, CaseIterable, Identifiable {
         case overview = "概览"
         case sessions = "会话"
+        case personalSessions = "我的会话"
         case settings = "设置"
         var id: Self { self }
     }
@@ -32,6 +33,11 @@ final class NetworkModel: ObservableObject {
     @Published var team: ConsoleMailbox.Team?
     @Published var engineVersion = ""
     @Published var lastUpdate: Date?
+    @Published private(set) var mySessions: [PersonalSession] = []
+    @Published private(set) var loadingMySessions = false
+    @Published private(set) var changingSession: String?
+    @Published private(set) var mySessionsNotice: String?
+    @Published private(set) var mySessionsError: String?
     @Published var selectedLocal: String {
         didSet {
             guard oldValue != selectedLocal else { return }
@@ -97,6 +103,7 @@ final class NetworkModel: ObservableObject {
     var own: LocalSession? { locals.first { $0.name == selectedLocal } }
     var canSend: Bool {
         !sending && error == nil && own != nil && peer?.acceptsMessages == true &&
+        (selectedLocal != LocalSession.console.name || consoleAddress != nil) &&
         !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
     var online: Bool { directory != nil && error == nil }
@@ -169,6 +176,49 @@ final class NetworkModel: ObservableObject {
     func open(_ page: UtilityPage) {
         utilityPage = page
         showsUtilities = true
+    }
+    func refreshMySessions() async {
+        guard !loadingMySessions else { return }
+        loadingMySessions = true
+        defer { loadingMySessions = false }
+        do {
+            mySessions = try await service.personalSessions()
+            mySessionsError = nil
+        } catch {
+            mySessionsError = error.localizedDescription
+        }
+    }
+    func joinMySession(_ session: PersonalSession) async {
+        guard session.canJoin else { return }
+        await changeMySession(session, joining: true)
+    }
+    func leaveMySession(_ session: PersonalSession) async {
+        guard session.canLeave else { return }
+        await changeMySession(session, joining: false)
+    }
+    private func changeMySession(_ session: PersonalSession, joining: Bool) async {
+        guard changingSession == nil else { return }
+        changingSession = session.id
+        mySessionsNotice = nil
+        mySessionsError = nil
+        defer { changingSession = nil }
+        do {
+            if joining {
+                let address = try await service.joinPersonalSession(session.id)
+                if case .paused = session.connection, !session.supportsImmediateJoin {
+                    mySessionsNotice = "已允许 \(address) 重新接入"
+                } else {
+                    mySessionsNotice = "已加入 \(address)"
+                }
+            } else {
+                let address = try await service.leavePersonalSession(session.id)
+                mySessionsNotice = "\(address) 已退出 Reason Network"
+            }
+            await refreshMySessions()
+            await refresh()
+        } catch {
+            mySessionsError = error.localizedDescription
+        }
     }
     func openConversation(_ session: NetworkSession) {
         if let directory, session.address == directory.person + "/" + selectedLocal, session.machine == directory.machine {

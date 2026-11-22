@@ -3,19 +3,12 @@ import AppKit
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    var consoleRegistered = false
-
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag { sender.windows.first { $0.canBecomeMain }?.makeKeyAndOrderFront(nil) }
         return true
     }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply { .terminateNow }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
-    func applicationWillTerminate(_ notification: Notification) {
-        if consoleRegistered {
-            let console = ConsoleMailbox(home: FileManager.default.homeDirectoryForCurrentUser)
-            _ = try? console.register(event: "end", timeout: 1)
-        }
-    }
 }
 
 struct ReasonNetworkApp: App {
@@ -24,14 +17,15 @@ struct ReasonNetworkApp: App {
     var body: some Scene {
         Window("Reason Network", id: "main") {
             ContentView().environmentObject(model)
-                .onChange(of: model.consoleAddress, initial: true) { _, address in
-                    if address != nil { delegate.consoleRegistered = true }
-                }
         }
         .defaultSize(width: 1000, height: 780)
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .newItem) { }
+            CommandGroup(replacing: .appTermination) {
+                Button("退出 Reason Network") { NSApplication.shared.terminate(nil) }
+                    .keyboardShortcut("q")
+            }
             CommandGroup(after: .appSettings) {
                 Button("设置…") { model.open(.settings) }.keyboardShortcut(",")
             }
@@ -40,6 +34,7 @@ struct ReasonNetworkApp: App {
                 Button("会话目录") { model.open(.sessions) }.keyboardShortcut("2")
                 Button("消息") { model.showsUtilities = false }.keyboardShortcut("3")
                 Button("设置") { model.open(.settings) }.keyboardShortcut("4")
+                Button("我的会话") { model.open(.personalSessions) }.keyboardShortcut("5")
                 Divider()
                 Button("刷新") { Task { await model.refresh() } }.keyboardShortcut("r")
             }

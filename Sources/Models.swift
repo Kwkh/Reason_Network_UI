@@ -17,7 +17,8 @@ struct NetworkSession: Decodable, Identifiable, Equatable {
     var target: String?
     var id: String { target ?? address }
     var title: String { doing?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? name }
-    var agentName: String {
+    var agentName: String { Self.agentDisplayName(agent) }
+    static func agentDisplayName(_ agent: String?) -> String {
         let names = ["codex": "Codex", "claude-code": "Claude Code", "cursor": "Cursor",
                      "gemini": "Gemini CLI", "cli": "终端与控制台", "reason": "Reason",
                      "dsh": "DeepSeek Harness", "deepseek": "DeepSeek Harness", "copilot": "Copilot CLI"]

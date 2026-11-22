@@ -12,7 +12,7 @@ struct NetworkUtilitiesView: View {
                 Picker("控制台页面", selection: $model.utilityPage) {
                     ForEach(NetworkModel.UtilityPage.allCases) { page in Text(page.rawValue).tag(page) }
                 }
-                .labelsHidden().pickerStyle(.segmented).frame(width: 224)
+                .labelsHidden().pickerStyle(.segmented).frame(width: 284)
                 Spacer(minLength: 0)
                 if let lastUpdate = model.lastUpdate {
                     Text("更新于 " + lastUpdate.formatted(date: .omitted, time: .standard))
@@ -29,12 +29,107 @@ struct NetworkUtilitiesView: View {
             switch model.utilityPage {
             case .overview: NetworkOverview()
             case .sessions: SessionDirectory()
+            case .personalSessions: PersonalSessionsView()
             case .settings: NetworkSettings()
             }
         }
         .frame(minWidth: 620, idealWidth: 720, minHeight: 490, idealHeight: 620)
         .background(colorScheme == .dark ? Color.black : Color.white)
         .tint(.primary)
+    }
+}
+
+private struct PersonalSessionsView: View {
+    @EnvironmentObject private var model: NetworkModel
+    @State private var query = ""
+    @State private var selectedAgent = ""
+
+    private var agents: [String] {
+        Set(model.mySessions.map(\.agentName)).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+    private var matches: [PersonalSession] {
+        model.mySessions.filter { (selectedAgent.isEmpty || $0.agentName == selectedAgent) && $0.matches(query) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("搜索本机会话或项目", text: $query).textFieldStyle(.plain)
+                }
+                .padding(8).background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+                Picker("工具", selection: $selectedAgent) {
+                    Text("全部工具").tag("")
+                    ForEach(agents, id: \.self) { Text($0).tag($0) }
+                }.labelsHidden().frame(width: 135)
+                Button { Task { await model.refreshMySessions() } } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .disabled(model.loadingMySessions).help("刷新本机会话").accessibilityLabel("刷新本机会话")
+            }
+            .padding(.horizontal, 22).padding(.top, 16)
+
+            if let status = model.mySessionsError ?? model.mySessionsNotice {
+                Text(status).font(.system(size: 12)).textSelection(.enabled).padding(.horizontal, 22)
+            }
+            if matches.isEmpty {
+                Group {
+                    if model.loadingMySessions { ProgressView().controlSize(.small) }
+                    else { Text(query.isEmpty ? "暂无本机会话" : "没有找到匹配的会话").font(.system(size: 12)).foregroundStyle(.secondary) }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 7) {
+                        ForEach(matches) { session in sessionRow(session) }
+                    }
+                    .padding(.horizontal, 22).padding(.bottom, 20)
+                }
+            }
+        }
+        .task { await model.refreshMySessions() }
+    }
+
+    private func sessionRow(_ session: PersonalSession) -> some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(session.title).font(.system(size: 13, weight: .medium)).lineLimit(1).help(session.title)
+                let project = session.cwd.map { URL(fileURLWithPath: $0).lastPathComponent }.flatMap(\.nonEmpty)
+                Text(([session.agentName] + (project.map { [$0] } ?? []) + (session.archived ? ["已归档"] : [])).joined(separator: " · "))
+                    .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            Text(session.connection.label).font(.system(size: 11)).foregroundStyle(.secondary)
+            if model.changingSession == session.id {
+                ProgressView().controlSize(.small).frame(width: 56)
+            } else if session.canLeave {
+                Button("退出") { Task { await model.leaveMySession(session) } }
+                    .disabled(model.changingSession != nil)
+                    .help("停止该会话接入 Reason Network，直到你重新加入。")
+                    .accessibilityLabel("退出 \(session.title)")
+            } else if session.canJoin {
+                Button(joinTitle(session)) {
+                    Task { await model.joinMySession(session) }
+                }
+                .disabled(model.changingSession != nil)
+                .help("将这个会话加入当前 Reason Network")
+                .accessibilityLabel("加入 \(session.title)")
+            } else if session.connection == .notJoined {
+                Text("在原工具打开").font(.system(size: 11)).foregroundStyle(.secondary)
+            } else if case .online = session.connection {
+                Text("需要新版后台").font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+        }
+        .padding(10).background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func joinTitle(_ session: PersonalSession) -> String {
+        switch session.connection {
+        case .notJoined: "加入"
+        case .paused where !session.supportsImmediateJoin: "允许接入"
+        default: "重新接入"
+        }
     }
 }
 

@@ -45,10 +45,11 @@ struct ConsoleMailbox {
     var socketURL: URL { stateHome.appendingPathComponent("network.sock") }
     var legacyHistory: URL { home.appendingPathComponent("Library/Application Support/Reason Network Console/history.json") }
 
-    func register(event: String = "stop", timeout: Int = 5) throws -> String {
-        let payload: [String: Any] = ["op": "hook", "agent": "cli", "event": event, "session_id": "reason-network-console",
+    func register() throws -> String {
+        let payload: [String: Any] = ["op": "hook", "agent": "cli", "event": "stop", "session_id": "reason-network-console",
+                                      "pid": ProcessInfo.processInfo.processIdentifier,
                                       "name": LocalSession.console.name, "cwd": home.path, "mail": false, "keep": true]
-        return try JSONDecoder().decode(Registration.self, from: request(payload, timeout: timeout)).address
+        return try decode(payload, as: Registration.self).address
     }
 
     func team() throws -> Team { try decode(["op": "team"], as: Team.self) }
