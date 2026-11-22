@@ -1,47 +1,33 @@
-# Reason Network · macOS
+# Reason Network Chat
 
-SwiftUI 原生消息控制台。界面不使用 WebView，不启动浏览器、HTTP 服务或 Python。系统要求 macOS 14+，工程使用 Xcode 26.5 验证。
+原生 macOS 聊天窗口，整合 wkh 的 Reason Network UI 和 Samson 的独立控制台。使用系统 SF 与苹方字体，默认白底，可在状态面板切换黑底。沿用 wkh 的原版 Icon Composer 图标。
 
 ## 运行
 
-打开 `Reason Network.xcodeproj`，选择共享 Scheme **Reason Network**，Run。
-工程默认使用本机临时签名，不需要修改 Apple Developer 账号或生成证书。
+系统要求 macOS 14 或更新版本。本机需要安装并配置官方 Reason Network 引擎，可执行文件通常在 `~/.local/bin/reason-network` 或 `~/.reason/bin/reason-network`。以 Codex 身份发送时，该会话还需要已接入 Reason Network。
 
-本机需要已经安装并配置 `~/.local/bin/reason-network`，Codex 会话需要已接入 Reason Network。App 不代替官方后台服务，也不创建新的 UI 身份。
+解压 App 后可直接打开。App 使用本机临时签名，尚未进行 Apple 公证。其 App 标识与两个原版分开，可以并存。打开源代码中的 `Reason Network.xcodeproj`，选择共享 Scheme **Reason Network** 即可构建。
 
 ```sh
-xcodebuild -project 'Reason Network.xcodeproj' -scheme 'Reason Network' -configuration Release -derivedDataPath /tmp/reason-network-build build
+xcodebuild -project 'Reason Network.xcodeproj' -scheme 'Reason Network' -configuration Release -derivedDataPath /tmp/reason-network-chat-build build
 ./Tests/run-checks.sh
 ```
 
-## 界面与行为
+## 操作
 
-- 左上角切换队友会话，优先显示公开的 doing 标题，下方保留地址。这不是读取对方完整聊天或确认其侧边栏标题。
-- 右上角在线状态打开设备面板：本机会话选择、push/turn/pull 接收模式、设备名、在线状态、连接方式及延迟；诊断可展开并刷新。
-- 消息按本机会话＋队友会话隔离，最近 100 条可见；切换时分别保留草稿。⌘ Return 发送，⌘ R 刷新。
-- 目录及消息约每 3 秒更新。App 的显示刷新与 Codex 的即时消息接收是独立机制；它不会把一个 pull 会话伪装为 push。
-- 只显示明确收集到的投递结果；已排队／已投递不等于对方已读。超时不自动重发。
+- 左上角按工具分组切换会话，可看最近一条消息和未读数。⌘K 搜索名称、地址、工具、项目目录、仓库或分支。
+- 右上角查看在线设备、连接方式、延迟和接收方式，也可以切换本机发送身份。选择「独立控制台」后沿用旧版的 `console` 收件箱。
+- 输入区可添加 UTF-8 文本附件。每次最多 10 个，单个最多 256 KB，合计最多 512 KB。发送选项可控制是否唤醒队友会话、是否在队友电脑弹窗提醒。
+- ⌘ Return 发送，⌘ R 刷新。不同本机与队友会话有各自的草稿、附件和发送选项。历史区先显示最近 100 条，可继续加载更早的记录。接收的附件可在 Finder 中查看位置。
+- 右上角的状态面板可打开概览、会话目录和设置，也可用 ⌘1、⌘2、⌘4 打开，按 ⌘3 返回聊天。
+- 概览显示账号验证状态、在线会话、设备和控制台未读。会话目录支持离线筛选、设备和项目详情、复制会话地址。
+- 设置可查看引擎版本、中继和 UDP 端口、后台日志，运行并复制诊断，或复制邀请链接、重启服务、修复接入。重启和修复会先确认。
 
-## 数据兼容
+## 数据
 
-继续使用网页控制台的 `~/.reason/network/local-ui/messages.sqlite3`，不复制或删除原缓存；同一消息 ID 去重。迁移兼容原 messages 表和 events 表。
-Reason 引擎数据库 `~/.reason/network/network.db` 以 SQLite **只读**方式访问。不会调用 Inbox / Delivered，不改变 Codex 未读状态，不自动执行消息文字。
-只从 Codex JSONL 中镜像确认成功的 Reason send 工具记录，不展示普通聊天、文件或提示词。支持直接 MCP 调用及单次字面量参数 exec 调用；不求值变量、模板或任意代码。初次读取各日志末尾 8 MB，复杂调用、缺失／压缩日志和更早记录可能不完整。
-现有官方数据库和日志格式不是稳定公共 API，后续 Reason / Codex 升级可能需要适配。
+- 继续使用 wkh 版的 `~/.reason/network/local-ui/messages.sqlite3`，首次打开时升级缓存结构并保留原有记录。
+- App 打开时同步独立控制台，并读取旧控制台的 `~/Library/Application Support/Reason Network Console/history.json` 中与当前网络 ID 匹配的记录。新消息持久化后才确认收取，打开该对话才清除 App 未读标记。关闭 App 时只结束控制台会话，Reason Network 服务继续运行。
+- Codex 身份的收件记录从引擎数据库只读获取，打开界面不会改变 Codex 的未读状态。已发记录只读取支持的成功发送日志，复杂工具调用和较早日志可能不完整。
+- App 依赖官方 CLI 和本机守护进程。数据库及日志格式随版本变化时可能需要适配。附件由引擎保留，过期后界面仍可能显示文件名。
 
-## 结构
-
-- `ReasonNetworkApp.swift` / `ContentView.swift`：原生窗口与 SwiftUI 控件。
-- `NetworkModel.swift`：主线程可观察状态，防止旧会话响应串入当前聊天。
-- `ReasonService.swift`：后台 actor，调用官方 CLI，接入现有缓存；发送前核验本机身份与接收会话。
-- `SQLiteStore.swift` / `TranscriptMirror.swift`：原生 SQLite 与只读日志镜像，无第三方运行时。
-- `Resources/AppIcon.icon`：当前实际编译的 Icon Composer 分层图标；`Assets/Bubble.svg` 与 `Assets/Prompt.svg` 是 1024×1024 画布的两层前景，`icon.json` 定义背景与材质。`Tools/Icon.swift` 和旧 PNG / ICNS 仅保留作绘制与对比参考。
-- `Tests/CoreChecks.swift`：隔离临时目录＋模拟 CLI，检查只读访问、held 消息排除、会话隔离、发送参数／正文、日志增量与半行恢复。不会向真实队友发测试消息。
-
-此本机配套工具需要访问用户目录内已配置的 CLI、数据库及日志，因此未开启 App Sandbox；仅供本机临时签名运行，不是已经完成公证或 App Store 发布的安装包。
-
-## 图标适配检查（2026-11-22）
-
-原 AppIcon PNG 各尺寸均有效，但当前 macOS 对旧格式的处理使圆角白底显示为独立贴片；改为完整不透明 PNG 后仍能复现。当前 Xcode 资源构建阶段已改为 `Resources/AppIcon.icon`，由 actool 编译背景与前景，避免将白色画布作为前景一起缩放。前景不包含底板、预制圆角和阴影；系统生成最终外轮廓。Release Build 7 与严格验签通过，系统“关于”窗口确认双层底板已消除。后续请用 Icon Composer 编辑该 .icon 文件。
-
-图标材质更新：Build 8 使用气泡外框与终端符号两个玻璃组，开启 specular；translucency 分别为 0.22 / 0.18，neutral shadow 分别为 0.38 / 0.44，背景使用浅灰自动渐变。Release 构建、严格验签和实际“关于”窗口显示检查通过。无玻璃版本的资源备份位于原 Websites 工作区 deliverables/reason-network-icon-before-glass.zip。
+`Tests/run-checks.sh` 使用临时目录、模拟 CLI 和模拟 Unix socket，覆盖缓存升级、旧独立控制台历史导入、双身份、附件、发送参数、管理命令、未读标记、历史分页和 Codex 收件记录只读访问。已构建的 App 可用 `Contents/MacOS/Reason Network Chat --self-test` 检查本机服务。

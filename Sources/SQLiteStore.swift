@@ -37,10 +37,75 @@ final class SQLiteStore {
         }
     }
     private func failure() -> NetworkError { NetworkError(String(cString: sqlite3_errmsg(db))) }
+    func prepareEvents() throws {
+        let schema = """
+            (id TEXT NOT NULL, at REAL, local_session TEXT NOT NULL, peer TEXT, direction TEXT NOT NULL,
+             body TEXT, result TEXT, reply_to TEXT, attachments TEXT NOT NULL DEFAULT '', unread INTEGER,
+             PRIMARY KEY(id,local_session,direction))
+            """
+        _ = try rows("BEGIN IMMEDIATE")
+        do {
+            let columns = try rows("PRAGMA table_info(events)")
+            if columns.isEmpty {
+                _ = try rows("CREATE TABLE events " + schema)
+            } else if !columns.contains(where: { $0["name"] == "attachments" }) {
+                _ = try rows("CREATE TABLE events_updated " + schema)
+                _ = try rows("""
+                    INSERT INTO events_updated(id,at,local_session,peer,direction,body,result,reply_to)
+                    SELECT id,at,local_session,peer,direction,body,result,reply_to FROM events
+                    """)
+                _ = try rows("DROP TABLE events")
+                _ = try rows("ALTER TABLE events_updated RENAME TO events")
+            } else if !columns.contains(where: { $0["name"] == "unread" }) {
+                _ = try rows("ALTER TABLE events ADD COLUMN unread INTEGER")
+            }
+            _ = try rows("CREATE INDEX IF NOT EXISTS events_conversation ON events(local_session,peer,at)")
+            _ = try rows("COMMIT")
+        } catch {
+            _ = try? rows("ROLLBACK")
+            throw error
+        }
+    }
     func insert(_ event: Message) throws {
-        _ = try rows("INSERT OR IGNORE INTO events(id,at,local_session,peer,direction,body,result,reply_to) VALUES(?,?,?,?,?,?,?,?)", [event.id, String(event.at), event.local, event.peer, event.direction, event.body, event.result, event.replyTo ?? ""])
+        let files = event.attachments.isEmpty ? "" : String(decoding: try JSONEncoder().encode(event.attachments), as: UTF8.self)
+        _ = try rows("""
+            INSERT INTO events(id,at,local_session,peer,direction,body,result,reply_to,attachments,unread)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(id,local_session,direction) DO UPDATE SET
+                attachments=CASE WHEN events.attachments='' THEN excluded.attachments ELSE events.attachments END,
+                unread=COALESCE(events.unread,excluded.unread)
+            WHERE (events.attachments='' AND excluded.attachments!='') OR events.unread IS NULL
+            """, [event.id, String(event.at), event.local, event.peer, event.direction, event.body, event.result, event.replyTo ?? "", files,
+                  event.unread ? "1" : "0"])
+    }
+    func conversations(in mailbox: String) throws -> [ConversationSummary] {
+        try rows("""
+            SELECT peer, body, unread_count FROM (
+                SELECT peer, body, at, id, ROW_NUMBER() OVER (PARTITION BY peer ORDER BY at DESC,id DESC) AS rank,
+                       SUM(COALESCE(unread,0)) OVER (PARTITION BY peer) AS unread_count
+                FROM events WHERE local_session=?
+            ) WHERE rank=1 ORDER BY at DESC,id DESC
+            """, [mailbox]).compactMap { row in
+                guard let address = row["peer"] else { return nil }
+                return ConversationSummary(address: address, preview: row["body"] ?? "", unread: Int(row["unread_count"] ?? "") ?? 0)
+            }
+    }
+    func markRead(mailbox: String, peer: String) throws {
+        _ = try rows("UPDATE events SET unread=0 WHERE local_session=? AND peer=? AND unread=1", [mailbox, peer])
+    }
+    func unreadCount(in mailbox: String) throws -> Int {
+        let value = try rows("SELECT COUNT(*) AS total FROM events WHERE local_session=? AND unread=1", [mailbox]).first?["total"]
+        return Int(value ?? "") ?? 0
     }
     static func event(_ row: [String: String]) -> Message {
-        Message(id: row["id"] ?? "", at: Double(row["at"] ?? "") ?? 0, local: row["local_session"] ?? "", peer: row["peer"] ?? "", direction: row["direction"] ?? "", body: row["body"] ?? "", result: row["result"] ?? "", replyTo: row["reply_to"])
+        Message(id: row["id"] ?? "", at: Double(row["at"] ?? "") ?? 0, local: row["local_session"] ?? "", peer: row["peer"] ?? "", direction: row["direction"] ?? "", body: row["body"] ?? "", result: row["result"] ?? "", replyTo: row["reply_to"], attachments: attachments(row["attachments"]), unread: row["unread"] == "1")
+    }
+    static func attachments(_ value: String?) -> [MessageAttachment] {
+        guard let value, !value.isEmpty else { return [] }
+        struct SavedFiles: Decodable { let files: [MessageAttachment] }
+        let data = Data(value.utf8)
+        let decoder = JSONDecoder()
+        return (try? decoder.decode([MessageAttachment].self, from: data)) ??
+            (try? decoder.decode(SavedFiles.self, from: data).files) ?? []
     }
 }

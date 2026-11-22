@@ -7,10 +7,11 @@ struct CoreChecks {
     }
     static func main() async throws {
         let fm = FileManager.default
-        let home = fm.temporaryDirectory.appendingPathComponent("reason-native-checks-" + UUID().uuidString)
+        let home = URL(fileURLWithPath: "/tmp").appendingPathComponent("reason-checks-" + UUID().uuidString)
         try fm.createDirectory(at: home, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: home) }
-        for path in [".reason/network", ".local/bin", ".codex/sessions"] {
+        for path in [".reason/network/local-ui", ".local/bin", ".codex/sessions",
+                     "Library/Application Support/Reason Network Console"] {
             try fm.createDirectory(at: home.appendingPathComponent(path), withIntermediateDirectories: true)
         }
         let engineURL = home.appendingPathComponent(".reason/network/network.db")
@@ -20,6 +21,12 @@ struct CoreChecks {
         _ = try engine.rows("CREATE TABLE messages(id TEXT,sent_at INTEGER,sender TEXT,body TEXT,reply_to TEXT,recipient TEXT,held INTEGER,read_at INTEGER)")
         _ = try engine.rows("INSERT INTO messages VALUES('incoming',1000,'peer/remote','hello',NULL,'me/local',0,NULL)")
         _ = try engine.rows("INSERT INTO messages VALUES('held',2000,'peer/remote','hidden',NULL,'me/local',1,NULL)")
+        _ = try engine.rows("ALTER TABLE messages ADD COLUMN files TEXT")
+        _ = try engine.rows("UPDATE messages SET files=? WHERE id='incoming'",
+                            [#"{"dir":"fixture","bytes":5,"files":[{"name":"notes.txt"}]}"#])
+        let oldCache = try SQLiteStore(home.appendingPathComponent(".reason/network/local-ui/messages.sqlite3"), readOnly: false)
+        _ = try oldCache.rows("CREATE TABLE events (id TEXT PRIMARY KEY, at REAL, local_session TEXT, peer TEXT, direction TEXT, body TEXT, result TEXT, reply_to TEXT)")
+        _ = try oldCache.rows("INSERT INTO events VALUES('old-event',0,'local','old/peer','in','from the previous cache','',NULL)")
         let readonly = try SQLiteStore(engineURL, readOnly: true)
         do { _ = try readonly.rows("UPDATE messages SET read_at=5"); throw NetworkError("readonly mutation succeeded") }
         catch { try expect(error.localizedDescription != "readonly mutation succeeded", "engine must stay read-only") }
@@ -33,6 +40,9 @@ elif sys.argv[1]=='send':
  (home/'sent.json').write_text(json.dumps({'args':sys.argv[2:],'body':sys.stdin.read()}))
  print('queued\nmessage id 01234567890123456789012345')
 elif sys.argv[1]=='doctor': print('fixture healthy')
+elif sys.argv[1]=='link': print('Join the Reason Network: https://reasonmachines.com/network/join/fixture')
+elif sys.argv[1] in ('stop','setup'):
+ (home/'management.log').open('a').write(sys.argv[1]+'\n')
 """#
         let cli = home.appendingPathComponent(".local/bin/reason-network")
         try script.write(to: cli, atomically: true, encoding: .utf8)
@@ -40,7 +50,10 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         let service = ReasonService(home: home)
         let snapshot = try await service.snapshot(local: "local", peer: "peer/remote")
         try expect(snapshot.messages.count == 1, "held messages excluded")
+        try expect(snapshot.messages.first?.attachments.first?.name == "notes.txt", "engine attachment metadata decoded")
+        try expect(snapshot.conversations.first?.preview == "hello", "conversation preview uses the most recent message")
         try expect(snapshot.localSessions.first?.title == "Local title", "local title retained")
+        try expect(snapshot.localSessions.contains(.console), "standalone console available")
         try expect(snapshot.directory.sessions.first?.title == "Remote title", "remote title decoded")
         try expect(snapshot.directory.machines.first?.isMe == true, "snake case device fields decoded")
         let unread = try engine.rows("SELECT read_at FROM messages WHERE id='incoming'").first
@@ -57,8 +70,25 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         try expect(sent["args"] as? [String] == ["--from", "codex:fixture", "peer/remote", "-"], "sender identity preserved")
         let after = try await service.snapshot(local: "local", peer: "peer/remote")
         try expect(after.messages.filter(\.outgoing).count == 1, "successful outgoing cached")
-        let other = try await service.snapshot(local: "local", peer: "other/peer")
-        try expect(other.messages.isEmpty, "conversation isolation")
+        let other = try await service.snapshot(local: "local", peer: "old/peer")
+        try expect(other.messages.map(\.body) == ["from the previous cache"], "conversation isolation and cache migration")
+        let attachment = home.appendingPathComponent("notes.txt")
+        try Data("附件内容".utf8).write(to: attachment)
+        _ = try await service.send(local: "local", to: "peer/remote", body: "with a file", files: [attachment], wake: false, notify: true)
+        let fileSend = try JSONSerialization.jsonObject(with: Data(contentsOf: home.appendingPathComponent("sent.json"))) as! [String: Any]
+        try expect(fileSend["args"] as? [String] == ["--from", "codex:fixture", "--fyi", "--notify", "--file", attachment.path, "peer/remote", "-"],
+                   "attachment, wake and notification options passed to the CLI")
+        let badFile = home.appendingPathComponent("picture.bin")
+        try Data([0, 255]).write(to: badFile)
+        do { _ = try await service.send(local: "local", to: "peer/remote", body: "invalid file", files: [badFile]); throw NetworkError("binary attachment accepted") }
+        catch { try expect(error.localizedDescription != "binary attachment accepted", "binary attachments are rejected") }
+        try await service.restart()
+        try await service.repair()
+        let management = try String(contentsOf: home.appendingPathComponent("management.log"), encoding: .utf8)
+        try expect(management == "stop\nsetup\n", "service management uses the official commands")
+        let invite = try await service.inviteLink()
+        try expect(invite == "https://reasonmachines.com/network/join/fixture", "invite URL extracted")
+        try await checkConsole(home: home, service: service)
         let literal = TranscriptMirror.literalSend(#"text(await tools.mcp__reason_network__send_message({to:"peer/remote",message:"hi\nthere"}));"#)
         try expect(literal?["message"] as? String == "hi\nthere", "literal extraction")
         try expect(TranscriptMirror.literalSend(#"tools.mcp__reason_network__send_message({to:recipient,message:body})"#) == nil, "never evaluate variables")
@@ -78,6 +108,81 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         let events = try mirror.events(for: local)
         try expect(events.count == 1 && events.first?.body == "from agent", "incremental transcript recovery")
         try expect(try mirror.events(for: local).isEmpty, "transcript not duplicated")
-        print("PASS: native adapter, read-only inbox, held-message exclusion, conversation isolation, sender identity, literal extraction, partial JSONL, and send cache")
+        print("PASS: Codex and console mailboxes, migrations, attachment validation, send flags, service actions, read-only Codex history, and transcript recovery")
+    }
+
+    static func checkConsole(home: URL, service: ReasonService) async throws {
+        let legacy = home.appendingPathComponent("Library/Application Support/Reason Network Console/history.json")
+        let record: [String: Any] = ["id": "sent:old-console-send", "teamID": "fixture-team", "peer": "peer/remote",
+                                     "body": "legacy console message", "date": 0, "outgoing": false, "status": "已收到", "unread": true,
+                                     "files": [["name": "legacy.txt"]]]
+        var otherRecord = record
+        otherRecord["teamID"] = "different-team"
+        otherRecord["id"] = "other-team"
+        try JSONSerialization.data(withJSONObject: [record, otherRecord]).write(to: legacy)
+        let serverScript = home.appendingPathComponent("socket_fixture.py")
+        try #"""
+import json, pathlib, socket, sqlite3, sys
+home = pathlib.Path(sys.argv[1])
+state = home / '.reason/network'
+with socket.socket(socket.AF_UNIX) as server:
+ server.bind(str(state / 'network.sock'))
+ server.listen()
+ (home / 'socket-ready').touch()
+ while True:
+  sock, _ = server.accept()
+  with sock, sock.makefile('rb') as reader:
+   request = json.loads(reader.readline())
+   op = request['op']
+   assert op in ('team', 'hook') or request['key'] == 'cli:reason-network-console'
+   if op == 'team': result = {'team_id': 'fixture-team', 'relay_connected': True, 'udp': {'port': 41641}}
+   elif op == 'hook':
+    assert request['session_id'] == 'reason-network-console'
+    result = {'address': 'me/console'}
+   elif op == 'inbox':
+    assert request['peek']
+    result = {'messages':[{'id':'console-reply', 'from':'peer/remote', 'body':'reply to console',
+                          'sent_at':1763800000000, 'files':[{'name':'reply.txt'}]}]}
+   elif op == 'delivered':
+    assert request['ids'] == ['console-reply']
+    with sqlite3.connect(state / 'local-ui/messages.sqlite3') as cache:
+     assert cache.execute("SELECT id FROM events WHERE id='console-reply'").fetchone()
+    (home / 'console-acknowledged').touch()
+    result = {}
+   sock.sendall((json.dumps({'id': request['id'], 'ok': True, 'result': result}) + '\n').encode())
+"""#.write(to: serverScript, atomically: true, encoding: .utf8)
+        let server = Process()
+        server.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        server.arguments = [serverScript.path, home.path]
+        let exited = DispatchSemaphore(value: 0)
+        server.terminationHandler = { _ in exited.signal() }
+        let stopServer = {
+            if server.isRunning { server.terminate() }
+            _ = exited.wait(timeout: .now() + 2)
+        }
+        try server.run()
+        defer { stopServer() }
+        let ready = home.appendingPathComponent("socket-ready")
+        for _ in 0..<100 {
+            if FileManager.default.fileExists(atPath: ready.path) { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        try expect(FileManager.default.fileExists(atPath: ready.path), "socket fixture ready")
+        let codex = try await service.snapshot(local: "local", peer: "peer/remote")
+        try expect(codex.consoleUnread == 2 && codex.team?.udp?.port == 41641, "console mail and diagnostic details available while using Codex")
+        let page = try await service.snapshot(local: "console", peer: "peer/remote", limit: 1)
+        try expect(page.hasEarlierMessages && page.messages.map(\.body) == ["reply to console"], "older console messages are paginated")
+        try expect(page.conversations.first?.unread == 2, "restored and new console unread counts")
+        let snapshot = try await service.snapshot(local: "console", peer: "peer/remote")
+        try expect(snapshot.messages.map(\.body) == ["legacy console message", "reply to console"], "console replies and matching legacy history")
+        try expect(snapshot.messages.last?.attachments.first?.name == "reply.txt", "console attachments decoded")
+        try expect(FileManager.default.fileExists(atPath: home.appendingPathComponent("console-acknowledged").path), "console acknowledges only after persistence")
+        let viewed = try await service.snapshot(local: "console", peer: "peer/remote", viewingConversation: true)
+        try expect(viewed.consoleUnread == 0, "viewing the console thread clears app unread state")
+        let seenAgain = try await service.snapshot(local: "console", peer: "peer/remote")
+        try expect(seenAgain.consoleUnread == 0, "repeated delivery does not mark read messages unread again")
+        _ = try await service.send(local: "console", to: "peer/remote", body: "from console")
+        let sent = try JSONSerialization.jsonObject(with: Data(contentsOf: home.appendingPathComponent("sent.json"))) as! [String: Any]
+        try expect(sent["args"] as? [String] == ["--from", "cli:reason-network-console", "peer/remote", "-"], "original console mailbox identity sent")
     }
 }
