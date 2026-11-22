@@ -6,6 +6,7 @@ struct CoreChecks {
         guard try value() else { throw NetworkError("FAIL: " + message) }
     }
     static func main() async throws {
+        try checkConversationGroups()
         let fm = FileManager.default
         let home = URL(fileURLWithPath: "/tmp").appendingPathComponent("reason-checks-" + UUID().uuidString)
         try fm.createDirectory(at: home, withIntermediateDirectories: true)
@@ -109,6 +110,21 @@ elif sys.argv[1] in ('stop','setup'):
         try expect(events.count == 1 && events.first?.body == "from agent", "incremental transcript recovery")
         try expect(try mirror.events(for: local).isEmpty, "transcript not duplicated")
         print("PASS: Codex and console mailboxes, migrations, attachment validation, send flags, service actions, read-only Codex history, and transcript recovery")
+    }
+
+    static func checkConversationGroups() throws {
+        let sessions = [
+            NetworkSession(address: "noa/chat-one", name: "chat-one", person: "noa", agent: "codex", repo: "chat"),
+            NetworkSession(address: "noa/chat-two", name: "chat-two", person: "noa", agent: "claude-code"),
+            NetworkSession(address: "li/chat-one", name: "chat-one", person: "li", agent: "codex"),
+            NetworkSession(address: "noa/archive", name: "archive", person: "noa", status: "offline")
+        ]
+        let people = PersonSessions.group(sessions)
+        try expect(people.map(\.name) == ["li", "noa"], "agent type never combines different contacts")
+        let noa = people.first { $0.name == "noa" }
+        try expect(noa?.agents.first { $0.name == "Codex" }?.sessions.map(\.id) == ["noa/chat-one"], "agent group is scoped to the contact")
+        try expect(noa?.agents.first { $0.name == "其他会话" }?.sessions.map(\.id) == ["noa/archive"], "offline historical conversations stay reachable")
+        try expect(sessions.filter { $0.matches("noa Codex chat") }.map(\.id) == ["noa/chat-one"], "search can match contact, agent and conversation together")
     }
 
     static func checkConsole(home: URL, service: ReasonService) async throws {

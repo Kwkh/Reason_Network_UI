@@ -1,18 +1,6 @@
 import AppKit
 import SwiftUI
 
-struct SessionGroup: Identifiable {
-    let name: String
-    let sessions: [NetworkSession]
-    var id: String { name }
-
-    static func group(_ sessions: [NetworkSession]) -> [Self] {
-        Dictionary(grouping: sessions, by: \.agentName)
-            .map { Self(name: $0.key, sessions: $0.value) }
-            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-    }
-}
-
 struct NetworkUtilitiesView: View {
     @EnvironmentObject private var model: NetworkModel
     @Environment(\.colorScheme) private var colorScheme
@@ -142,8 +130,8 @@ private struct SessionDirectory: View {
     @State private var query = ""
     @State private var detail: NetworkSession?
 
-    private var groups: [SessionGroup] {
-        SessionGroup.group(model.listedSessions.filter { (showOffline || !$0.offline) && $0.matches(query) })
+    private var people: [PersonSessions] {
+        PersonSessions.group(model.listedSessions.filter { (showOffline || !$0.offline) && $0.matches(query) })
     }
 
     var body: some View {
@@ -151,34 +139,26 @@ private struct SessionDirectory: View {
             HStack(spacing: 16) {
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                    TextField("搜索会话、工具或项目", text: $query).textFieldStyle(.plain)
+                    TextField("搜索人、Agent 或对话", text: $query).textFieldStyle(.plain)
                 }
                 .padding(9).background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
                 Toggle("显示离线", isOn: $showOffline).toggleStyle(.checkbox)
             }
             .padding(.horizontal, 24).padding(.top, 20)
-            if groups.isEmpty {
+            if people.isEmpty {
                 Text("没有匹配的会话").foregroundStyle(.secondary).frame(maxHeight: .infinity)
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 8) {
-                        ForEach(groups) { group in
-                            Text(group.name).font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
-                                .padding(.top, 6)
-                            ForEach(group.sessions) { session in
-                                HStack(spacing: 12) {
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(session.title).font(.system(size: 13, weight: .medium)).lineLimit(1)
-                                        Text(session.id).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1)
-                                    }
-                                    Spacer()
-                                    Text(session.statusText).font(.system(size: 11)).foregroundStyle(.secondary)
-                                    Button { detail = session } label: { Image(systemName: "info.circle") }
-                                        .buttonStyle(.plain).accessibilityLabel("会话详情").help("会话详情")
-                                    Button("发消息") { model.openConversation(session) }.disabled(!session.acceptsMessages)
+                        ForEach(people) { person in
+                            Text(person.name).font(.system(size: 15, weight: .semibold)).padding(.top, 9)
+                                .accessibilityAddTraits(.isHeader)
+                            ForEach(person.agents) { agent in
+                                Text(agent.name).font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                                    .padding(.top, 3)
+                                ForEach(agent.sessions) { session in
+                                    sessionRow(session)
                                 }
-                                .padding(10)
-                                .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 8))
                             }
                         }
                     }
@@ -187,6 +167,22 @@ private struct SessionDirectory: View {
             }
         }
         .sheet(item: $detail) { session in SessionDetails(session: session) }
+    }
+
+    private func sessionRow(_ session: NetworkSession) -> some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(session.title).font(.system(size: 13, weight: .medium)).lineLimit(1)
+                Text(session.id).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer()
+            Text(session.statusText).font(.system(size: 11)).foregroundStyle(.secondary)
+            Button { detail = session } label: { Image(systemName: "info.circle") }
+                .buttonStyle(.plain).accessibilityLabel("会话详情").help("会话详情")
+            Button("发消息") { model.openConversation(session) }.disabled(!session.acceptsMessages)
+        }
+        .padding(10)
+        .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 8))
     }
 }
 

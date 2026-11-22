@@ -31,10 +31,33 @@ struct NetworkSession: Decodable, Identifiable, Equatable {
         ["push": "即时推送", "turn": "下次操作时接收", "pull": "主动读取", "none": "未接入"][tier ?? ""] ?? "状态未知"
     }
     func matches(_ query: String) -> Bool {
-        let terms = [title, name, id, agent, agentName, repo, branch, machine, cwd].compactMap { $0 }.joined(separator: " ")
+        let terms = [person, title, name, id, agent, agentName, repo, branch, machine, cwd].compactMap { $0 }.joined(separator: " ")
         return query.split(whereSeparator: \.isWhitespace).allSatisfy { terms.localizedCaseInsensitiveContains(String($0)) }
     }
     enum CodingKeys: String, CodingKey { case address, name, person, machine, agent, repo, branch, cwd, doing, tier, status }
+}
+struct SessionGroup: Identifiable {
+    let name: String
+    let sessions: [NetworkSession]
+    var id: String { name }
+
+    static func group(_ sessions: [NetworkSession]) -> [Self] {
+        Dictionary(grouping: sessions, by: \.agentName)
+            .map { Self(name: $0.key, sessions: $0.value) }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+}
+struct PersonSessions: Identifiable {
+    let name: String
+    let sessions: [NetworkSession]
+    var id: String { name }
+    var agents: [SessionGroup] { SessionGroup.group(sessions) }
+
+    static func group(_ sessions: [NetworkSession]) -> [Self] {
+        Dictionary(grouping: sessions, by: \.person)
+            .map { Self(name: $0.key, sessions: $0.value) }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
 }
 struct Device: Decodable, Identifiable, Equatable {
     let person: String

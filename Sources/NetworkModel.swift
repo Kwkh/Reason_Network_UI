@@ -93,9 +93,6 @@ final class NetworkModel: ObservableObject {
         }
         return result.sorted { ($0.offline ? 1 : 0, $0.title, $0.id) < ($1.offline ? 1 : 0, $1.title, $1.id) }
     }
-    func summary(for session: NetworkSession) -> ConversationSummary? {
-        conversations.first { $0.address == session.id }
-    }
     var peer: NetworkSession? { peers.first { $0.id == selectedPeer } }
     var own: LocalSession? { locals.first { $0.name == selectedLocal } }
     var canSend: Bool {
@@ -158,10 +155,7 @@ final class NetworkModel: ObservableObject {
                 hasEarlierMessages = snapshot.hasEarlierMessages
                 messageCache[conversationKey] = snapshot.messages
                 if messages != snapshot.messages { messages = snapshot.messages }
-                if self.peer == nil, !peers.isEmpty {
-                    selectedPeer = conversations.first(where: { summary in peers.contains(where: { $0.id == summary.address }) })?.address ??
-                        peers.first(where: \.acceptsMessages)?.id ?? peers[0].id
-                }
+                if !selectedPeer.isEmpty, self.peer == nil { selectedPeer = "" }
             } catch {
                 if local == selectedLocal, peer == selectedPeer { self.error = error.localizedDescription }
             }

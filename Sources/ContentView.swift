@@ -7,23 +7,27 @@ struct ContentView: View {
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage("darkAppearance") private var darkAppearance = false
     @State private var showStatus = false
-    @State private var showConversations = false
     @State private var choosingFiles = false
     @State private var restoreScrollTo: String?
     @State private var nearBottom = true
     @FocusState private var composing: Bool
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            history
-            composer
+        HSplitView {
+            ConversationSidebar()
+                .frame(minWidth: 208, idealWidth: 250, maxWidth: 288, maxHeight: .infinity)
+            VStack(spacing: 0) {
+                header
+                Divider()
+                history
+                composer
+            }
+            .frame(minWidth: 454, maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(colorScheme == .dark ? Color.black : Color.white)
         .foregroundStyle(.primary)
         .tint(.primary)
         .preferredColorScheme(darkAppearance ? .dark : .light)
-        .frame(minWidth: 520, minHeight: 520)
+        .frame(minWidth: 680, minHeight: 520)
         .task { await model.start() }
         .sheet(isPresented: $model.showsUtilities, onDismiss: { Task { await model.refresh() } }) {
             NetworkUtilitiesView()
@@ -37,25 +41,13 @@ struct ContentView: View {
     }
     private var header: some View {
         HStack(spacing: 24) {
-            Button {
-                showConversations.toggle()
-            } label: {
-                VStack(alignment: .leading, spacing: 5) {
-                    HStack(spacing: 6) {
-                        Text(model.peer?.title ?? "选择会话")
-                            .font(.system(size: 20, weight: .semibold)).lineLimit(1)
-                        Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold))
-                    }
-                    Text(model.peer?.id ?? "Reason Network")
+            VStack(alignment: .leading, spacing: 5) {
+                Text(model.peer?.title ?? "Reason Network")
+                    .font(.system(size: 20, weight: .semibold)).lineLimit(1)
+                if let peer = model.peer {
+                    Text(peer.id)
                         .font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1)
                 }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .keyboardShortcut("k")
-            .accessibilityLabel("搜索或切换会话")
-            .popover(isPresented: $showConversations, arrowEdge: .bottom) {
-                ConversationPicker(isPresented: $showConversations)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             Spacer(minLength: 0)
@@ -74,7 +66,7 @@ struct ContentView: View {
                 .contentShape(Capsule())
             }
             .buttonStyle(.plain).help("设备状态与本机会话")
-            .popover(isPresented: $showStatus, arrowEdge: .bottom) { StatusView(isPresented: $showStatus) }
+            .popover(isPresented: $showStatus, arrowEdge: .bottom) { StatusView() }
         }
         .padding(.horizontal, 30).padding(.top, 14).padding(.bottom, 23)
     }
@@ -92,7 +84,7 @@ struct ContentView: View {
                             .padding(.vertical, 4)
                         }
                         if model.messages.isEmpty {
-                            Text(model.selectedPeer.isEmpty ? "选择一个会话" : "还没有消息")
+                            Text(model.selectedPeer.isEmpty ? "从侧栏选择对话" : "还没有消息")
                                 .font(.system(size: 14)).foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity).padding(.top, 70)
                         }
@@ -139,17 +131,20 @@ struct ContentView: View {
     private var composer: some View {
         VStack(spacing: 0) {
             VStack(spacing: 6) {
-                ZStack(alignment: .topLeading) {
-                    if model.draft.text.isEmpty {
-                        Text("输入消息…").foregroundStyle(.secondary).padding(.top, 8).padding(.leading, 5).allowsHitTesting(false)
+                TextEditor(text: $model.draft.text)
+                    .scrollContentBackground(.hidden)
+                    .font(.system(size: 14)).lineSpacing(4)
+                    .focused($composing)
+                    .accessibilityLabel("消息内容")
+                    .frame(height: 65)
+                    .overlay(alignment: .topLeading) {
+                        if model.draft.text.isEmpty && !composing {
+                            Text("输入消息…")
+                                .font(.system(size: 14)).foregroundStyle(.secondary)
+                                .padding(.top, 3).padding(.leading, 5)
+                                .allowsHitTesting(false).accessibilityHidden(true)
+                        }
                     }
-                    TextEditor(text: $model.draft.text)
-                        .scrollContentBackground(.hidden)
-                        .font(.system(size: 14)).lineSpacing(4)
-                        .focused($composing)
-                        .accessibilityLabel("消息内容")
-                        .frame(height: 65)
-                }
                 if !model.draft.files.isEmpty {
                     ScrollView(.horizontal) {
                         HStack(spacing: 6) {
@@ -225,89 +220,200 @@ struct ContentView: View {
     }
 }
 
-private struct ConversationPicker: View {
-    @EnvironmentObject private var model: NetworkModel
-    @Environment(\.colorScheme) private var colorScheme
-    @Binding var isPresented: Bool
-    @State private var query = ""
-    @FocusState private var searchFocused: Bool
-
-    private var results: [NetworkSession] {
-        model.peers.filter { $0.matches(query) }
+private struct ConversationSidebar: View {
+    private struct AgentKey: Hashable {
+        let person: String
+        let name: String
     }
 
+    @EnvironmentObject private var model: NetworkModel
+    @State private var query = ""
+    @State private var expandedPeople: Set<String> = []
+    @State private var expandedAgents: Set<AgentKey> = []
+    @FocusState private var searchFocused: Bool
+
+    private var searching: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    private var activeAgent: AgentKey? { model.peer.map { AgentKey(person: $0.person, name: $0.agentName) } }
+
     var body: some View {
-        VStack(spacing: 10) {
-            HStack(spacing: 9) {
-                Image(systemName: "magnifyingglass")
-                TextField("搜索会话、工具或项目", text: $query)
-                    .textFieldStyle(.plain)
-                    .focused($searchFocused)
-                    .onSubmit { if let first = results.first { select(first) } }
-                Button { Task { await model.refresh() } } label: { Image(systemName: "arrow.clockwise") }
-                    .buttonStyle(.plain).accessibilityLabel("刷新会话列表")
-            }
-            .padding(10).background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
-            if results.isEmpty {
-                Text(query.isEmpty ? "暂无可选会话" : "没有找到匹配的会话")
-                    .font(.system(size: 12)).foregroundStyle(.secondary).padding(16)
+        let matches = model.peers.filter { $0.matches(query) }
+        let people = PersonSessions.group(matches)
+        let summaries = Dictionary(uniqueKeysWithValues: model.conversations.map { ($0.address, $0) })
+
+        VStack(spacing: 0) {
+            search(matches: matches).padding(.horizontal, 12).padding(.top, 14).padding(.bottom, 12)
+
+            if people.isEmpty {
+                Text(searching ? "没有找到匹配的对话" : "暂无可选对话")
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .padding(.top, 18)
             } else {
                 ScrollView {
-                    VStack(spacing: 1) {
-                        ForEach(SessionGroup.group(results)) { group in
-                            Text(group.name).font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
-                                .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 8).padding(.vertical, 5)
-                            ForEach(group.sessions) { session in
-                                pickerRow(session)
+                    LazyVStack(spacing: 1) {
+                        ForEach(people) { person in
+                            let personExpanded = expandedPeople.contains(person.id)
+                            groupRow(person.name, icon: "person", indent: 8, expanded: personExpanded,
+                                     unread: unread(in: person.sessions, summaries: summaries)) {
+                                if personExpanded { expandedPeople.remove(person.id) }
+                                else { expandedPeople.insert(person.id) }
+                            }
+                            if personExpanded || searching {
+                                ForEach(person.agents) { agent in
+                                    let key = AgentKey(person: person.id, name: agent.id)
+                                    let agentExpanded = expandedAgents.contains(key)
+                                    groupRow(agent.name, icon: "terminal", indent: 23, expanded: agentExpanded,
+                                             unread: unread(in: agent.sessions, summaries: summaries)) {
+                                        if agentExpanded { expandedAgents.remove(key) }
+                                        else { expandedAgents.insert(key) }
+                                    }
+                                    if agentExpanded || searching {
+                                        ForEach(agent.sessions) { session in
+                                            conversationRow(session, summary: summaries[session.id])
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
+                    .padding(.horizontal, 8).padding(.bottom, 10)
                 }
-                .frame(height: min(340, CGFloat(results.count) * 63 + CGFloat(SessionGroup.group(results).count) * 22))
+                .frame(maxHeight: .infinity)
             }
+
             Divider()
-            Button("打开会话目录", systemImage: "sidebar.left") {
-                isPresented = false
-                model.open(.sessions)
+            HStack(spacing: 4) {
+                utilityButton("概览", icon: "square.grid.2x2", page: .overview)
+                utilityButton("会话目录", icon: "list.bullet", page: .sessions)
+                utilityButton("设置", icon: "gearshape", page: .settings)
             }
-            .buttonStyle(.plain).frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 5)
+            .padding(.horizontal, 6).padding(.vertical, 9)
         }
-        .padding(12).frame(width: 350)
-        .background(colorScheme == .dark ? Color.black : Color.white)
-        .onAppear { searchFocused = true }
+        .accessibilityIdentifier("conversation-sidebar")
+        .onChange(of: activeAgent, initial: true) { _, _ in revealSelected() }
+        .onChange(of: model.selectedPeer) { _, _ in revealSelected() }
     }
 
-    private func pickerRow(_ session: NetworkSession) -> some View {
-        let summary = model.summary(for: session)
-        return Button { select(session) } label: {
-            HStack(spacing: 10) {
+    private func search(matches: [NetworkSession]) -> some View {
+        HStack(spacing: 7) {
+            Button { searchFocused = true } label: {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain).keyboardShortcut("k")
+            .help("搜索对话（⌘K）").accessibilityLabel("聚焦对话搜索")
+
+            TextField("搜索人、Agent 或对话", text: $query)
+                .textFieldStyle(.plain).focused($searchFocused)
+                .accessibilityIdentifier("sidebar-conversation-search")
+                .onSubmit {
+                    if searching, matches.count == 1, let session = matches.first {
+                        reveal(session)
+                        model.openConversation(session)
+                        searchFocused = false
+                    }
+                }
+            if searching {
+                Button { query = "" } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain).accessibilityLabel("清除搜索")
+            } else {
+                Button { Task { await model.refresh() } } label: {
+                    Image(systemName: "arrow.clockwise").foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain).accessibilityLabel("刷新会话列表")
+            }
+        }
+        .font(.system(size: 12))
+        .padding(8).background(Color.primary.opacity(0.065), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder
+    private func groupRow(_ name: String, icon: String, indent: CGFloat, expanded: Bool,
+                          unread: Int, action: @escaping () -> Void) -> some View {
+        let label = HStack(spacing: 7) {
+            Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                .font(.system(size: 8, weight: .semibold)).frame(width: 10)
+                .foregroundStyle(.secondary).opacity(searching ? 0 : 1).accessibilityHidden(true)
+            Image(systemName: icon).font(.system(size: 11)).frame(width: 14)
+                .foregroundStyle(.secondary).accessibilityHidden(true)
+            Text(name).lineLimit(1)
+            Spacer(minLength: 0)
+            unreadBadge(unread)
+        }
+        .font(.system(size: 12, weight: .medium))
+        .padding(.leading, indent).padding(.trailing, 8).frame(height: 31)
+        .contentShape(Rectangle())
+
+        if searching {
+            label.accessibilityElement(children: .combine)
+        } else {
+            Button(action: action) { label }
+                .buttonStyle(.plain).accessibilityValue(expanded ? "已展开" : "已折叠")
+        }
+    }
+
+    private func conversationRow(_ session: NetworkSession, summary: ConversationSummary?) -> some View {
+        let active = session.id == model.selectedPeer
+        let subtitle = session.target != nil ? session.id : summary?.preview.nonEmpty ?? (session.title == session.name ? nil : session.name)
+        return Button {
+            reveal(session)
+            model.openConversation(session)
+            searchFocused = false
+        } label: {
+            HStack(spacing: 6) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(session.title).lineLimit(1)
-                    Text(session.id).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1)
-                    if let summary {
-                        Text(summary.preview).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                    Text(session.title).font(.system(size: 12, weight: active ? .semibold : .regular)).lineLimit(1)
+                    if let subtitle {
+                        Text(subtitle).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
                     }
                 }
                 Spacer(minLength: 0)
-                if let summary, summary.unread > 0 {
-                    Text("\(summary.unread)").font(.system(size: 11, weight: .semibold)).monospacedDigit()
-                        .accessibilityLabel("未读 \(summary.unread) 条")
-                }
                 if session.offline || session.tier == "none" {
-                    Text(session.statusText).foregroundStyle(.secondary).font(.system(size: 11))
+                    Text(session.statusText).font(.system(size: 10)).foregroundStyle(.secondary)
                 }
-                if session.id == model.selectedPeer { Image(systemName: "checkmark") }
+                unreadBadge(summary?.unread ?? 0)
             }
-            .padding(8)
-            .background(session.id == model.selectedPeer ? Color.primary.opacity(0.07) : .clear, in: RoundedRectangle(cornerRadius: 8))
+            .padding(.leading, 72).padding(.trailing, 8).padding(.vertical, 6)
+            .frame(minHeight: 30)
+            .background(active ? Color.primary.opacity(0.11) : .clear, in: RoundedRectangle(cornerRadius: 7))
             .contentShape(Rectangle())
-        }.buttonStyle(.plain)
+        }
+        .buttonStyle(.plain)
+        .help(session.id)
+        .accessibilityAddTraits(active ? .isSelected : [])
     }
 
-    private func select(_ session: NetworkSession) {
-        model.selectedPeer = session.id
-        isPresented = false
+    private func unread(in sessions: [NetworkSession], summaries: [String: ConversationSummary]) -> Int {
+        sessions.reduce(0) { $0 + (summaries[$1.id]?.unread ?? 0) }
+    }
+
+    @ViewBuilder
+    private func unreadBadge(_ count: Int) -> some View {
+        if count > 0 {
+            Text("\(count)")
+                .font(.system(size: 10, weight: .semibold)).monospacedDigit()
+                .accessibilityLabel("未读 \(count) 条")
+        }
+    }
+
+    private func utilityButton(_ title: String, icon: String, page: NetworkModel.UtilityPage) -> some View {
+        Button { model.open(page) } label: {
+            Label(title, systemImage: icon)
+                .font(.system(size: 11)).lineLimit(1)
+                .frame(maxWidth: .infinity).padding(.vertical, 5)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func revealSelected() {
+        if let session = model.peer { reveal(session) }
+    }
+
+    private func reveal(_ session: NetworkSession) {
+        expandedPeople.insert(session.person)
+        expandedAgents.insert(AgentKey(person: session.person, name: session.agentName))
     }
 }
 private struct ScrollPinObserver: ViewModifier {
@@ -390,7 +496,6 @@ struct StatusView: View {
     @EnvironmentObject private var model: NetworkModel
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage("darkAppearance") private var darkAppearance = false
-    @Binding var isPresented: Bool
     @State private var diagnostics = false
     var body: some View {
         ScrollView {
@@ -438,11 +543,6 @@ struct StatusView: View {
                     if device.id != model.directory?.machines.last?.id { Divider() }
                 }
                 Divider()
-                HStack {
-                    Button("概览") { open(.overview) }
-                    Button("会话目录") { open(.sessions) }
-                    Button("设置") { open(.settings) }
-                }.font(.system(size: 12))
                 NetworkServiceActions()
                 Toggle("深色外观", isOn: $darkAppearance)
                     .toggleStyle(.switch).controlSize(.small).font(.system(size: 12))
@@ -463,10 +563,6 @@ struct StatusView: View {
         .background(colorScheme == .dark ? Color.black : Color.white)
     }
 
-    private func open(_ page: NetworkModel.UtilityPage) {
-        isPresented = false
-        model.open(page)
-    }
 }
 
 struct NetworkServiceActions: View {

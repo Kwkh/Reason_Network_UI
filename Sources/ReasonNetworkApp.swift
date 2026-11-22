@@ -28,7 +28,7 @@ struct ReasonNetworkApp: App {
                     if address != nil { delegate.consoleRegistered = true }
                 }
         }
-        .defaultSize(width: 760, height: 780)
+        .defaultSize(width: 1000, height: 780)
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .newItem) { }
