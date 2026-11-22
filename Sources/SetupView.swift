@@ -98,7 +98,7 @@ struct SetupView: View {
                 .font(.system(size: 12)).buttonStyle(.plain).foregroundStyle(.secondary)
             }
             .padding(38).frame(maxWidth: 510, alignment: .leading)
-            .frame(maxWidth: .infinity, minHeight: 510)
+            .frame(maxWidth: .infinity, minHeight: 510, alignment: .top)
         }
         .background(Color(nsColor: .textBackgroundColor))
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: model.step)
