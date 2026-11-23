@@ -12,7 +12,8 @@ actor ReasonService {
         mirror = TranscriptMirror(root: home.appendingPathComponent(".codex/sessions"))
         console = ConsoleMailbox(home: home)
     }
-    func snapshot(local: String, peer: String, limit: Int = 100, viewingConversation: Bool = false) throws -> Snapshot {
+    func snapshot(local: String, peer: String, limit: Int = 100, viewingConversation: Bool = false,
+                  restoreConversation: Bool = false) throws -> Snapshot {
         let directory = try directory()
         let engine = try SQLiteStore(home.appendingPathComponent(".reason/network/network.db"), readOnly: true)
         var locals = try engine.rows("SELECT name,key,doing FROM sessions WHERE agent='codex' AND attached=1 ORDER BY last_seen DESC").map { row in
@@ -57,10 +58,34 @@ actor ReasonService {
         let messages = try cache.rows("""
             SELECT * FROM (SELECT * FROM events WHERE local_session=? AND peer=? ORDER BY at DESC,id DESC LIMIT ?) ORDER BY at,id
             """, [mailbox, peer, String(limit + 1)]).map(SQLiteStore.event)
-        return Snapshot(directory: directory, localSessions: locals, conversations: conversations, messages: Array(messages.suffix(limit)),
+        let restored = restoreConversation && conversations.isEmpty
+            ? try recentConversation(local: local, locals: locals, directory: directory,
+                                     consoleAddress: address, consoleMailbox: consoleMailbox, cache: cache)
+            : nil
+        return Snapshot(restoredConversation: restored, directory: directory, localSessions: locals,
+                        conversations: conversations, messages: Array(messages.suffix(limit)),
                         hasEarlierMessages: messages.count > limit, consoleUnread: try cache.unreadCount(in: consoleMailbox),
                         consoleAddress: address, team: team, mirrorWarning: warning)
     }
+    private func recentConversation(local: String, locals: [LocalSession], directory: Directory,
+                                    consoleAddress: String?, consoleMailbox: String,
+                                    cache: SQLiteStore) throws -> ConversationSelection? {
+        var online = Set(directory.sessions.filter {
+            $0.person == directory.person && $0.machine == directory.machine && !$0.offline && $0.tier != "none"
+        }.map(\.name))
+        if consoleAddress != nil { online.insert(LocalSession.console.name) }
+        else { online.remove(LocalSession.console.name) }
+        guard !online.contains(local) else { return nil }
+
+        let available = locals.filter { $0 != .console || consoleAddress != nil }
+        let mailbox: (LocalSession) -> String = { $0 == .console ? consoleMailbox : $0.name }
+        let active = available.filter { online.contains($0.name) }.map(mailbox)
+        let recent = try cache.mostRecentConversation(in: active)
+            ?? cache.mostRecentConversation(in: available.map(mailbox))
+        guard let recent, let identity = available.first(where: { mailbox($0) == recent.mailbox }) else { return nil }
+        return ConversationSelection(local: identity.name, peer: recent.peer)
+    }
+
     func send(local: String, to: String, body: String, files: [URL] = [], wake: Bool = true, notify: Bool = false) throws -> String {
         let content = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !content.isEmpty else { throw NetworkError("请先输入消息。") }

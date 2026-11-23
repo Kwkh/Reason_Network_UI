@@ -235,8 +235,8 @@ private struct ConversationSidebar: View {
 
     @EnvironmentObject private var model: NetworkModel
     @State private var query = ""
-    @State private var expandedPeople: Set<String> = []
-    @State private var expandedAgents: Set<AgentKey> = []
+    @State private var collapsedPeople: Set<String> = []
+    @State private var collapsedAgents: Set<AgentKey> = []
     @FocusState private var searchFocused: Bool
 
     private var searching: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -272,20 +272,20 @@ private struct ConversationSidebar: View {
                 ScrollView {
                     LazyVStack(spacing: 1) {
                         ForEach(people) { person in
-                            let personExpanded = expandedPeople.contains(person.id)
+                            let personExpanded = !collapsedPeople.contains(person.id)
                             groupRow(person.name, icon: "person", indent: 8, expanded: personExpanded,
                                      unread: unread(in: person.sessions, summaries: summaries)) {
-                                if personExpanded { expandedPeople.remove(person.id) }
-                                else { expandedPeople.insert(person.id) }
+                                if personExpanded { collapsedPeople.insert(person.id) }
+                                else { collapsedPeople.remove(person.id) }
                             }
                             if personExpanded || searching {
                                 ForEach(person.agents) { agent in
                                     let key = AgentKey(person: person.id, name: agent.id)
-                                    let agentExpanded = expandedAgents.contains(key)
+                                    let agentExpanded = !collapsedAgents.contains(key)
                                     groupRow(agent.name, icon: "terminal", indent: 23, expanded: agentExpanded,
                                              unread: unread(in: agent.sessions, summaries: summaries)) {
-                                        if agentExpanded { expandedAgents.remove(key) }
-                                        else { expandedAgents.insert(key) }
+                                        if agentExpanded { collapsedAgents.insert(key) }
+                                        else { collapsedAgents.remove(key) }
                                     }
                                     if agentExpanded || searching {
                                         ForEach(agent.sessions) { session in
@@ -432,8 +432,8 @@ private struct ConversationSidebar: View {
     }
 
     private func reveal(_ session: NetworkSession) {
-        expandedPeople.insert(session.person)
-        expandedAgents.insert(AgentKey(person: session.person, name: session.agentName))
+        collapsedPeople.remove(session.person)
+        collapsedAgents.remove(AgentKey(person: session.person, name: session.agentName))
     }
 }
 private struct ScrollPinObserver: ViewModifier {

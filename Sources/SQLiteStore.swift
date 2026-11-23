@@ -90,6 +90,16 @@ final class SQLiteStore {
                 return ConversationSummary(address: address, preview: row["body"] ?? "", unread: Int(row["unread_count"] ?? "") ?? 0)
             }
     }
+    func mostRecentConversation(in mailboxes: [String]) throws -> (mailbox: String, peer: String)? {
+        guard !mailboxes.isEmpty else { return nil }
+        let parameters = Array(repeating: "?", count: mailboxes.count).joined(separator: ",")
+        guard let row = try rows("""
+            SELECT local_session, peer FROM events WHERE local_session IN (\(parameters)) AND peer <> ''
+            ORDER BY at DESC, id DESC LIMIT 1
+            """, mailboxes).first, let mailbox = row["local_session"], let peer = row["peer"] else { return nil }
+        return (mailbox, peer)
+    }
+
     func markRead(mailbox: String, peer: String) throws {
         _ = try rows("UPDATE events SET unread=0 WHERE local_session=? AND peer=? AND unread=1", [mailbox, peer])
     }

@@ -124,7 +124,13 @@ struct ConversationSummary {
     let preview: String
     let unread: Int
 }
+struct ConversationSelection: Equatable {
+    let local: String
+    let peer: String
+}
+
 struct Snapshot {
+    let restoredConversation: ConversationSelection?
     let directory: Directory
     let localSessions: [LocalSession]
     let conversations: [ConversationSummary]

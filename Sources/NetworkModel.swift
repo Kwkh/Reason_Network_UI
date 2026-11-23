@@ -41,6 +41,7 @@ final class NetworkModel: ObservableObject {
     @Published var selectedLocal: String {
         didSet {
             guard oldValue != selectedLocal else { return }
+            restoreConversation = false
             UserDefaults.standard.set(selectedLocal, forKey: "selectedLocal")
             conversations = []
             changedConversation()
@@ -49,6 +50,7 @@ final class NetworkModel: ObservableObject {
     @Published var selectedPeer: String {
         didSet {
             guard oldValue != selectedPeer else { return }
+            restoreConversation = false
             UserDefaults.standard.set(selectedPeer, forKey: "selectedPeer")
             changedConversation()
         }
@@ -66,6 +68,7 @@ final class NetworkModel: ObservableObject {
     private let service: ReasonService
     private var running = false
     private var requestAgain = false
+    private var restoreConversation = true
     private var messageCache: [String: [Message]] = [:]
     private var messageLimit = 100
 
@@ -145,7 +148,8 @@ final class NetworkModel: ObservableObject {
             let local = selectedLocal, peer = selectedPeer
             do {
                 let viewing = !showsUtilities && NSApp.isActive && NSApp.keyWindow?.isVisible == true
-                let snapshot = try await service.snapshot(local: local, peer: peer, limit: messageLimit, viewingConversation: viewing)
+                let snapshot = try await service.snapshot(local: local, peer: peer, limit: messageLimit,
+                                                          viewingConversation: viewing, restoreConversation: restoreConversation)
                 if directory?.team != snapshot.directory.team || directory?.person != snapshot.directory.person {
                     messageCache.removeAll()
                 }
@@ -158,6 +162,12 @@ final class NetworkModel: ObservableObject {
                 error = nil
                 mirrorWarning = snapshot.mirrorWarning
                 guard local == selectedLocal, peer == selectedPeer else { requestAgain = true; continue }
+                restoreConversation = false
+                if let restored = snapshot.restoredConversation {
+                    selectedLocal = restored.local
+                    selectedPeer = restored.peer
+                    continue
+                }
                 if !locals.contains(where: { $0.name == selectedLocal }), let first = locals.first {
                     selectedLocal = first.name
                     continue
