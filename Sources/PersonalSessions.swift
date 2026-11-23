@@ -32,6 +32,7 @@ struct PersonalSession: Identifiable {
     }
     var transcript: URL?
     var nativeID: String?
+    var restriction: LocalThreadRestriction?
     var canManageParticipation = false
     var connection: Connection = .notJoined
     var agentName: String { NetworkSession.agentDisplayName(agent) }
@@ -39,6 +40,7 @@ struct PersonalSession: Identifiable {
         (nativeID != nil && cwd?.hasPrefix("/") == true)
     }
     var canJoin: Bool {
+        guard restriction == nil else { return false }
         if case .online = connection { return false }
         if case .paused = connection { return canManageParticipation }
         return supportsImmediateJoin
@@ -123,6 +125,12 @@ struct PersonalSessionCatalog {
     private var fm: FileManager { .default }
 
     func discover() throws -> (sessions: [PersonalSession], hidden: Set<String>) {
+        var hidden = archivedFileKeys()
+        let sessions = try codex(excluding: &hidden) + claude() + otherLocalSessions()
+        return (sessions, hidden)
+    }
+
+    private func archivedFileKeys() -> Set<String> {
         // An archived rollout can outlive its index row and Network registration.
         let archive = home.appendingPathComponent(".codex/archived_sessions")
         let archivedKeys = contents(archive).compactMap { url -> String? in
@@ -131,9 +139,7 @@ struct PersonalSessionCatalog {
             guard UUID(uuidString: suffix) != nil else { return nil }
             return "codex:" + suffix.lowercased()
         }
-        var hidden = Set(archivedKeys)
-        let sessions = try codex(excluding: &hidden) + claude() + otherLocalSessions()
-        return (sessions, hidden)
+        return Set(archivedKeys)
     }
 
     private func codexDatabase() throws -> SQLiteStore? {
@@ -151,25 +157,54 @@ struct PersonalSessionCatalog {
         fields.contains("name") ? "COALESCE(NULLIF(name,''),title) AS title" : "title"
     }
 
-    /// Read only the registered Codex threads during the periodic network refresh.
-    func codexTitles(for keys: [String]) throws -> [String: String]? {
-        let ids = keys.compactMap { key -> String? in
-            guard key.hasPrefix("codex:") else { return nil }
-            return String(key.dropFirst(6))
-        }
+    struct ThreadInfo {
+        var title: String?
+        var restriction: LocalThreadRestriction?
+    }
+
+    // Missing registration metadata alone does not prove deletion. A healthy index can
+    // confirm a missing UUID; a temporarily unreadable index only makes it unverified.
+    func registeredThreads(_ keys: [String]) -> [String: ThreadInfo] {
+        let ids = Set(keys.filter { $0.hasPrefix("codex:") }.map { String($0.dropFirst(6)).lowercased() })
         guard !ids.isEmpty else { return [:] }
-        guard let db = try codexDatabase() else { return nil }
-        let fields = Set(try db.rows("PRAGMA table_info(threads)").compactMap { $0["name"] })
-        guard fields.contains("title") else { return [:] }
-        var titles = [String: String]()
-        for offset in stride(from: 0, to: ids.count, by: 500) {
-            let batch = Array(ids[offset..<min(offset + 500, ids.count)])
-            let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ",")
-            for row in try db.rows("SELECT id, \(titleColumn(fields)) FROM threads WHERE id COLLATE NOCASE IN (\(placeholders))", batch) {
-                if let id = row["id"], let title = row["title"]?.nonEmpty { titles["codex:" + id.lowercased()] = title }
+        var result: [String: ThreadInfo] = [:]
+        var readable = false
+        do {
+            if let db = try codexDatabase() {
+                let fields = Set(try db.rows("PRAGMA table_info(threads)").compactMap { $0["name"] })
+                if fields.contains("id") && fields.contains("title") {
+                    let optional = ["archived", "archived_at", "rollout_path"].map {
+                        fields.contains($0) ? $0 : "NULL AS " + $0
+                    }.joined(separator: ",")
+                    let ordered = Array(ids)
+                    _ = try db.rows("BEGIN")
+                    for offset in stride(from: 0, to: ordered.count, by: 500) {
+                        let batch = Array(ordered[offset..<min(offset + 500, ordered.count)])
+                        let args = Array(repeating: "?", count: batch.count).joined(separator: ",")
+                        for row in try db.rows("SELECT id, \(titleColumn(fields)), \(optional) FROM threads WHERE id COLLATE NOCASE IN (\(args))", batch) {
+                            guard let id = row["id"] else { continue }
+                            result["codex:" + id.lowercased()] = ThreadInfo(title: row["title"]?.nonEmpty,
+                                restriction: isArchived(row) ? .archived : nil)
+                        }
+                    }
+                    readable = true
+                }
+            }
+        } catch { result.removeAll() }
+        let missing = ids.filter { UUID(uuidString: $0) != nil && result["codex:" + $0] == nil }
+        if !missing.isEmpty {
+            let archived = archivedFileKeys()
+            for id in missing {
+                let key = "codex:" + id
+                result[key] = ThreadInfo(restriction: archived.contains(key) ? .archived : readable ? .missing : .unverified)
             }
         }
-        return titles
+        return result
+    }
+
+    private func isArchived(_ row: [String: String]) -> Bool {
+        let prefix = home.appendingPathComponent(".codex/archived_sessions").path + "/"
+        return row["archived"] == "1" || row["archived_at"] != nil || row["rollout_path"]?.hasPrefix(prefix) == true
     }
 
     private func codex(excluding hidden: inout Set<String>) throws -> [PersonalSession] {
@@ -187,10 +222,9 @@ struct PersonalSessionCatalog {
         let optional = ["project_id", "is_pinned", "attached_thread_parent_id", "archived_at", "updated_at_ms"].map {
             fields.contains($0) ? $0 : "NULL AS " + $0
         }.joined(separator: ",")
-        let archivePrefix = root.appendingPathComponent("archived_sessions").path + "/"
         return try db.rows("SELECT \(optional), id, \(kind), \(source), \(title), cwd, rollout_path, updated_at, \(archived) FROM threads").compactMap { row in
             guard let id = row["id"], UUID(uuidString: id) != nil else { return nil }
-            if row["archived"] == "1" || row["archived_at"] != nil || row["rollout_path"]?.hasPrefix(archivePrefix) == true ||
+            if isArchived(row) ||
                 row["attached_thread_parent_id"]?.nonEmpty != nil || isInternalThread(row) {
                 hidden.insert("codex:" + id.lowercased())
                 return nil

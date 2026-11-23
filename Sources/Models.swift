@@ -1,5 +1,11 @@
 import Foundation
 
+enum LocalThreadRestriction: String {
+    case archived = "已归档"
+    case missing = "本机未找到"
+    case unverified = "待核实"
+}
+
 struct NetworkSession: Decodable, Identifiable, Equatable {
     let address: String
     let name: String
@@ -14,10 +20,12 @@ struct NetworkSession: Decodable, Identifiable, Equatable {
     var cwd: String?
     var target: String?
     var clientTitle: String?
+    var restriction: LocalThreadRestriction?
     var overviewID: [String] { [target ?? address, machine ?? ""] }
-    var offline: Bool { status == "offline" }
+    var offline: Bool { restriction != nil || status == "offline" }
     var available: Bool { !offline && tier != "none" }
     var statusText: String {
+        if let restriction { return restriction.rawValue }
         if offline { return "离线" }
         if tier == "none" { return "未接入" }
         return ["busy": "工作中", "idle": "空闲", "live": "在线"][status ?? ""] ?? "状态未知"
@@ -93,6 +101,8 @@ struct LocalSession: Identifiable, Equatable {
     let key: String
     var doing: String?
     var historyOnly = false
+    var hasRegistration: Bool { !key.hasPrefix("history:") }
+    var restriction: LocalThreadRestriction?
     var id: String { key }
     var title: String { doing?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? name }
 }
@@ -164,11 +174,23 @@ struct Message: Identifiable, Equatable {
         case "expired": return "已过期"
         default: break
         }
+        if result.hasPrefix("refused:") || result.hasPrefix("rejected:") { return "已拒收" }
+        if result.hasPrefix("held:") { return "待批准" }
         if result.contains("queued") { return "已排队" }
         if result.contains("delivered") { return "已投递" }
         return result.isEmpty ? "" : "已发送"
     }
 }
+enum TranscriptBottomProximity {
+    case pinned, nearby, away
+
+    init(distance: CGFloat, viewportHeight: CGFloat) {
+        if distance <= 8 { self = .pinned }
+        else if distance <= min(72, viewportHeight / 5) { self = .nearby }
+        else { self = .away }
+    }
+}
+
 // The service returns the latest 100 messages. While reading, replacing that window
 // can move or evict the visible paragraph. Keep at most one displayed window.
 struct ConversationReadingWindow {
@@ -183,18 +205,27 @@ struct ConversationReadingWindow {
     }
 
     /// Returns true when the view should pin the new layout to its bottom edge.
-    mutating func receive(_ latest: [Message], atBottom: Bool) -> Bool {
+    mutating func receive(_ latest: [Message], proximity: TranscriptBottomProximity) -> Bool {
+        // Measure proximity against the old document. Only a new tail message should
+        // pull a nearby reader down; receipt updates and historical inserts can wait in place.
+        let follow: Bool
+        if proximity == .nearby, let previous = messages.last, let next = latest.last {
+            follow = (next.at, next.id, next.direction) > (previous.at, previous.id, previous.direction) &&
+                !messages.contains { $0.rowKey == next.rowKey }
+        } else {
+            follow = proximity == .pinned
+        }
         if expanded, let first = latest.first, let overlap = messages.firstIndex(where: { $0.rowKey == first.rowKey }) {
             let changed = !messages[overlap...].elementsEqual(latest)
             if changed { messages.replaceSubrange(overlap..., with: latest) }
             hasPendingUpdate = false
-            return changed && atBottom
+            return changed && follow
         }
         if latest == messages {
             hasPendingUpdate = false
             return false
         }
-        if messages.isEmpty || latest.isEmpty || atBottom {
+        if messages.isEmpty || latest.isEmpty || follow {
             show(latest)
             return !latest.isEmpty
         }

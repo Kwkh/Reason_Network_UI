@@ -29,10 +29,10 @@ final class TranscriptMirror {
             cursors = cursors.filter { current.contains($0.key) }
             lastScan = now
         }
-        let thread = session.key.hasPrefix("codex:") ? String(session.key.dropFirst(6)) : session.key
+        let thread = session.key.hasPrefix("codex:") ? String(session.key.dropFirst(6)).lowercased() : session.key.lowercased()
         guard !thread.isEmpty else { return }
         for path in files {
-            let stem = path.deletingPathExtension().lastPathComponent
+            let stem = path.deletingPathExtension().lastPathComponent.lowercased()
             guard stem == thread || stem.hasSuffix("-" + thread) else { continue }
             let handle: FileHandle
             do { handle = try FileHandle(forReadingFrom: path) }
@@ -95,12 +95,54 @@ final class TranscriptMirror {
             return nil
         }
         guard type == "function_call_output" || type == "custom_tool_call_output", let sent = waiting.removeValue(forKey: call) else { return nil }
-        let output = String(describing: item["output"] ?? "")
-        guard output.range(of: #"\b(delivered|queued)\b"#, options: .regularExpression) != nil, let id = Self.match(#"message id ([0-9A-Z]{26})"#, in: output), let to = sent.arguments["to"] as? String, let body = sent.arguments["message"] as? String else { return nil }
+        guard let output = item["output"], let confirmation = Self.confirmation(in: output),
+              let to = sent.arguments["to"] as? String, let body = sent.arguments["message"] as? String else { return nil }
         let files = (sent.arguments["files"] as? [String] ?? []).map {
             MessageAttachment(name: URL(fileURLWithPath: $0).lastPathComponent)
         }
-        return Message(id: id, at: sent.at, local: session.name, peer: to, direction: "out", body: body, result: output.contains("queued") ? "queued" : "delivered", replyTo: sent.arguments["reply_to"] as? String, attachments: files)
+        return Message(id: confirmation.id, at: sent.at, local: session.name, peer: confirmation.peer ?? to, direction: "out", body: body, result: confirmation.note, replyTo: sent.arguments["reply_to"] as? String, attachments: files)
+    }
+
+    struct Confirmation: Equatable {
+        let id: String
+        let peer: String?
+        let note: String
+    }
+
+    // Each MCP send result pairs a resolved recipient and a transport note with its message ID.
+    // Codex can store the result as nested content blocks or as their serialized JSON.
+    static func confirmation(in value: Any) -> Confirmation? {
+        func collect(_ value: Any, depth: Int) -> [Confirmation] {
+            guard depth < 10 else { return [] }
+            if let blocks = value as? [Any] {
+                return blocks.flatMap { collect($0, depth: depth + 1) }
+            }
+            if let block = value as? [String: Any] {
+                if block["isError"] as? Bool == true { return [] }
+                if let content = block["content"] { return collect(content, depth: depth + 1) }
+                guard ["text", "input_text"].contains(block["type"] as? String ?? ""), let text = block["text"] as? String else { return [] }
+                return collect(text, depth: depth + 1)
+            }
+            guard let raw = value as? String else { return [] }
+            let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.first == "[" || text.first == "{",
+               let nested = try? JSONSerialization.jsonObject(with: Data(text.utf8)) {
+                return collect(nested, depth: depth + 1)
+            }
+            let lines = text.components(separatedBy: .newlines)
+            if lines.count >= 2, let peer = match(#"^→ ([^:\s]+): .+$"#, in: lines[0]),
+               let id = match(#"^message id ([0-9A-Z]{26})$"#, in: lines[1]) {
+                return [Confirmation(id: id, peer: peer, note: String(lines[0].dropFirst(("→ " + peer + ": ").count)))]
+            }
+            let legacy = #"^(delivered|queued)\s+message id ([0-9A-Z]{26})$"#
+            if let note = match(legacy, in: text), let id = match(#"message id ([0-9A-Z]{26})$"#, in: text) {
+                return [Confirmation(id: id, peer: nil, note: note)]
+            }
+            return []
+        }
+        let results = collect(value, depth: 0)
+        guard let first = results.first, results.allSatisfy({ $0 == first }) else { return nil }
+        return first
     }
 
     static func match(_ pattern: String, in value: String) -> String? {

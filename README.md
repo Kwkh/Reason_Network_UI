@@ -4,7 +4,7 @@ SwiftUI 原生消息控制台。界面不使用 WebView，不启动浏览器、H
 
 ## 安装与首次配置
 
-从 [GitHub Releases](https://github.com/Kwkh/Reason_Network_UI/releases) 下载 Universal DMG，将 App 拖入 Applications。GitHub 上的 1.1.4 发行包内含 Developer ID 签名并通过 Apple 公证的 App。已有安装请打开「环境配置」，点击「更新兼容后台」启用后台重连修复。
+从 [GitHub Releases](https://github.com/Kwkh/Reason_Network_UI/releases) 下载 Universal DMG，将 App 拖入 Applications。GitHub 上的 1.1.5 发行包内含 Developer ID 签名并通过 Apple 公证的 App。已有安装请打开「环境配置」，点击「更新兼容后台」启用归档与缺失线程的投递保护。
 
 首次启动自动检查内置兼容后台、登录服务、Codex 接入与 Network 状态；已配置的机器直接进入聊天。新机流程：
 
@@ -40,7 +40,7 @@ xcodebuild -project 'Reason Network.xcodeproj' -scheme 'Reason Network' -configu
 
 继续使用网页控制台的 `~/.reason/network/local-ui/messages.sqlite3`，不复制或删除原缓存；同一消息 ID 去重。迁移兼容原 messages 表和 events 表。
 Reason 引擎数据库 `~/.reason/network/network.db` 以 SQLite **只读**方式访问。不会调用 Inbox / Delivered，不改变 Codex 未读状态，不自动执行消息文字。
-只从 Codex JSONL 中镜像确认成功的 Reason send 工具记录，不展示普通聊天、文件或提示词。支持直接 MCP 调用及单次字面量参数 exec 调用；不求值变量、模板或任意代码。初次读取各日志末尾 8 MB，复杂调用、缺失／压缩日志和更早记录可能不完整。
+客户端按消息 ID、Network 和会话核对后台收件、待投递发件与发送回执。Codex 日志中的单次发送也可补入历史，包括原生输入通道的回执。首次从现存日志开头扫描，随后增量读取。若远端消息已离开发件队列，且本机没有缓存正文或可识别的发送日志，仅凭回执无法还原正文。
 现有官方数据库和日志格式不是稳定公共 API，后续 Reason / Codex 升级可能需要适配。
 
 ## 结构

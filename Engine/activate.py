@@ -72,8 +72,8 @@ def main(binary):
                     sock.sendall(b'{"op":"session_participation","id":1}\n')
                     with sock.makefile("rb") as reader:
                         reply = json.loads(reader.readline(1024 * 1024))
-                        if reply.get("ok") and reply["result"]["version"] == 1 and reply["result"].get("connection_recovery"):
-                            print("Connection recovery is available.")
+                        if reply.get("ok") and reply["result"]["version"] == 1 and reply["result"].get("native_thread_guard"):
+                            print("Native Codex thread verification is available.")
                             return
                         if not handed_off:
                             # Darwin SOL_LOCAL/LOCAL_PEERPID. Check this socket's peer before shutdown.
@@ -85,7 +85,7 @@ def main(binary):
             except (OSError, ValueError):
                 pass
             time.sleep(0.5)
-        raise RuntimeError("Daemon did not advertise connection recovery")
+        raise RuntimeError("Daemon did not advertise native Codex thread verification")
     except BaseException:
         subprocess.run(["launchctl", "bootout", service], check=False)
         replace_plist(old)

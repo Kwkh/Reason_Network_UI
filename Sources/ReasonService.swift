@@ -43,10 +43,19 @@ actor ReasonService {
         let codexRecords = try engine.rows("SELECT name,key,doing,attached FROM sessions WHERE agent='codex' ORDER BY last_seen DESC")
         let registrations = codexRecords.filter { !paused.contains($0["key"] ?? "") }
         let catalog = PersonalSessionCatalog(home: home)
-        // A missing or temporarily unavailable agent index must not interrupt messaging.
         let attached = registrations.filter { $0["attached"] == "1" }
-        if let titles = try? catalog.codexTitles(for: codexRecords.compactMap { $0["key"] }) {
-            lastCodexTitles = titles
+        let info = catalog.registeredThreads(codexRecords.compactMap { $0["key"] })
+        var restrictions: [String: LocalThreadRestriction] = [:]
+        for row in codexRecords {
+            guard let name = row["name"], let key = row["key"]?.lowercased(), let thread = info[key] else { continue }
+            if let restriction = thread.restriction { restrictions[name] = restriction }
+            if thread.restriction == nil || thread.title != nil { lastCodexTitles[key] = thread.title }
+        }
+        for i in directory.sessions.indices {
+            let session = directory.sessions[i]
+            if session.person == directory.person && session.machine == directory.machine && session.agent == "codex" {
+                directory.sessions[i].restriction = restrictions[session.name]
+            }
         }
         var localTitlesByName: [String: String] = [:]
         for row in codexRecords {
@@ -54,15 +63,27 @@ actor ReasonService {
                 localTitlesByName[name] = lastCodexTitles[key.lowercased()] ?? row["doing"]?.nonEmpty
             }
         }
+        for i in directory.sessions.indices {
+            let session = directory.sessions[i]
+            if session.person == directory.person, session.machine == directory.machine, session.agent == "codex",
+               let key = attached.first(where: { $0["name"] == session.name })?["key"],
+               let title = lastCodexTitles[key.lowercased()] {
+                directory.sessions[i].clientTitle = title
+            }
+        }
+        let labels = try cache.sessionLabels(network: network, sessions: &directory.sessions)
         var locals = attached.compactMap { row -> LocalSession? in
             guard let name = row["name"], let key = row["key"] else { return nil }
             let index = directory.sessions.firstIndex {
                 $0.person == directory.person && $0.machine == directory.machine && $0.name == name && $0.agent == "codex"
             }
             let title = lastCodexTitles[key.lowercased()]
-            if let index, let title { directory.sessions[index].clientTitle = title }
             let published = index.map { directory.sessions[$0] }
-            return LocalSession(name: name, key: key, doing: title ?? published?.clientTitle ?? published?.doing ?? row["doing"])
+            let remembered = labels[directory.person + "/" + name]
+            let displayTitle = title ?? published?.clientTitle ?? remembered?.title
+            let activity = published?.doing ?? row["doing"]?.nonEmpty ?? remembered?.activity
+            return LocalSession(name: name, key: key, doing: displayTitle ?? activity,
+                                historyOnly: restrictions[name] != nil, restriction: restrictions[name])
         }
         try cache.recordInboxOwnership(network, engine: engine)
         let otherMail = Set(try cache.rows("SELECT id FROM network_inbox WHERE network<>?", [network]).compactMap { $0["id"] })
@@ -70,52 +91,54 @@ actor ReasonService {
         let hasFiles = try engine.rows("PRAGMA table_info(messages)").contains { $0["name"] == "files" }
         let fileColumn = hasFiles ? ",files" : ""
         // A registered mailbox can receive mail just before detaching, between UI polls.
-        for registration in registrations {
+        for registration in codexRecords {
             guard let name = registration["name"], let key = registration["key"] else { continue }
             let session = LocalSession(name: name, key: key)
             do {
                 for row in try engine.rows("SELECT id,sent_at,sender,body,reply_to\(fileColumn) FROM messages WHERE recipient=? AND held=0 ORDER BY sent_at", [directory.person + "/" + session.name]) {
                     guard let id = row["id"], !otherMail.contains(id) else { continue }
-                    try cache.insert(Message(id: id, at: (Double(row["sent_at"] ?? "") ?? 0) / 1000, local: session.name, peer: row["sender"] ?? "", direction: "in", body: row["body"] ?? "", result: "", replyTo: row["reply_to"], attachments: receivedFiles(row["files"])), network: network)
+                    try cache.reconcileEnvelope(Message(id: id, at: (Double(row["sent_at"] ?? "") ?? 0) / 1000, local: session.name, peer: row["sender"] ?? "", direction: "in", body: row["body"] ?? "", result: "", replyTo: row["reply_to"], attachments: receivedFiles(row["files"])), network: network, knowsFiles: hasFiles)
                 }
                 try mirror.sync(for: session) { batch in
                     try cache.transaction {
                         for event in batch {
                             let origin = try cache.rows("SELECT network FROM network_periods WHERE since<=? ORDER BY since DESC, rowid DESC LIMIT 1", [String(event.at)]).first?["network"]
-                            if let origin = origin?.nonEmpty { try cache.insert(event, network: origin) }
+                            if let origin = origin?.nonEmpty {
+                                try cache.insertMirrored(event, network: origin)
+                            }
                         }
                     }
                 }
             } catch { warning = "部分历史记录暂未同步：" + error.localizedDescription }
         }
-        if try engine.rows("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sent_receipts'").first != nil {
-            let receipts = try engine.rows("SELECT id,sender,recipient,stage,sent_at FROM sent_receipts")
-            try cache.transaction {
-                for row in receipts {
-                    guard let id = row["id"], let sender = row["sender"], sender.hasPrefix(directory.person + "/"),
-                          let peer = row["recipient"], let stage = row["stage"], let at = row["sent_at"] else { continue }
-                    _ = try cache.rows("""
-                        UPDATE network_events SET receipt_stage=? WHERE network=? AND id=? AND direction='out'
-                          AND local_session=? AND peer=? AND receipt_stage IS NOT ?
-                          AND network=(SELECT network FROM network_periods WHERE since<=CAST(? AS REAL)/1000
-                                       ORDER BY since DESC,rowid DESC LIMIT 1)
-                        """, [stage, network, id, String(sender.dropFirst(directory.person.count + 1)), peer, stage, at])
-                }
-            }
+        try reconcileSent(engine: engine, cache: cache, network: network, person: directory.person, otherMail: otherMail, hasInboxFiles: hasFiles)
+        let pausedNames = Set(codexRecords.filter { paused.contains($0["key"] ?? "") }.compactMap { $0["name"] })
+        let registeredNames = Set(codexRecords.compactMap { $0["name"] })
+        let hiddenHistory = Set(try cache.rows("SELECT name FROM hidden_local_history WHERE network=?", [network]).compactMap { $0["name"] })
+        let hiddenNames = pausedNames.union(hiddenHistory.subtracting(registeredNames))
+        directory.sessions.removeAll {
+            $0.person == directory.person && $0.machine == directory.machine && $0.agent == "codex" && hiddenNames.contains($0.name)
         }
-        let pausedNames = try engine.rows("SELECT key,name FROM sessions").filter { paused.contains($0["key"] ?? "") }.compactMap { $0["name"] }
-        let knownNames = Set(locals.map(\.name) + pausedNames)
+        let knownNames = Set(locals.map(\.name)).union(hiddenNames)
         for row in try cache.rows("SELECT DISTINCT local_session FROM network_events WHERE network=? ORDER BY local_session", [network]) {
             if let name = row["local_session"], !knownNames.contains(name) {
-                locals.append(LocalSession(name: name, key: "history:" + name, doing: localTitlesByName[name], historyOnly: true))
+                let key = registrations.first { $0["name"] == name }?["key"] ?? "history:" + name
+                let remembered = labels[directory.person + "/" + name]
+                let title = lastCodexTitles[key.lowercased()] ?? remembered?.title ?? localTitlesByName[name] ?? remembered?.activity
+                locals.append(LocalSession(name: name, key: key, doing: title, historyOnly: true, restriction: restrictions[name]))
             }
         }
+        // Prefer an active sender when the previous selection has disappeared.
+        locals = locals.filter { !$0.historyOnly } + locals.filter { $0.historyOnly }
         let conversations = try cache.rows("SELECT peer,MAX(at) AS recent FROM network_events WHERE network=? AND local_session=? GROUP BY peer ORDER BY recent DESC", [network, local]).compactMap { $0["peer"] }
-        let previousPeers = conversations.map { address in
+        let hiddenAddresses = Set(hiddenNames.map { directory.person + "/" + $0 })
+        let previousPeers = conversations.filter { !hiddenAddresses.contains($0) }.map { address in
             let parts = address.split(separator: "/", maxSplits: 1).map(String.init)
             let person = parts.first ?? "", name = parts.last ?? address
-            return NetworkSession(address: address, name: name, person: person, agent: "离线", status: "offline",
-                                  clientTitle: person == directory.person ? localTitlesByName[name] : nil)
+            let remembered = labels[address]
+            return NetworkSession(address: address, name: name, person: person, agent: "离线", doing: remembered?.activity, status: "offline",
+                                  clientTitle: (person == directory.person ? locals.first { $0.name == name }?.doing ?? localTitlesByName[name] : nil) ?? remembered?.title,
+                                  restriction: person == directory.person ? restrictions[name] : nil)
         }
         let page: MessagePage
         if readingNetwork == network, let start = readingFrom, start.local == local {
@@ -125,6 +148,58 @@ actor ReasonService {
         }
         return Snapshot(directory: directory, localSessions: locals, conversations: previousPeers, messages: page.messages,
                         hasEarlier: page.hasEarlier, mirrorWarning: warning)
+    }
+
+    private func reconcileSent(engine: SQLiteStore, cache: SQLiteStore, network: String, person: String,
+                               otherMail: Set<String>, hasInboxFiles: Bool) throws {
+        let columns = try engine.rows("PRAGMA table_info(sent_receipts)").compactMap { $0["name"] }
+        guard !columns.isEmpty else { return }
+        let key = columns.contains("sender_key") ? "r.sender_key" : "NULL"
+        let hasOutbox = try engine.rows("PRAGMA table_info(outbox)").contains { $0["name"] == "msg" }
+        // The receipt owns the resolved peer (including a device-qualified terminal).
+        // An inbox or queued envelope with the same ID and endpoints owns the exact transmitted payload.
+        let queuedJoin = hasOutbox ? """
+            LEFT JOIN outbox q ON q.id=r.id AND json_valid(q.msg)
+              AND json_extract(q.msg,'$.id')=r.id AND json_extract(q.msg,'$.from')=r.sender
+              AND (json_extract(q.msg,'$.to')=r.recipient OR
+                   (json_extract(q.msg,'$.to') || '@')=substr(r.recipient,1,instr(r.recipient,'@')))
+            """ : ""
+        let queuedFields = hasOutbox ? """
+            json_extract(q.msg,'$.body') AS queued_body,json_extract(q.msg,'$.reply_to') AS queued_reply,
+            (SELECT json_group_array(json_extract(value,'$.name')) FROM json_each(q.msg,'$.files')) AS queued_files
+            """ : "NULL AS queued_body,NULL AS queued_reply,NULL AS queued_files"
+        let receipts = try engine.rows("""
+            SELECT r.id,r.sender,r.recipient,r.stage,r.sent_at,\(key) AS sender_key,
+                   m.body,m.reply_to,\(hasInboxFiles ? "m.files" : "NULL") AS files,\(queuedFields)
+            FROM sent_receipts r LEFT JOIN messages m ON m.id=r.id AND m.held=0
+              AND m.sender=r.sender AND m.recipient=r.recipient
+            \(queuedJoin)
+            """)
+        try cache.transaction {
+            for row in receipts {
+                guard let id = row["id"], !otherMail.contains(id), let sender = row["sender"], sender.hasPrefix(person + "/"),
+                      let peer = row["recipient"], let stage = row["stage"], let stamp = row["sent_at"].flatMap(Double.init) else { continue }
+                let at = stamp / 1000
+                let origin = try cache.rows("SELECT network FROM network_periods WHERE since<=? ORDER BY since DESC,rowid DESC LIMIT 1", [String(at)])
+                guard origin.first?["network"] == network else { continue }
+                let local = String(sender.dropFirst(person.count + 1))
+                let scope = [network, id, local]
+                if row["sender_key"]?.hasPrefix("codex:") == true, let body = row["body"] ?? row["queued_body"] {
+                    let queuedNames = row["queued_files"].flatMap { try? JSONDecoder().decode([String].self, from: Data($0.utf8)) } ?? []
+                    let names = row["body"] != nil ? receivedFiles(row["files"]).map(\.name) : queuedNames
+                    let reply = (row["body"] != nil ? row["reply_to"] : row["queued_reply"]) ?? ""
+                    let files = names.map { MessageAttachment(name: $0) }
+                    let event = Message(id: id, at: at, local: local, peer: peer, direction: "out", body: body, result: "",
+                                        replyTo: reply, attachments: files, receiptStage: stage)
+                    try cache.reconcileEnvelope(event, network: network, knowsFiles: row["body"] == nil || hasInboxFiles)
+                } else {
+                    _ = try cache.rows("""
+                        UPDATE network_events SET peer=?,receipt_stage=?,at=? WHERE network=? AND id=? AND local_session=?
+                          AND direction='out' AND (peer IS NOT ? OR receipt_stage IS NOT ? OR at IS NOT CAST(? AS REAL))
+                        """, [peer, stage, String(at)] + scope + [peer, stage, String(at)])
+                }
+            }
+        }
     }
 
     private func teamID(in engine: SQLiteStore) throws -> String? {
@@ -208,6 +283,15 @@ actor ReasonService {
         return MessagePage(messages: rows.map(SQLiteStore.event), hasEarlier: !earlier.isEmpty)
     }
 
+    private func verifyLocalThreads(_ keys: [String]) throws {
+        let info = PersonalSessionCatalog(home: home).registeredThreads(keys)
+        for key in keys {
+            if let restriction = info[key.lowercased()]?.restriction {
+                throw NetworkError("本机 Codex 对话" + restriction.rawValue + "，当前仅可查看历史记录。")
+            }
+        }
+    }
+
     func send(network: String, local: String, to: String, body: String, files: [URL] = [], notify: Bool = false) throws -> String {
         let typed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         let content = typed.isEmpty && !files.isEmpty ? "附件" : typed
@@ -223,11 +307,16 @@ actor ReasonService {
         let engine = try SQLiteStore(home.appendingPathComponent(".reason/network/network.db"), readOnly: true)
         guard let key = try engine.rows("SELECT key FROM sessions WHERE name=? AND agent='codex' AND attached=1", [local]).first?["key"] else { throw NetworkError("本机 Codex 会话未连接") }
         guard try !pausedKeys(in: engine).contains(key) else { throw NetworkError("本机会话已退出 Network") }
+        try verifyLocalThreads([key])
         let directory = try directory()
         guard directory.liveLocalSession(named: local, agent: "codex") != nil else { throw LocalSenderOffline() }
         guard let recipient = directory.sessions.first(where: {
             $0.address == to && $0.available && directory.isRecipient($0, sendingAs: local)
         }) else { throw NetworkError("收件会话暂不可用，请刷新后重新选择。") }
+        if recipient.person == directory.person && recipient.machine == directory.machine {
+            let keys = try engine.rows("SELECT key FROM sessions WHERE name=? AND agent='codex'", [recipient.name])
+            try verifyLocalThreads(keys.compactMap { $0["key"] })
+        }
         // Pin a local delivery to this Mac even if another device advertises the same address.
         let destination = recipient.person == directory.person ? to + "@" + directory.machine : to
         guard try teamID(in: engine) == network else { throw NetworkError("当前 Network 已变化，请刷新后重试。") }
@@ -241,16 +330,17 @@ actor ReasonService {
             // The daemon lost the sender after the directory check and before dispatch.
             throw LocalSenderOffline()
         }
-        guard let id = TranscriptMirror.match(#"message id ([0-9A-Z]{26})"#, in: result) else {
+        guard let confirmation = TranscriptMirror.confirmation(in: result) else {
             throw NetworkError(result.nonEmpty ?? "后台没有返回消息编号，投递状态未知。")
         }
+        let event = Message(id: confirmation.id, at: Date().timeIntervalSince1970, local: local, peer: confirmation.peer ?? to, direction: "out", body: content, result: confirmation.note, attachments: files.map { MessageAttachment(name: $0.lastPathComponent) })
         do {
-            try store().insert(Message(id: id, at: Date().timeIntervalSince1970, local: local, peer: to, direction: "out", body: content, result: result, attachments: files.map { MessageAttachment(name: $0.lastPathComponent) }), network: network)
+            try store().insert(event, network: network)
         } catch {
             // Sending has already succeeded: never turn a cache failure into an invitation to resend.
             return "已发送；本地记录保存失败，请勿重复发送。"
         }
-        let status = result.contains("queued") ? "已排队" : "已发送"
+        let status = event.delivery
         if notify && result.contains("not popped up:") { return status + " · 对方设备未弹窗" }
         return status
     }
@@ -269,6 +359,7 @@ actor ReasonService {
         } else {
             knownRecords = []
         }
+        let info = PersonalSessionCatalog(home: home).registeredThreads(knownRecords.compactMap { $0["key"] })
         for row in knownRecords {
             guard let key = row["key"], !discovered.hidden.contains(key), !discovered.hidden.contains(key.lowercased()), let agent = row["agent"], let name = row["name"] else { continue }
             let current = directory?.sessions.first {
@@ -279,6 +370,8 @@ actor ReasonService {
             let catalogKey = agent == "codex" ? key.lowercased() : key
             var item = sessions[catalogKey] ?? PersonalSession(id: key, agent: agent, title: row["doing"]?.nonEmpty ?? name,
                                                          cwd: row["cwd"], updated: Date(timeIntervalSince1970: (Double(row["last_seen"] ?? "") ?? 0) / 1000))
+            item.restriction = info[key.lowercased()]?.restriction
+            if item.restriction == .archived || item.restriction == .missing { continue }
             item.id = key
             if agent == "codex", item.nativeID != nil { item.nativeID = String(key.dropFirst("codex:".count)) }
             item.canManageParticipation = participation != nil
@@ -300,6 +393,7 @@ actor ReasonService {
               try !pausedKeys(in: engine).contains(local.key) else {
             throw NetworkError("本机会话或 Network 已变化，请刷新后重新选择。")
         }
+        try verifyLocalThreads([local.key])
         if try directory().liveLocalSession(named: local.name, agent: "codex") != nil { return }
         guard var session = try PersonalSessionCatalog(home: home).discover().sessions.first(where: { $0.agent == "codex" && $0.id.lowercased() == local.key.lowercased() }) else {
             throw NetworkError("找不到这个本机 Codex 对话，请在 Codex 中打开后重试。")
@@ -333,6 +427,19 @@ actor ReasonService {
         guard let address = reply.address?.nonEmpty else { throw NetworkError("引擎没有返回会话地址。") }
         return address
     }
+    func removeLocal(_ local: LocalSession, network: String) throws {
+        let engine = try SQLiteStore(home.appendingPathComponent(".reason/network/network.db"), readOnly: true)
+        let keys = try engine.rows("SELECT key FROM sessions WHERE agent='codex' AND name=?", [local.name]).compactMap { $0["key"] }
+        guard try teamID(in: engine) == network else { throw NetworkError("当前 Network 已变化，请刷新。") }
+        if local.hasRegistration {
+            guard keys.contains(local.key) else { throw NetworkError("会话注册已变化，请刷新后重试。") }
+            try setParticipation(local.key, paused: true)
+        } else {
+            guard local.historyOnly, keys.isEmpty else { throw NetworkError("该会话已重新注册，请刷新后重试。") }
+            _ = try store().rows("INSERT OR IGNORE INTO hidden_local_history(network,name) VALUES(?,?)", [network, local.name])
+        }
+    }
+
     func leavePersonalSession(_ key: String) throws -> String {
         guard let chosen = try personalSessions().first(where: { $0.id == key }), chosen.canLeave else {
             throw NetworkError("当前后台服务不支持退出该会话。")
@@ -366,6 +473,7 @@ actor ReasonService {
     }
 
     func setReceiveMode(_ mode: ReceiveMode, local: LocalSession, network: String) throws -> ReceiveMode {
+        try verifyLocalThreads([local.key])
         struct Reply: Decodable { let effective: ReceiveMode }
         do {
             return try console.decode(["op": "set_receive_mode", "key": local.key, "network": network, "mode": mode.rawValue],
@@ -463,6 +571,11 @@ actor ReasonService {
         }
         _ = try database.rows("CREATE INDEX IF NOT EXISTS network_history ON network_events(network,local_session,peer,at,id)")
         try database.prepareNetworkMetadata()
+        _ = try database.rows("""
+            CREATE TABLE IF NOT EXISTS session_labels(network TEXT NOT NULL,address TEXT NOT NULL,
+              title TEXT,activity TEXT,PRIMARY KEY(network,address))
+            """)
+        _ = try database.rows("CREATE TABLE IF NOT EXISTS hidden_local_history(network TEXT NOT NULL,name TEXT NOT NULL,PRIMARY KEY(network,name))")
         cache = database
         return database
     }

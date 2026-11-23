@@ -8,7 +8,7 @@ struct ParticipationInstaller: Sendable {
     var binary = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/reason-network-backend")
     var launchctl = URL(fileURLWithPath: "/bin/launchctl")
     var probe: @Sendable (URL) -> Bool = { home in
-        capabilities(at: home)?["connection_recovery"] as? Bool == true
+        capabilities(at: home)?["native_thread_guard"] as? Bool == true
     }
 
     static func capabilities(at home: URL) -> [String: Any]? {

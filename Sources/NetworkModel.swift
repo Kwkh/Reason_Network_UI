@@ -1,6 +1,7 @@
 import SwiftUI
 
 enum SenderPresence: String {
+    case archived = "已归档", missing = "本机未找到", unverified = "待核实"
     case online = "在线", offline = "离线", reconnecting = "正在重新接入", history = "仅历史记录", unknown = "状态未知"
 }
 
@@ -82,11 +83,11 @@ final class NetworkModel: ObservableObject {
         guard let directory else { return [] }
         var result = directory.sessions.filter { directory.isRecipient($0, sendingAs: selectedLocal) }
         let ownAddress = directory.person + "/" + selectedLocal
-        for session in locals where !session.historyOnly && session.name != selectedLocal {
+        for session in locals where (!session.historyOnly || session.restriction != nil) && session.name != selectedLocal {
             let address = directory.person + "/" + session.name
             if !result.contains(where: { $0.address == address }) {
                 result.append(NetworkSession(address: address, name: session.name, person: directory.person,
-                                             machine: directory.machine, agent: "codex", status: "offline", clientTitle: session.title))
+                                             machine: directory.machine, agent: "codex", status: "offline", clientTitle: session.title, restriction: session.restriction))
             }
         }
         for previous in conversations where previous.address != ownAddress && !result.contains(where: { $0.address == previous.address }) {
@@ -100,6 +101,12 @@ final class NetworkModel: ObservableObject {
         own.map(presence(for:)) ?? .unknown
     }
     func presence(for session: LocalSession) -> SenderPresence {
+        switch session.restriction {
+        case .archived: return .archived
+        case .missing: return .missing
+        case .unverified: return .unverified
+        case nil: break
+        }
         if session.historyOnly { return .history }
         if reconnectingKey == session.key { return .reconnecting }
         guard error == nil, let directory else { return .unknown }
@@ -187,8 +194,9 @@ final class NetworkModel: ObservableObject {
                 }
                 if directory != snapshot.directory { directory = snapshot.directory }
                 if locals != snapshot.localSessions { locals = snapshot.localSessions }
-                if !locals.contains(where: { $0.name == selectedLocal }), selectedLocal != (locals.first?.name ?? "") {
-                    selectedLocal = locals.first?.name ?? ""
+                let defaultSender = locals.first(where: { !$0.historyOnly })?.name ?? ""
+                if !locals.contains(where: { $0.name == selectedLocal }), selectedLocal != defaultSender {
+                    selectedLocal = defaultSender
                     requestAgain = true
                     continue
                 }
@@ -315,12 +323,13 @@ final class NetworkModel: ObservableObject {
     func supportsSessionExit() async throws -> Bool { try await service.supportsSessionExit() }
 
     func exitLocal(_ local: LocalSession) async throws -> String {
-        guard own?.key == local.key, changingSession == nil else { throw NetworkError("本机会话已变化，请重新选择。") }
+        guard own?.key == local.key, let network = directory?.networkID, !sending, !leavingNetwork, changingSession == nil else { throw NetworkError("本机会话已变化，请重新选择。") }
         changingSession = local.key
         defer { changingSession = nil }
-        let address = try await service.leavePersonalSession(local.key)
+        let address = (directory?.person ?? "") + "/" + local.name
+        try await service.removeLocal(local, network: network)
         await refresh()
-        if selectedLocal == local.name { selectedLocal = locals.first(where: { $0.key != local.key })?.name ?? "" }
+        if selectedLocal == local.name { selectedLocal = locals.first(where: { !$0.historyOnly && $0.key != local.key })?.name ?? "" }
         return address
     }
 

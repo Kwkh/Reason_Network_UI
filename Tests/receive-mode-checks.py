@@ -53,7 +53,7 @@ fi
             assert proc.poll() is None, "daemon exited early"
             try:
                 capabilities = call("session_participation")
-                assert capabilities["receive_modes"] and capabilities["codex_queue_resume"] and capabilities["connection_recovery"]
+                assert capabilities["receive_modes"] and capabilities["codex_queue_resume"] and capabilities["connection_recovery"] and capabilities["native_thread_guard"]
                 return
             except OSError:
                 time.sleep(.08)
@@ -85,6 +85,27 @@ fi
         start()
         address = hook("alpha")["address"]
         hook("beta")
+        native = "11111111-2222-4333-8444-555555555555"
+        index = home / ".codex/state_5.sqlite"
+        index.parent.mkdir()
+        with sqlite3.connect(index) as catalog:
+            catalog.execute("CREATE TABLE threads(id TEXT PRIMARY KEY,archived INTEGER,archived_at INTEGER,rollout_path TEXT)")
+            catalog.execute("INSERT INTO threads VALUES(?,0,NULL,NULL)", (native,))
+            catalog.commit()
+            addr = call("hook", agent="codex", event="stop", session_id=native, name="archive-test", cwd=root, mail=False)["address"]
+            name = addr.split("/")[1]
+            assert name in tiers()
+            for change in ["UPDATE threads SET archived=1", "DELETE FROM threads"]:
+                catalog.execute(change)
+                catalog.commit()
+                assert name not in tiers()
+                for sender, recipient in [("codex:beta", addr), ("codex:" + native, address)]:
+                    assert not request("send", **{"from": sender, "to": recipient, "body": "blocked fixture", "wake": True})["ok"]
+            catalog.execute("INSERT INTO threads VALUES(?,0,NULL,NULL)", (native,))
+            catalog.commit()
+            assert name in tiers()
+            call("send", **{"from": "codex:" + native, "to": "qa/beta", "body": "restored fixture", "wake": False})
+        print("PASS: native lifecycle hides archived and missing UUIDs, denies both send directions and restores original identity")
         before = tiers()["beta"]
         assert mode("pull") == "pull"
         send("manual sample")

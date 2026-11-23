@@ -1,0 +1,128 @@
+diff --git a/src/codex.rs b/src/codex.rs
+index e0d22ab..123e8bb 100644
+--- a/src/codex.rs
++++ b/src/codex.rs
+@@ -12,6 +12,41 @@ use std::{
+     sync::{Mutex, OnceLock},
+ };
+ 
++/// Only native Codex UUIDs can be verified against the desktop thread index. Other
++/// agent identities and legacy process-based registrations follow the usual routing.
++pub(crate) fn unavailable(key: &str) -> bool {
++    let Some(id) = key.strip_prefix("codex:") else { return false };
++    if id.len() != 36 || !id.bytes().enumerate().all(|(i, b)| {
++        if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_hexdigit() }
++    }) {
++        return false;
++    }
++    let root = std::env::var_os("CODEX_HOME").map(PathBuf::from)
++        .unwrap_or_else(|| crate::paths::user_home().join(".codex"));
++    indexed_active(&root, id) != Some(true)
++}
++
++fn indexed_active(root: &Path, id: &str) -> Option<bool> {
++    use rusqlite::{Connection, OpenFlags, OptionalExtension};
++    let (_, path) = std::fs::read_dir(root).ok()?.filter_map(|entry| {
++        let path = entry.ok()?.path();
++        let version = path.file_name()?.to_str()?.strip_prefix("state_")?.strip_suffix(".sqlite")?.parse::<u32>().ok()?;
++        Some((version, path))
++    }).max_by_key(|(version, _)| *version)?;
++    let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
++    db.busy_timeout(std::time::Duration::ZERO).ok()?;
++    let mut stmt = db.prepare("SELECT * FROM threads WHERE id=? COLLATE NOCASE LIMIT 1").ok()?;
++    let active = stmt.query_row([id], |row| {
++        let field = |name| row.as_ref().column_index(name).ok();
++        let archived = field("archived").map(|i| row.get::<_, Option<i64>>(i)).transpose()?.flatten().unwrap_or(0);
++        let when = field("archived_at").map(|i| row.get_ref(i)).transpose()?;
++        let path = field("rollout_path").map(|i| row.get::<_, Option<String>>(i)).transpose()?.flatten();
++        Ok(archived == 0 && when.is_none_or(|v| v == rusqlite::types::ValueRef::Null)
++            && !path.is_some_and(|p| Path::new(&p).starts_with(root.join("archived_sessions"))))
++    }).optional().ok()?;
++    Some(active.unwrap_or(false))
++}
++
+ /// How much is read at a time, from the end back, to find the last turn event.
+ const CHUNK: u64 = 256 << 10;
+ 
+diff --git a/src/daemon/directory.rs b/src/daemon/directory.rs
+index 6c0e295..12251d9 100644
+--- a/src/daemon/directory.rs
++++ b/src/daemon/directory.rs
+@@ -126,6 +126,7 @@ impl Daemon {
+         let mut rows = Vec::new();
+         let mut matched = HashSet::new();
+         for l in g.live.values() {
++            if crate::codex::unavailable(&l.reg.key) { continue; }
+             let mut row = self.row(&l.name, &l.reg.agent, &l.reg.cwd, Some(&l.git));
+             row.since = Some(l.since);
+             if let Some((st, at)) = &l.status {
+@@ -238,7 +239,7 @@ impl Daemon {
+     fn remembered(&self, g: &super::Inner) -> Vec<Remembered> {
+         let live: HashSet<&str> = g.live.values().map(|l| l.name.as_str()).collect();
+         let mut known = g.store.sessions().unwrap_or_default();
+-        known.retain(|r| !live.contains(r.name.as_str()) && !self.cfg.off_in(&r.cwd) && !g.paused.contains(&r.key));
++        known.retain(|r| !live.contains(r.name.as_str()) && !self.cfg.off_in(&r.cwd) && !g.paused.contains(&r.key) && !crate::codex::unavailable(&r.key));
+         known
+     }
+ 
+@@ -352,6 +353,7 @@ impl Daemon {
+     fn candidates(&self, g: &super::Inner, remotes: &HashMap<EndpointId, Remote>) -> Vec<Cand> {
+         let mut out = Vec::new();
+         for l in g.live.values() {
++            if crate::codex::unavailable(&l.reg.key) { continue; }
+             out.push(Cand {
+                 person: self.person.clone(),
+                 name: l.name.clone(),
+diff --git a/src/daemon/mail.rs b/src/daemon/mail.rs
+index e864868..7a2ba92 100644
+--- a/src/daemon/mail.rs
++++ b/src/daemon/mail.rs
+@@ -236,6 +236,7 @@ impl Daemon {
+             }
+             // Your own user, not a session: just the pop-up, on each of their machines that is on now. (To get a
+             // teammate's attention, message one of their sessions with notify.)
++            if crate::codex::unavailable(&exclude) { bail!("local Codex thread unavailable; refresh its native session"); }
+             let own = notify && to == self.person;
+             if own && !files.is_empty() {
+                 bail!("files go to a session: send them to one of {to}'s sessions");
+@@ -472,6 +473,7 @@ impl Daemon {
+         msgs: Vec<Message>,
+         wake: bool,
+     ) -> (String, String) {
++        if crate::codex::unavailable(key) { return ("refused".into(), "local Codex thread unavailable".into()); }
+         if !g.live.contains_key(key) {
+             let note = offline_note(g.store.session_by_key(key).ok().flatten().as_ref(), util::now_ms());
+             return ("queued".into(), note);
+@@ -698,6 +700,9 @@ impl Daemon {
+         let this = self.clone();
+         tokio::spawn(async move {
+             let run = async {
++                if bin == "codex" && codex::unavailable(&key) {
++                    return Err("local Codex thread unavailable".into());
++                }
+                 let program = agent::command_for(bin).ok_or_else(|| format!("{bin} not found"))?;
+                 let out = crate::util::no_window(tokio::process::Command::from(program))
+                     .args(&args)
+@@ -830,6 +835,9 @@ impl Daemon {
+             if g.store.has(&msg.id)? {
+                 return Ok(("queued".into(), "already delivered".into()));
+             }
++            if key.as_deref().or_else(|| remembered.as_ref().map(|r| r.key.as_str())).is_some_and(crate::codex::unavailable) {
++                return Ok(("refused".into(), "recipient session unavailable".into()));
++            }
+             // Files take room here: past the quota, the sender's machine keeps the message and tries again later.
+             let bytes = files::size(&msg.files);
+             if bytes > 0 {
+diff --git a/src/daemon/mod.rs b/src/daemon/mod.rs
+index eb345df..3de5e54 100644
+--- a/src/daemon/mod.rs
++++ b/src/daemon/mod.rs
+@@ -381,7 +381,7 @@ impl Daemon {
+             Request::SessionParticipation => {
+                 let g = self.inner.lock().unwrap();
+                 let pending: Vec<_> = g.live.iter().filter(|(_, l)| l.codex_resume_pending).map(|(key, _)| key).collect();
+-                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true,
++                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true,
+                         "resume_pending": pending })
+             }
+             Request::SetReceiveMode { key, network, mode } => {

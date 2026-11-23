@@ -51,7 +51,9 @@ final class SQLiteStore {
         return NetworkError(String(cString: sqlite3_errmsg(db)))
     }
     func insert(_ event: Message, network: String? = nil) throws {
-        let files = event.attachments.isEmpty ? "" : String(decoding: try JSONEncoder().encode(event.attachments), as: UTF8.self)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let files = event.attachments.isEmpty ? "" : String(decoding: try encoder.encode(event.attachments), as: UTF8.self)
         let table = network == nil ? "events" : "network_events"
         let networkColumn = network == nil ? "" : "network,"
         let networkParameter = network == nil ? "" : "?,"
@@ -66,6 +68,35 @@ final class SQLiteStore {
             """, scope + [event.id, String(event.at), event.local, event.peer, event.direction, event.body,
                   event.result, event.replyTo ?? "", files])
     }
+    func insertMirrored(_ event: Message, network: String) throws {
+        // Older clients filed Codex sends under their typed, machine-qualified routing address.
+        // Only coalesce an exact qualification of the resolved peer in this sender's mailbox.
+        _ = try rows("""
+            UPDATE network_events SET peer=? WHERE network=? AND id=? AND local_session=? AND direction='out'
+              AND receipt_stage IS NULL AND substr(peer,1,instr(peer,'@')-1)=? AND instr(peer,'@')>0
+            """, [event.peer, network, event.id, event.local, event.peer])
+        try insert(event, network: network)
+    }
+
+    // Called only for payloads read from the daemon. Keep the original transport note
+    // and preserve attachment metadata when an older daemon cannot supply it.
+    func reconcileEnvelope(_ event: Message, network: String, knowsFiles: Bool) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let files = event.attachments.isEmpty ? "" : String(decoding: try encoder.encode(event.attachments), as: UTF8.self)
+        _ = try rows("""
+            INSERT INTO network_events(network,id,local_session,direction,peer,at,body,result,reply_to,attachments,receipt_stage)
+            VALUES(?,?,?,?,?,?,?,'',?,?,NULLIF(?,''))
+            ON CONFLICT(network,id,local_session,direction) DO UPDATE SET peer=excluded.peer,at=excluded.at,
+              body=excluded.body,reply_to=excluded.reply_to,receipt_stage=excluded.receipt_stage,
+              attachments=CASE WHEN ?='1' THEN excluded.attachments ELSE attachments END
+            WHERE peer IS NOT excluded.peer OR at IS NOT excluded.at OR body IS NOT excluded.body OR
+              reply_to IS NOT excluded.reply_to OR receipt_stage IS NOT excluded.receipt_stage OR
+              (?='1' AND attachments IS NOT excluded.attachments)
+            """, [network, event.id, event.local, event.direction, event.peer, String(event.at), event.body,
+                  event.replyTo ?? "", files, event.receiptStage ?? "", knowsFiles ? "1" : "0", knowsFiles ? "1" : "0"])
+    }
+
     func transaction<T>(_ body: () throws -> T) throws -> T {
         _ = try rows("BEGIN IMMEDIATE")
         do {
@@ -80,6 +111,54 @@ final class SQLiteStore {
     func prepareNetworkMetadata() throws {
         _ = try rows("CREATE TABLE IF NOT EXISTS network_periods(network TEXT NOT NULL,since REAL NOT NULL)")
         _ = try rows("CREATE TABLE IF NOT EXISTS network_inbox(id TEXT PRIMARY KEY,network TEXT NOT NULL)")
+    }
+
+    struct SessionLabel: Equatable {
+        var title: String?
+        var activity: String?
+    }
+
+    func sessionLabels(network: String, sessions: inout [NetworkSession]) throws -> [String: SessionLabel] {
+        var labels: [String: SessionLabel] = [:]
+        for row in try rows("SELECT address,title,activity FROM session_labels WHERE network=?", [network]) {
+            if let address = row["address"] {
+                labels[address] = SessionLabel(title: row["title"], activity: row["activity"])
+            }
+        }
+        let counts = Dictionary(grouping: sessions, by: \.address)
+        var changes: [String: SessionLabel] = [:]
+        for i in sessions.indices {
+            let session = sessions[i]
+            var addresses: [String] = []
+            if counts[session.address]?.count == 1 { addresses.append(session.address) }
+            if let target = session.target?.nonEmpty, target != session.address { addresses.append(target) }
+            guard let address = addresses.last else { continue }
+            let title = session.clientTitle?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            let activity = session.doing?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            for key in addresses {
+                let previous = labels[key]
+                let label = SessionLabel(title: title ?? previous?.title, activity: activity ?? previous?.activity)
+                if (title != nil || activity != nil) && previous != label {
+                    // Persist only observed fields. Another client may have learned the other field since our read.
+                    changes[key] = SessionLabel(title: title, activity: activity)
+                    labels[key] = label
+                }
+            }
+            sessions[i].clientTitle = labels[address]?.title
+            sessions[i].doing = labels[address]?.activity
+        }
+        if !changes.isEmpty {
+            try transaction {
+                for (address, label) in changes {
+                    _ = try rows("""
+                        INSERT INTO session_labels(network,address,title,activity) VALUES(?,?,NULLIF(?,''),NULLIF(?,''))
+                        ON CONFLICT(network,address) DO UPDATE SET title=COALESCE(excluded.title,title),
+                            activity=COALESCE(excluded.activity,activity)
+                        """, [network, address, label.title ?? "", label.activity ?? ""])
+                }
+            }
+        }
+        return labels
     }
 
     func recordInboxOwnership(_ network: String, engine: SQLiteStore) throws {

@@ -15,7 +15,15 @@
               0,
               0
             ]
-          }
+          },
+          "fill-specializations": [
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "srgb:0.79,0.79,0.79,1.00000"
+              }
+            }
+          ]
         }
       ],
       "lighting": "combined",
@@ -41,7 +49,15 @@
               0,
               0
             ]
-          }
+          },
+          "fill-specializations": [
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "srgb:0.95,0.95,0.95,1.00000"
+              }
+            }
+          ]
         }
       ],
       "lighting": "combined",

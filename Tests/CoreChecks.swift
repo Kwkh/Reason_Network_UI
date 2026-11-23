@@ -15,19 +15,29 @@ struct CoreChecks {
         let initial = (1...99).map(sample)
         let full = initial + [sample(100)]
         let next = (2...101).map(sample)
-        try expect(window.receive(initial, atBottom: false), "first load follows latest")
-        try expect(!window.receive(full, atBottom: false) && window.messages == full,
+        try expect(window.receive(initial, proximity: .away), "first load follows latest")
+        try expect(!window.receive(full, proximity: .away) && window.messages == full,
                    "pure append leaves the reading position alone")
-        try expect(!window.receive(next, atBottom: false) && window.messages == full && window.hasPendingUpdate,
+        try expect(!window.receive(next, proximity: .away) && window.messages == full && window.hasPendingUpdate,
                    "dropping the oldest row during reading preserves the displayed window")
         let burst = (202...301).map(sample)
-        try expect(!window.receive(burst, atBottom: false) && window.messages == full,
+        try expect(!window.receive(burst, proximity: .away) && window.messages == full,
                    "a burst with no overlap still preserves the paragraph")
         window.show(burst)
         try expect(window.messages == burst && !window.hasPendingUpdate, "jump shows the latest snapshot")
-        try expect(!window.receive(burst, atBottom: true), "identical polling never scrolls")
-        try expect(window.receive(next, atBottom: true) && window.messages == next, "pinned view follows replacement")
-        try expect(!window.receive([], atBottom: false) && window.messages.isEmpty, "empty history clears visible rows")
+        try expect(!window.receive(burst, proximity: .pinned), "identical polling never scrolls")
+        try expect(window.receive(next, proximity: .pinned) && window.messages == next, "pinned view follows replacement")
+        try expect(TranscriptBottomProximity(distance: 8, viewportHeight: 500) == .pinned &&
+                   TranscriptBottomProximity(distance: 60, viewportHeight: 500) == .nearby &&
+                   TranscriptBottomProximity(distance: 100, viewportHeight: 500) == .away &&
+                   TranscriptBottomProximity(distance: 65, viewportHeight: 300) == .away, "near-bottom band scales down for short viewports")
+        window.show(initial)
+        try expect(window.receive(full, proximity: .nearby), "nearby reader follows a new last message")
+        var updated = full
+        updated[updated.count - 1].receiptStage = "accepted"
+        try expect(!window.receive(updated, proximity: .nearby), "receipt alone preserves nearby reading position")
+        try expect(window.receive(next, proximity: .nearby), "nearby reader follows rolling history")
+        try expect(!window.receive([], proximity: .away) && window.messages.isEmpty, "empty history clears visible rows")
     }
 
     @MainActor
@@ -104,6 +114,57 @@ struct CoreChecks {
         try expect(model.canSend && model.options == original, "confirmed return enables sending with the original draft")
     }
 
+    @MainActor
+    static func checkThreadLifecycle(service: ReasonService, engine: SQLiteStore, catalog: SQLiteStore) async throws {
+        let uuid = UUID().uuidString.lowercased(), key = "codex:" + uuid
+        _ = try engine.rows("UPDATE sessions SET key=? WHERE name='local'", [key])
+        _ = try catalog.rows("INSERT INTO threads(id,title,cwd,archived) VALUES(?,'Lifecycle fixture','/tmp',1)", [uuid])
+        let model = NetworkModel(service: service)
+        model.selectedLocal = "local"
+        model.selectedPeer = "peer/remote"
+        await model.refresh()
+        model.draft = "保留草稿"
+        for expected in [LocalThreadRestriction.archived, .missing, .unverified] {
+            if expected == .missing { _ = try catalog.rows("DELETE FROM threads WHERE id=?", [uuid]) }
+            if expected == .unverified { _ = try catalog.rows("ALTER TABLE threads RENAME TO temporarily_unavailable") }
+            await model.refresh()
+            try expect(model.own?.restriction == expected && model.own?.historyOnly == true && !model.canSend &&
+                       !model.senderOffline && model.messages.contains { $0.id == "incoming" } && model.draft == "保留草稿",
+                       "stale directory cannot enable restricted sender; history and draft survive")
+            try expect(model.peer?.available == true && model.directory?.liveLocalSession(named: "local", agent: "codex") == nil,
+                       "local restriction does not alter a remote peer")
+            let other = try await service.snapshot(local: "sibling", peer: "me/local")
+            try expect(other.directory.sessions.first { $0.name == "local" }?.restriction == expected,
+                       "restricted recipient cannot remain online on this Mac")
+            do {
+                _ = try await service.send(network: "team-a", local: "local", to: "peer/remote", body: "blocked")
+                throw NetworkError("unexpected send")
+            } catch { try expect(error.localizedDescription.contains("仅可查看"), "service rechecks stale send even before a UI refresh") }
+        }
+        _ = try catalog.rows("ALTER TABLE temporarily_unavailable RENAME TO threads")
+        _ = try catalog.rows("INSERT INTO threads(id,title,cwd,archived) VALUES(?,'Lifecycle fixture','/tmp',0)", [uuid])
+        await model.refresh()
+        try expect(model.canSend && model.senderPresence == .online && model.draft == "保留草稿",
+                   "same UUID returns, keeps history and draft, can send again")
+        _ = try engine.rows("CREATE TABLE IF NOT EXISTS paused_sessions(key TEXT PRIMARY KEY)")
+        _ = try engine.rows("INSERT INTO paused_sessions(key) VALUES(?)", [key])
+        _ = try catalog.rows("DELETE FROM threads WHERE id=?", [uuid])
+        let afterExit = try await service.snapshot(local: "sibling", peer: "me/local")
+        try expect(!afterExit.localSessions.contains { $0.name == "local" } &&
+                   !afterExit.directory.sessions.contains { $0.address == "me/local" } &&
+                   !afterExit.conversations.contains { $0.address == "me/local" }, "paused missing UUID is hidden despite directory and cached history")
+        let retained = try await service.history(network: "team-a", local: "local", peer: "peer/remote")
+        try expect(retained.messages.contains { $0.id == "incoming" }, "explicit exit preserves message history")
+        _ = try engine.rows("DELETE FROM sessions WHERE name='detached'")
+        let retired = try await service.snapshot(local: "detached", peer: "peer/remote")
+        guard let onlyHistory = retired.localSessions.first(where: { $0.name == "detached" }) else { throw NetworkError("missing history fixture") }
+        try expect(!onlyHistory.hasRegistration, "no daemon identity remains")
+        try await service.removeLocal(onlyHistory, network: "team-a")
+        let hidden = try await service.snapshot(local: "detached", peer: "peer/remote")
+        try expect(!hidden.localSessions.contains { $0.name == "detached" } && hidden.messages.contains { $0.id == "late-in" }, "hiding a history-only identity preserves its events")
+        print("PASS: local archive, missing UUID, unavailable index, retained history and draft, restoration, remote isolation")
+    }
+
     static func main() async throws {
         try checkReadingWindow()
         let fm = FileManager.default
@@ -137,7 +198,11 @@ if sys.argv[1]=='who':
  local={'address':'me/local','name':'local','agent':'codex','person':'me','machine':'fixture-mac','status':'live','tier':'pull'}
  sibling=dict(local,address='me/sibling',name='sibling',status='busy')
  if (home/'offline').exists(): local['machine']='another-mac'
- print(json.dumps({'team':'fixture','person':'me','machine':'fixture-mac','sessions':[{'address':'peer/remote','name':'remote','person':'peer','doing':'Remote title','tier':'push'},local,sibling],'machines':[{'person':'me','machine':'fixture-mac','endpoint':'fixture','is_me':True,'online':True}]}))
+ remote={'address':'peer/remote','name':'remote','person':'peer','doing':'Remote title','tier':'push'}
+ metadata=home/'peer-metadata.json'
+ if metadata.exists(): remote.update(json.loads(metadata.read_text()))
+ peers=[] if (home/'peer-away').exists() else [remote]
+ print(json.dumps({'team':'fixture','person':'me','machine':'fixture-mac','sessions':peers+[local,sibling],'machines':[{'person':'me','machine':'fixture-mac','endpoint':'fixture','is_me':True,'online':True}]}))
 elif sys.argv[1]=='leave':
  assert sys.argv[2:] == []
  if (home/'refuse').exists(): sys.exit("no teammate is online")
@@ -230,6 +295,27 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         try expect(reverted.localSessions.first { $0.name == "local" }?.title == "Generated", "refresh observes title changes, including removed custom name")
         let advertised = try JSONDecoder().decode(NetworkSession.self, from: Data(#"{"address":"other/s","name":"s","person":"other","title":"A · B","doing":"A · B · testing"}"#.utf8))
         try expect(advertised.title == "A · B", "explicit peer title takes precedence over activity")
+        let metadata = home.appendingPathComponent("peer-metadata.json")
+        let absent = home.appendingPathComponent("peer-away")
+        func offlinePeer() async throws -> NetworkSession? {
+            let fresh = try await ReasonService(home: home).snapshot(local: "local", peer: "peer/remote")
+            return fresh.conversations.first { $0.address == "peer/remote" }
+        }
+        try Data().write(to: absent)
+        let legacyPeer = try await offlinePeer()
+        try expect(legacyPeer?.title == "Remote title" && legacyPeer?.clientTitle == nil, "legacy activity fallback survives restart")
+        try fm.removeItem(at: absent)
+        for title in ["Original", "Renamed"] {
+            try JSONEncoder().encode(["title": title]).write(to: metadata)
+            _ = try await service.snapshot(local: "local", peer: "peer/remote")
+        }
+        try Data(#"{"title":" ","doing":null}"#.utf8).write(to: metadata)
+        let incomplete = try await service.snapshot(local: "local", peer: "peer/remote")
+        try expect(incomplete.directory.sessions.first?.title == "Renamed", "partial directory cannot wipe confirmed title")
+        try Data().write(to: absent)
+        let away = try await offlinePeer()
+        try expect(away?.title == "Renamed" && away?.offline == true, "offline peer retains renamed title after restart")
+        try fm.removeItem(at: absent)
         let unread = try engine.rows("SELECT read_at FROM messages WHERE id='incoming'").first
         try expect(unread?["read_at"] == nil, "mirror never acknowledges inbox")
         do { _ = try await service.send(network: "team-a", local: "missing", to: "peer/remote", body: "hello"); throw NetworkError("invalid local accepted") }
@@ -252,12 +338,12 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         let after = try await service.snapshot(local: "local", peer: "peer/remote")
         try expect(after.messages.filter(\.outgoing).count == 1, "successful outgoing cached")
         _ = try engine.rows("CREATE TABLE sent_receipts(id TEXT,sender TEXT,recipient TEXT,stage TEXT,sent_at INTEGER)")
-        _ = try engine.rows("INSERT INTO sent_receipts VALUES('01234567890123456789012345','me/local','peer/remote','replied',1000)")
+        _ = try engine.rows("INSERT INTO sent_receipts VALUES('01234567890123456789012345','me/local','peer/remote','replied',2100)")
         let updated = try await service.snapshot(local: "local", peer: "peer/remote")
         try expect(updated.messages.first(where: { $0.outgoing })?.delivery == "已回复", "remote reply replaces initial queue status")
         var visible = ConversationReadingWindow()
         visible.show(after.messages)
-        try expect(!visible.receive(updated.messages, atBottom: false) && visible.messages == updated.messages &&
+        try expect(!visible.receive(updated.messages, proximity: .away) && visible.messages == updated.messages &&
                    !visible.hasPendingUpdate, "receipt-only updates preserve scroll position")
         let other = try await service.snapshot(local: "local", peer: "other/peer")
         try expect(other.messages.isEmpty, "conversation isolation")
@@ -284,6 +370,33 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         do { _ = try await service.attachmentText(escaping); throw NetworkError("FAIL outside inbox") }
         catch { try expect(error.localizedDescription != "FAIL outside inbox", "preview confined to inbox") }
         let cache = try SQLiteStore(home.appendingPathComponent(".reason/network/local-ui/messages.sqlite3"), readOnly: false)
+        _ = try engine.rows("ALTER TABLE sent_receipts ADD COLUMN sender_key TEXT")
+        _ = try engine.rows("CREATE TABLE outbox(id TEXT PRIMARY KEY,msg TEXT)")
+        _ = try engine.rows("INSERT INTO sent_receipts VALUES('native','me/sibling','me/local','replied',2100,'codex:sibling')")
+        _ = try engine.rows("INSERT INTO messages(id,sent_at,sender,body,recipient,held,reply_to) VALUES('native',2100,'me/sibling','exact body','me/local',0,'parent')")
+        try cache.insert(Message(id: "native", at: 1, local: "sibling", peer: "me/local@fixture-mac", direction: "out", body: "stale", result: "queued"), network: "team-a")
+        try cache.insert(Message(id: "native", at: 1, local: "local", peer: "me/sibling", direction: "in", body: "stale", result: ""), network: "team-a")
+        let repaired = try await service.snapshot(local: "sibling", peer: "me/local")
+        let source = repaired.messages.filter { $0.id == "native" }
+        let destination = try await service.history(network: "team-a", local: "local", peer: "me/sibling").messages.first { $0.id == "native" }
+        try expect(source.count == 1 && source[0].outgoing && source[0].body == "exact body" && source[0].replyTo == "parent"
+                   && source[0].at == 2.1 && source[0].receiptStage == "replied" && destination?.body == source[0].body
+                   && destination?.at == source[0].at && destination?.replyTo == source[0].replyTo, "daemon repairs both mailbox views by ID")
+        let stalePeer = try await service.history(network: "team-a", local: "sibling", peer: "me/local@fixture-mac")
+        try expect(stalePeer.messages.isEmpty, "corrected peer leaves no ghost conversation")
+        _ = try cache.rows("DELETE FROM network_events WHERE id='native' AND direction='out'")
+        let rebuilt = try await service.snapshot(local: "sibling", peer: "me/local")
+        try expect(rebuilt.messages.count == repaired.messages.count && rebuilt.messages.first(where: { $0.id == "native" })?.body == "exact body", "reconstruct outgoing from inbox and receipt without transcript")
+        _ = try engine.rows("INSERT INTO sent_receipts VALUES('remote-q','me/local','peer/terminal@remote-mac','queued',2300,'codex:fixture')")
+        _ = try engine.rows("INSERT INTO outbox VALUES('remote-q',?)", [#"{"id":"remote-q","from":"me/local","to":"peer/terminal","body":"queued outside app","reply_to":"native","files":[{"name":"x.txt","content":"sample"}]}"#])
+        _ = try engine.rows("INSERT INTO sent_receipts VALUES('no-body','me/local','peer/terminal@remote-mac','replied',2400,'codex:fixture')")
+        _ = try engine.rows("INSERT INTO outbox VALUES('no-body',?)", [#"{"id":"no-body","from":"other/sender","to":"peer/terminal","body":"wrong envelope"}"#])
+        let queued = try await service.snapshot(local: "local", peer: "peer/terminal@remote-mac")
+        try expect(queued.messages.count == 1 && queued.messages[0].body == "queued outside app" && queued.messages[0].replyTo == "native"
+                   && queued.messages[0].attachments == [MessageAttachment(name: "x.txt")], "qualified terminal, remote queue and reply recovered, unrelated envelope ignored")
+        _ = try engine.rows("DELETE FROM outbox")
+        let retained = try await service.snapshot(local: "local", peer: "peer/terminal@remote-mac")
+        try expect(retained.messages == queued.messages, "payload survives outbox draining and repeated sync")
         for i in 0..<230 {
             try cache.insert(Message(id: String(format: "page%03d", i), at: 42, local: "local", peer: "history", direction: "in", body: "正文", result: ""), network: "team-a")
         }
@@ -296,7 +409,7 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         var reading = ConversationReadingWindow()
         reading.show(newest.messages)
         reading.prepend(middle, before: newest.messages[0].rowKey)
-        try expect(!reading.receive(newest.messages, atBottom: false) && reading.messages.count == 200, "poll preserves explicitly loaded history")
+        try expect(!reading.receive(newest.messages, proximity: .away) && reading.messages.count == 200, "poll preserves explicitly loaded history")
         try await checkExpandedHistory(service: service, cache: cache)
         _ = try engine.rows("INSERT INTO sessions(name,key,agent,doing,attached,last_seen) VALUES('detached','codex:detached','codex',NULL,0,1)")
         _ = try engine.rows("INSERT INTO messages(id,sent_at,sender,body,recipient,held) VALUES('late-in',2000,'peer/remote','late','me/detached',0)")
@@ -349,12 +462,16 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         try joinFixture("team-b")
         _ = try engine.rows("INSERT INTO messages(id,sent_at,sender,body,recipient,held) VALUES('other-team',1000,'peer/remote','another network','me/local',0)")
         let restarted = ReasonService(home: home)
+        try Data().write(to: absent)
         let otherNetwork = try await restarted.snapshot(local: "local", peer: "peer/remote")
         try expect(otherNetwork.messages.map(\.id) == ["other-team"], "same network name and peer address cannot show previous network inbox or outbox")
+        try expect(otherNetwork.conversations.first { $0.address == "peer/remote" }?.title == "remote", "title cache isolated across networks")
         try await restarted.leaveNetwork(expected: "team-b")
         try SQLiteStore.prepareNetworkJoin(home: home)
         try joinFixture("team-a")
         let restored = try await ReasonService(home: home).snapshot(local: "local", peer: "peer/remote")
+        try expect(restored.conversations.first { $0.address == "peer/remote" }?.title == "Renamed", "same network restores cached peer title")
+        try fm.removeItem(at: absent)
         try expect(restored.messages == withFiles.messages, "original incoming and sent messages and attachments survive leaving, other team and restart")
         print("PASS: confirmed leave, stale confirmation, refused leave, same-address team isolation and rejoin history")
         let literal = TranscriptMirror.literalSend(#"text(await tools.mcp__reason_network__send_message({to:"peer/remote",message:"hi\nthere"}));"#)
@@ -370,6 +487,22 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         }
         let call = try line(["type":"function_call","call_id":"one","name":"mcp__reason_network__send_message","arguments":"{\"to\":\"peer/remote\",\"message\":\"from agent\"}"])
         let output = try line(["type":"function_call_output","call_id":"one","output":"queued message id 11234567890123456789012345"])
+        let nativeID = "01M8427YF8TGWSVA9MDHWDSHN4"
+        let nativeNote = "→ me/local: sending to the Codex session through its native input channel\nmessage id " + nativeID
+        let payload = try JSONSerialization.data(withJSONObject: ["content": [["type": "text", "text": nativeNote]]])
+        let wrapped = [["type":"input_text","text":"Script completed\nOutput:\n"],
+                       ["type":"input_text","text":String(decoding: payload, as: UTF8.self)]]
+        let nativeCall = try line(["type":"custom_tool_call","name":"exec","call_id":"wrapped","input":#"text(await tools.mcp__reason_network__send_message({to:"me/local@fixture-mac",message:"exact body"}))"#])
+        let nativeOutput = try line(["type":"custom_tool_call_output","call_id":"wrapped","output":wrapped])
+        let replayRoot = home.appendingPathComponent("native-replay/sessions")
+        try fm.createDirectory(at: replayRoot, withIntermediateDirectories: true)
+        try (nativeCall + nativeOutput).write(to: replayRoot.appendingPathComponent("rollout-sibling.jsonl"))
+        var nativeEvents: [Message] = []
+        try TranscriptMirror(root: replayRoot).sync(for: LocalSession(name: "sibling", key: "codex:SIBLING")) { nativeEvents += $0 }
+        try expect(nativeEvents.count == 1 && nativeEvents[0].id == nativeID && nativeEvents[0].peer == "me/local"
+                   && nativeEvents[0].body == "exact body" && nativeEvents[0].delivery == "已发送", "native confirmation, resolved address and nested output decoded")
+        try expect(TranscriptMirror.confirmation(in: ["isError": true, "content":[["type":"text","text":nativeNote]]]) == nil
+                   && TranscriptMirror.confirmation(in: "not delivered\nmessage id " + nativeID) == nil, "error and unrelated ID do not create messages")
         let split = output.count / 2
         var first = call; first.append(output.prefix(split)); try first.write(to: log)
         let mirror = TranscriptMirror(root: home.appendingPathComponent(".codex/sessions"))
@@ -405,6 +538,7 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         var backfill: [Message] = []
         try reopened.sync(for: local) { backfill += $0 }
         try expect(backfill.map(\.id) == events.map(\.id), "fresh mirror reads records before the former 8 MB cutoff")
+        try await checkThreadLifecycle(service: service, engine: engine, catalog: catalog)
         print("PASS: native adapter, read-only inbox, held-message exclusion, conversation isolation, sender identity, literal extraction, partial JSONL, and send cache")
     }
 }
