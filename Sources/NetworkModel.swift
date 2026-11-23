@@ -4,10 +4,18 @@ import SwiftUI
 final class NetworkModel: ObservableObject {
     @Published var directory: Directory?
     @Published var locals: [LocalSession] = []
+    @Published private(set) var unjoinedCodexSessions: [PersonalSession] = []
     @Published var messages: [Message] = []
     @Published private(set) var waitingForHistory = true
     @Published var conversations: [String] = []
-    @Published var selectedLocal: String { didSet { guard oldValue != selectedLocal else { return }; UserDefaults.standard.set(selectedLocal, forKey: "selectedLocal"); changedConversation() } }
+    @Published var selectedLocal: String {
+        didSet {
+            guard oldValue != selectedLocal else { return }
+            UserDefaults.standard.set(selectedLocal, forKey: "selectedLocal")
+            notice = ""
+            Task { await refresh() }
+        }
+    }
     @Published var selectedPeer: String { didSet { guard oldValue != selectedPeer else { return }; UserDefaults.standard.set(selectedPeer, forKey: "selectedPeer"); changedConversation() } }
     struct Draft: Equatable {
         var text = ""
@@ -28,7 +36,9 @@ final class NetworkModel: ObservableObject {
     }
     func loadEarlier(before message: Message) async throws -> MessagePage {
         guard let network = directory?.networkID else { throw NetworkError("本机尚未加入 Network。") }
-        return try await service.history(network: network, local: message.local, peer: message.peer, before: message.rowKey)
+        let page = try await service.history(network: network, local: message.local, peer: message.peer,
+                                             before: message.rowKey, acrossLocalIdentities: true)
+        return MessagePage(messages: displayTitles(in: page.messages), hasEarlier: page.hasEarlier)
     }
     func readAttachment(_ attachment: MessageAttachment) async throws -> String {
         try await service.attachmentText(attachment)
@@ -59,6 +69,7 @@ final class NetworkModel: ObservableObject {
         selectedPeer = UserDefaults.standard.string(forKey: "selectedPeer") ?? ""
     }
     var conversationKey: String { (directory?.networkID ?? "") + "/" + selectedLocal + "/" + selectedPeer }
+    var historyKey: String { (directory?.networkID ?? "") + "/" + selectedPeer }
     var draft: String {
         get { options.text }
         set {
@@ -67,7 +78,11 @@ final class NetworkModel: ObservableObject {
         }
     }
     var peers: [NetworkSession] {
-        var result = directory?.sessions.filter { $0.person != directory?.person } ?? []
+        var result = directory?.sessions.filter { session in
+            session.person != directory?.person ||
+                (session.machine == directory?.machine && session.agent == "codex" &&
+                 session.clientTitle != nil && session.name != selectedLocal)
+        } ?? []
         for address in conversations where !result.contains(where: { $0.address == address }) {
             let parts = address.split(separator: "/", maxSplits: 1).map(String.init)
             result.append(NetworkSession(address: address, name: parts.last ?? address, person: parts.first ?? "", agent: "离线", status: "offline"))
@@ -79,7 +94,11 @@ final class NetworkModel: ObservableObject {
     var canSend: Bool {
         !leavingNetwork && !sending && error == nil && own?.historyOnly == false && peer?.offline == false && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !options.files.isEmpty)
     }
-    var online: Bool { directory != nil && error == nil }
+    var localServiceConnected: Bool { directory != nil && error == nil }
+    var localServiceStatus: String {
+        if error != nil { return "本机连接异常" }
+        return localServiceConnected ? "本机已连接" : "本机连接中"
+    }
     var tier: String? { directory?.sessions.first { $0.person == directory?.person && $0.name == selectedLocal }?.tier }
     func start() async {
         guard !running else { return }; running = true
@@ -90,7 +109,7 @@ final class NetworkModel: ObservableObject {
         }
     }
     private func changedConversation() {
-        let cached = messageCache[conversationKey]
+        let cached = messageCache[historyKey]
         waitingForHistory = cached == nil
         messages = cached ?? []
         hasEarlier = false
@@ -116,11 +135,15 @@ final class NetworkModel: ObservableObject {
             requestAgain = false
             let local = selectedLocal, peer = selectedPeer
             do {
-                let snapshot = try await service.snapshot(local: local, peer: peer)
+                let snapshot = try await service.snapshot(local: local, peer: peer, acrossLocalIdentities: true)
                 guard !leavingNetwork, departure == departureCount else { return }
                 guard local == selectedLocal, peer == selectedPeer else { requestAgain = true; continue }
+                if directory?.networkID != snapshot.directory.networkID { messageCache.removeAll() }
                 if directory != snapshot.directory { directory = snapshot.directory }
                 if locals != snapshot.localSessions { locals = snapshot.localSessions }
+                if unjoinedCodexSessions != snapshot.unjoinedCodexSessions {
+                    unjoinedCodexSessions = snapshot.unjoinedCodexSessions
+                }
                 if !locals.contains(where: { $0.name == selectedLocal }), selectedLocal != (locals.first?.name ?? "") {
                     selectedLocal = locals.first?.name ?? ""
                     requestAgain = true
@@ -131,8 +154,9 @@ final class NetworkModel: ObservableObject {
                 if waitingForHistory { waitingForHistory = false }
                 if conversations != snapshot.conversations { conversations = snapshot.conversations }
                 if hasEarlier != snapshot.hasEarlier { hasEarlier = snapshot.hasEarlier }
-                messageCache[conversationKey] = snapshot.messages
-                if messages != snapshot.messages { messages = snapshot.messages }
+                let namedMessages = displayTitles(in: snapshot.messages)
+                messageCache[historyKey] = namedMessages
+                if messages != namedMessages { messages = namedMessages }
                 if !peers.contains(where: { $0.address == selectedPeer }), selectedPeer != (peers.first?.address ?? "") {
                     selectedPeer = peers.first?.address ?? ""
                     requestAgain = true
@@ -144,6 +168,15 @@ final class NetworkModel: ObservableObject {
             }
         } while requestAgain && !Task.isCancelled
     }
+    private func displayTitles(in messages: [Message]) -> [Message] {
+        let titles = Dictionary(locals.map { ($0.name, $0.title) }, uniquingKeysWith: { first, _ in first })
+        return messages.map { original in
+            var message = original
+            message.localTitle = titles[message.local]
+            return message
+        }
+    }
+
     func send() async {
         guard canSend, let network = directory?.networkID else { return }
         let local = selectedLocal, peer = selectedPeer, item = options, key = conversationKey
@@ -211,6 +244,7 @@ final class NetworkModel: ObservableObject {
         try await service.leaveNetwork(expected: id)
         directory = nil
         locals = []
+        unjoinedCodexSessions = []
         conversations = []
         messages = []
         messageCache.removeAll()

@@ -132,6 +132,8 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         let snapshot = try await service.snapshot(local: "local", peer: "peer/remote")
         try expect(snapshot.messages.count == 1, "held messages excluded")
         try expect(snapshot.localSessions.first?.title == "Local title", "local title retained")
+        try expect(Set(snapshot.unjoinedCodexSessions.compactMap(\.nativeID)) == Set([userID, visibleID]),
+                   "sidebar previews real unjoined Codex threads and excludes internal, attached and archived conversations")
         try expect(snapshot.directory.sessions.first?.title == "Remote title", "remote title decoded")
         try expect(snapshot.directory.machines.first?.isMe == true, "snake case device fields decoded")
         _ = try catalog.rows("ALTER TABLE threads ADD COLUMN name TEXT")
@@ -224,6 +226,14 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         try expect(scoped.messages.count == 2 && Set(scoped.messages.map(\.rowKey)).count == 2, "both directions are distinct transcript rows")
         let prior = try await sharedService.history(network: "team-a", local: "one", peer: "peer", before: scoped.messages[1].rowKey)
         try expect(prior.messages == [scoped.messages[0]], "cursor disambiguates same ID and timestamp")
+        try shared.insert(sharedEvent("other-account", "in"), network: "team-b")
+        let aggregate = try await sharedService.snapshot(local: "one", peer: "peer", acrossLocalIdentities: true)
+        try expect(aggregate.messages.count == 3 && Set(aggregate.messages.map(\.local)) == Set(["one", "two"]),
+                   "the app includes both local senders for the current Network only")
+        let sharedPrior = try await sharedService.history(network: "team-a", local: "one", peer: "peer",
+                                                          before: aggregate.messages[2].rowKey, acrossLocalIdentities: true)
+        try expect(sharedPrior.messages == Array(aggregate.messages.prefix(2)),
+                   "aggregation preserves the cursor across identities with identical message IDs")
         let saved = try shared.rows("SELECT * FROM events")
         try expect(saved.count == 3 && saved.allSatisfy { $0["unread"] == "1" && $0["body"] == "original" }, "existing cache content and unread flags survive")
         try expect(saved.filter { $0["attachments"]?.isEmpty == false }.count == 1 &&

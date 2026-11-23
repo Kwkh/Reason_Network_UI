@@ -8,6 +8,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply { .terminateNow }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag { sender.windows.first { $0.canBecomeMain }?.makeKeyAndOrderFront(nil) }
         return true
@@ -40,6 +43,9 @@ struct ReasonNetworkApp: App {
         .commands {
             SidebarCommands()
             CommandGroup(replacing: .newItem) { }
+            CommandGroup(replacing: .appTermination) {
+                Button("退出 Reason Network") { NSApplication.shared.terminate(nil) }.keyboardShortcut("q")
+            }
             CommandGroup(after: .toolbar) {
                 Picker("外观", selection: $appearance) {
                     ForEach(DisplayAppearance.allCases, id: \.self) { option in

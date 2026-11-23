@@ -127,6 +127,8 @@ struct Message: Identifiable, Equatable {
     let result: String
     var replyTo: String? = nil
     var attachments: [MessageAttachment] = []
+    var localTitle: String? = nil
+    var localDisplayName: String { localTitle ?? (local.hasPrefix("console:") ? "独立控制台" : local) }
     var outgoing: Bool { direction == "out" }
     var delivery: String {
         if result.contains("queued") { return "已排队" }
@@ -181,6 +183,7 @@ struct ConversationReadingWindow {
 struct Snapshot {
     let directory: Directory
     let localSessions: [LocalSession]
+    let unjoinedCodexSessions: [PersonalSession]
     let conversations: [String]
     let messages: [Message]
     let hasEarlier: Bool

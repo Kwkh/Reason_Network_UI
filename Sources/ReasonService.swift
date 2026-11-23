@@ -10,7 +10,7 @@ actor ReasonService {
         self.home = home
         mirror = TranscriptMirror(root: home.appendingPathComponent(".codex/sessions"))
     }
-    func snapshot(local: String, peer: String) throws -> Snapshot {
+    func snapshot(local: String, peer: String, acrossLocalIdentities: Bool = false) throws -> Snapshot {
         var directory = try directory()
         let engine = try SQLiteStore(home.appendingPathComponent(".reason/network/network.db"), readOnly: true)
         _ = try engine.rows("BEGIN")
@@ -24,6 +24,9 @@ actor ReasonService {
         let registrations = try engine.rows("SELECT name,key,doing FROM sessions WHERE agent='codex' AND attached=1 ORDER BY last_seen DESC")
             .filter { !paused.contains($0["key"] ?? "") }
         let catalog = PersonalSessionCatalog(home: home)
+        let registered = try engine.rows("SELECT key FROM sessions WHERE agent='codex'")
+        let registeredKeys = Set(registered.compactMap { $0["key"]?.lowercased() }).union(paused.map { $0.lowercased() })
+        let unjoined = (try? catalog.unjoinedCodex(excluding: registeredKeys)) ?? []
         // A missing or temporarily unavailable agent index must not interrupt messaging.
         let titles = (try? catalog.codexTitles(for: registrations.compactMap { $0["key"] })) ?? [:]
         var locals = registrations.compactMap { row -> LocalSession? in
@@ -31,9 +34,9 @@ actor ReasonService {
             let index = directory.sessions.firstIndex {
                 $0.person == directory.person && $0.machine == directory.machine && $0.name == name && $0.agent == "codex"
             }
-            if let index, let title = titles[key] { directory.sessions[index].clientTitle = title }
+            if let index, let title = titles[key.lowercased()] { directory.sessions[index].clientTitle = title }
             let published = index.map { directory.sessions[$0] }
-            return LocalSession(name: name, key: key, doing: titles[key] ?? published?.clientTitle ?? published?.doing ?? row["doing"])
+            return LocalSession(name: name, key: key, doing: titles[key.lowercased()] ?? published?.clientTitle ?? published?.doing ?? row["doing"])
         }
         try cache.recordInboxOwnership(network, engine: engine)
         let otherMail = Set(try cache.rows("SELECT id FROM network_inbox WHERE network<>?", [network]).compactMap { $0["id"] })
@@ -59,9 +62,15 @@ actor ReasonService {
                 locals.append(LocalSession(name: name, key: "history:" + name, historyOnly: true))
             }
         }
-        let conversations = try cache.rows("SELECT peer,MAX(at) AS recent FROM network_events WHERE network=? AND local_session=? GROUP BY peer ORDER BY recent DESC", [network, local]).compactMap { $0["peer"] }
-        let page = try history(network: network, local: local, peer: peer)
-        return Snapshot(directory: directory, localSessions: locals, conversations: conversations, messages: page.messages,
+        let identityFilter = acrossLocalIdentities ? "" : " AND local_session=?"
+        let arguments = acrossLocalIdentities ? [network] : [network, local]
+        let conversations = try cache.rows("""
+            SELECT peer,MAX(at) AS recent FROM network_events WHERE network=?\(identityFilter)
+            GROUP BY peer ORDER BY recent DESC,peer
+            """, arguments).compactMap { $0["peer"] }
+        let page = try history(network: network, local: local, peer: peer, acrossLocalIdentities: acrossLocalIdentities)
+        return Snapshot(directory: directory, localSessions: locals, unjoinedCodexSessions: unjoined,
+                        conversations: conversations, messages: page.messages,
                         hasEarlier: page.hasEarlier, mirrorWarning: warning)
     }
 
@@ -122,14 +131,23 @@ actor ReasonService {
         try file.readText(in: home.appendingPathComponent(".reason/network/inbox"))
     }
 
-    func history(network: String, local: String, peer: String, before: Message.RowKey? = nil) throws -> MessagePage {
-        var sql = "SELECT * FROM network_events WHERE network=? AND local_session=? AND peer=?"
-        var args = [network, local, peer]
+    func history(network: String, local: String, peer: String, before: Message.RowKey? = nil,
+                 acrossLocalIdentities: Bool = false) throws -> MessagePage {
+        var sql = "SELECT * FROM network_events WHERE network=? AND peer=?"
+        var args = [network, peer]
+        if !acrossLocalIdentities {
+            sql += " AND local_session=?"
+            args.append(local)
+        }
         if let before {
-            sql += " AND (at,id,direction) < (SELECT at,id,direction FROM network_events WHERE network=? AND id=? AND local_session=? AND direction=? AND peer=?)"
+            sql += """
+                 AND (at,id,local_session,direction) <
+                (SELECT at,id,local_session,direction FROM network_events
+                 WHERE network=? AND id=? AND local_session=? AND direction=? AND peer=?)
+                """
             args += [network, before.id, before.local, before.direction, peer]
         }
-        let rows = try store().rows(sql + " ORDER BY at DESC,id DESC,direction DESC LIMIT 101", args)
+        let rows = try store().rows(sql + " ORDER BY at DESC,id DESC,local_session DESC,direction DESC LIMIT 101", args)
         return MessagePage(messages: rows.prefix(100).reversed().map(SQLiteStore.event), hasEarlier: rows.count > 100)
     }
 
@@ -149,7 +167,10 @@ actor ReasonService {
         guard let key = try engine.rows("SELECT key FROM sessions WHERE name=? AND agent='codex' AND attached=1", [local]).first?["key"] else { throw NetworkError("本机 Codex 会话未连接") }
         guard try !pausedKeys(in: engine).contains(key) else { throw NetworkError("本机会话已退出 Network") }
         let directory = try directory()
-        guard directory.sessions.contains(where: { $0.person != directory.person && $0.address == to }) else { throw NetworkError("该队友会话已离线，请刷新后重新选择") }
+        guard directory.sessions.contains(where: {
+            $0.address == to && $0.available &&
+                ($0.person != directory.person || ($0.machine == directory.machine && $0.agent == "codex" && $0.name != local))
+        }) else { throw NetworkError("该队友会话已离线，请刷新后重新选择") }
         guard try teamID(in: engine) == network else { throw NetworkError("当前 Network 已变化，请刷新后重试。") }
         var arguments = ["send", "--from", key]
         if notify { arguments.append("--notify") }
@@ -332,6 +353,7 @@ actor ReasonService {
               PRIMARY KEY(network,id,local_session,direction))
             """)
         _ = try database.rows("CREATE INDEX IF NOT EXISTS network_history ON network_events(network,local_session,peer,at,id)")
+        _ = try database.rows("CREATE INDEX IF NOT EXISTS network_peer_history ON network_events(network,peer,at,id,local_session,direction)")
         try database.prepareNetworkMetadata()
         cache = database
         return database

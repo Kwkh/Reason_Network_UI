@@ -1,7 +1,7 @@
 import Foundation
 import Darwin
 
-struct PersonalSession: Identifiable {
+struct PersonalSession: Identifiable, Equatable {
     enum Connection: Equatable {
         case notJoined
         case online(String)
@@ -164,14 +164,21 @@ struct PersonalSessionCatalog {
         for offset in stride(from: 0, to: ids.count, by: 500) {
             let batch = Array(ids[offset..<min(offset + 500, ids.count)])
             let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ",")
-            for row in try db.rows("SELECT id, \(titleColumn(fields)) FROM threads WHERE id IN (\(placeholders))", batch) {
-                if let id = row["id"], let title = row["title"]?.nonEmpty { titles["codex:" + id] = title }
+            for row in try db.rows("SELECT id, \(titleColumn(fields)) FROM threads WHERE id COLLATE NOCASE IN (\(placeholders))", batch) {
+                if let id = row["id"], let title = row["title"]?.nonEmpty { titles["codex:" + id.lowercased()] = title }
             }
         }
         return titles
     }
 
-    private func codex(excluding hidden: inout Set<String>) throws -> [PersonalSession] {
+    func unjoinedCodex(excluding registered: Set<String>) throws -> [PersonalSession] {
+        var hidden: Set<String> = []
+        return try codex(excluding: &hidden, previewOnly: true)
+            .filter { !registered.contains($0.id.lowercased()) }
+            .sorted { ($0.updated, $0.id) > ($1.updated, $1.id) }
+    }
+
+    private func codex(excluding hidden: inout Set<String>, previewOnly: Bool = false) throws -> [PersonalSession] {
         let root = home.appendingPathComponent(".codex", isDirectory: true)
         guard let db = try codexDatabase() else { return [] }
         let fields = Set(try db.rows("PRAGMA table_info(threads)").compactMap { $0["name"] })
@@ -182,7 +189,7 @@ struct PersonalSessionCatalog {
         let title = titleColumn(fields)
         let source = fields.contains("source") ? "source" : "NULL AS source"
         let kind = fields.contains("thread_source") ? "thread_source" : "NULL AS thread_source"
-        let projects = try CodexProjects(root: root, db: db)
+        let projects = previewOnly ? nil : try CodexProjects(root: root, db: db)
         let optional = ["project_id", "is_pinned", "attached_thread_parent_id", "archived_at", "updated_at_ms"].map {
             fields.contains($0) ? $0 : "NULL AS " + $0
         }.joined(separator: ",")
@@ -195,11 +202,12 @@ struct PersonalSessionCatalog {
                 return nil
             }
             hidden.remove("codex:" + id.lowercased())
-            let group = projects.group(thread: id, projectID: row["project_id"], cwd: row["cwd"])
+            let group = projects?.group(thread: id, projectID: row["project_id"], cwd: row["cwd"])
             let timestamp = row["updated_at_ms"].flatMap(Double.init).map { $0 / 1000 } ?? Double(row["updated_at"] ?? "") ?? 0
             return PersonalSession(id: "codex:" + id, agent: "codex", title: row["title"]?.nonEmpty ?? "未命名对话",
                                    cwd: row["cwd"], updated: Date(timeIntervalSince1970: timestamp),
-                                   project: group, pinned: row["is_pinned"] == "1", transcript: codexTranscript(row["rollout_path"], under: root),
+                                   project: group, pinned: row["is_pinned"] == "1",
+                                   transcript: previewOnly ? nil : codexTranscript(row["rollout_path"], under: root),
                                    nativeID: id)
         }
     }

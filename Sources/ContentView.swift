@@ -76,7 +76,7 @@ struct ContentView: View {
                 composer
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { composerHeight = $0 }
             }
-            .background(Color(nsColor: .textBackgroundColor).ignoresSafeArea(.container, edges: .top))
+            .background((colorScheme == .dark ? Color.black : Color.white).ignoresSafeArea(.container, edges: .top))
             .foregroundStyle(.primary)
             .frame(minWidth: minimumDetailWidth)
             .toolbar {
@@ -111,10 +111,13 @@ struct ContentView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(Color(nsColor: .labelColor))
                 .truncationMode(.tail)
-            Text(address)
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(Color(nsColor: .secondaryLabelColor))
-                .truncationMode(.middle)
+            HStack(spacing: 6) {
+                Text(address).font(.system(size: 10, design: .monospaced)).truncationMode(.middle)
+                if let peer {
+                    Text(peer.statusText).font(.system(size: 10)).layoutPriority(1)
+                }
+            }
+            .foregroundStyle(Color(nsColor: .secondaryLabelColor))
         }
         .lineLimit(1)
         .frame(maxWidth: maxWidth)
@@ -128,15 +131,15 @@ struct ContentView: View {
     private var statusButton: some View {
         Button { showStatus.toggle() } label: {
             HStack(spacing: 7) {
-                Circle().fill(model.online ? Color.primary.opacity(0.85) : Color.gray).frame(width: 6, height: 6)
-                Text(model.online ? "在线" : model.directory == nil && model.error == nil ? "连接中" : "离线")
+                Circle().fill(model.localServiceConnected ? Color.primary.opacity(0.85) : Color.gray).frame(width: 6, height: 6)
+                Text(model.localServiceStatus)
                     .font(.system(size: 12, weight: .medium))
             }
             .padding(.horizontal, 13).padding(.vertical, 7)
             .background(Capsule().stroke(Color.primary.opacity(0.16), lineWidth: 1))
             .contentShape(Capsule())
         }
-        .buttonStyle(.plain).help("设备状态与本机会话")
+        .buttonStyle(.plain).help("本机连接、设备和发送身份")
         .popover(isPresented: $showStatus, arrowEdge: .bottom) { StatusView().environmentObject(model) }
     }
     private var history: some View {
@@ -153,10 +156,10 @@ struct ContentView: View {
                                         preview = AttachmentPreview(name: file.name, text: text)
                                     }
                                 })
-                .id(model.conversationKey)
+                .id(model.historyKey)
                 .transition(.opacity)
         }
-        .animation(conversationFade, value: model.conversationKey)
+        .animation(conversationFade, value: model.historyKey)
         .overlay(alignment: .top) {
             if let error = model.error {
                 HStack(spacing: 10) {
@@ -572,6 +575,8 @@ private struct ConversationSidebar: View {
             return tokens.allSatisfy { haystack.localizedCaseInsensitiveContains(String($0)) }
         }
         let groups = Dictionary(grouping: sessions, by: \.person)
+        let localMatches = model.unjoinedCodexSessions.filter { $0.matches(query) }
+        let unjoined = tokens.isEmpty ? Array(localMatches.lazy.filter { $0.title != "未命名对话" }.prefix(5)) : localMatches
         VStack(alignment: .leading, spacing: 0) {
             if !model.locals.isEmpty {
                 Menu {
@@ -620,6 +625,26 @@ private struct ConversationSidebar: View {
             }
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
+                    if !unjoined.isEmpty {
+                        Text("未加入的 Codex 对话").font(.caption).foregroundStyle(.secondary).padding(.vertical, 6)
+                        ForEach(unjoined) { session in
+                            HStack(spacing: 8) {
+                                Text(session.title).font(.system(size: 12)).lineLimit(1).help(session.title)
+                                Spacer(minLength: 0)
+                                if model.changingSession == session.id {
+                                    ProgressView().controlSize(.small)
+                                } else if session.canJoin {
+                                    Button("加入") { Task { await model.joinMySession(session) } }
+                                        .buttonStyle(.plain).font(.caption)
+                                        .disabled(model.changingSession != nil)
+                                        .accessibilityLabel("加入 " + session.title)
+                                }
+                            }.padding(.vertical, 5)
+                        }
+                        if let error = model.mySessionsError {
+                            Text(error).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
                     ForEach(groups.keys.sorted(), id: \.self) { person in
                         let people = expansion([person])
                         GroupHeading(title: person, icon: "person", expanded: people.wrappedValue) {
@@ -646,12 +671,17 @@ private struct ConversationSidebar: View {
             }
             .accessibilityLabel("队友会话")
             .overlay(alignment: .top) {
-                if groups.isEmpty && model.directory != nil {
+                if groups.isEmpty && unjoined.isEmpty && model.directory != nil {
                     Text(terms.isEmpty ? "暂无队友会话" : "没有匹配的会话")
                         .font(.callout).foregroundStyle(.secondary).padding(.top)
                 }
             }
             HStack {
+                Button { page = .overview } label: {
+                    Label("概览", systemImage: "square.grid.2x2")
+                        .font(.system(size: 12)).padding(.horizontal, 7).frame(height: 30)
+                }
+                .buttonStyle(.plain)
                 Button { settingsOpen.toggle() } label: {
                     Image(systemName: "gearshape")
                         .font(.system(size: 15))
@@ -661,14 +691,6 @@ private struct ConversationSidebar: View {
                 .buttonStyle(.plain)
                 .popover(isPresented: $settingsOpen, arrowEdge: .top) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Button {
-                            settingsOpen = false
-                            page = .overview
-                        } label: {
-                            Label("概览", systemImage: "square.grid.2x2")
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(6).contentShape(Rectangle())
-                        }
                         Button {
                             settingsOpen = false
                             setup.presented = true
@@ -870,7 +892,8 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
         if changed { text.textStorage?.setAttributedString(record.text) }
         if headerChanged {
             let message = record.message
-            header.stringValue = (message.outgoing ? "我" : sender) + " · " +
+            let identity = message.outgoing ? "我 · " + message.localDisplayName : sender + " → " + message.localDisplayName
+            header.stringValue = identity + " · " +
                 Date(timeIntervalSince1970: message.at).formatted(date: .omitted, time: .shortened)
             delivery.stringValue = message.delivery
             header.alignment = message.outgoing ? .right : .left
