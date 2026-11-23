@@ -13,14 +13,14 @@ actor ReasonService {
         console = ConsoleMailbox(home: home)
     }
     func snapshot(local: String, peer: String, limit: Int = 100, viewingConversation: Bool = false,
-                  restoreConversation: Bool = false) throws -> Snapshot {
+                  restoreConversation: Bool = false, includeAllLocalIdentities: Bool = false) throws -> Snapshot {
         let directory = try directory()
         let engine = try SQLiteStore(home.appendingPathComponent(".reason/network/network.db"), readOnly: true)
-        var locals = try engine.rows("SELECT name,key,doing FROM sessions WHERE agent='codex' AND attached=1 ORDER BY last_seen DESC").map { row in
+        let codexLocals = try engine.rows("SELECT name,key,doing FROM sessions WHERE agent='codex' AND attached=1 ORDER BY last_seen DESC").map { row in
             LocalSession(name: row["name"] ?? "", key: row["key"] ?? "", doing: directory.sessions.first { $0.person == directory.person && $0.name == row["name"] }?.doing ?? row["doing"])
         }
         let paused = try pausedSessionKeys(engine)
-        locals.removeAll { paused.contains($0.key) }
+        var locals = codexLocals.filter { !paused.contains($0.key) }
         if !paused.contains(LocalSession.console.key) { locals.append(.console) }
         let cache = try store()
         var warning: String?
@@ -51,17 +51,25 @@ actor ReasonService {
             }
         }
         let mailbox = local == LocalSession.console.name ? consoleMailbox : local
-        if local == LocalSession.console.name && viewingConversation && !peer.isEmpty {
-            try cache.markRead(mailbox: mailbox, peer: peer)
+        let mailboxes = includeAllLocalIdentities
+            ? Set(codexLocals.map(\.name) + [consoleMailbox, mailbox]).sorted()
+            : [mailbox]
+        if (includeAllLocalIdentities || local == LocalSession.console.name) && viewingConversation && !peer.isEmpty {
+            try cache.markRead(mailbox: consoleMailbox, peer: peer)
         }
-        let conversations = try cache.conversations(in: mailbox)
+        let conversations = try cache.conversations(in: mailboxes)
+        let placeholders = Array(repeating: "?", count: mailboxes.count).joined(separator: ",")
         let messages = try cache.rows("""
-            SELECT * FROM (SELECT * FROM events WHERE local_session=? AND peer=? ORDER BY at DESC,id DESC LIMIT ?) ORDER BY at,id
-            """, [mailbox, peer, String(limit + 1)]).map(SQLiteStore.event)
-        let restored = restoreConversation && conversations.isEmpty
-            ? try recentConversation(local: local, locals: locals, directory: directory,
-                                     consoleAddress: address, consoleMailbox: consoleMailbox, cache: cache)
-            : nil
+            SELECT * FROM (
+                SELECT * FROM events WHERE peer=? AND local_session IN (\(placeholders))
+                ORDER BY at DESC,id DESC,local_session DESC,direction DESC LIMIT ?
+            ) ORDER BY at,id,local_session,direction
+            """, [peer] + mailboxes + [String(limit + 1)]).map(SQLiteStore.event)
+        var restored: ConversationSelection?
+        if try restoreConversation && messages.isEmpty && cache.mostRecentConversation(in: [mailbox]) == nil {
+            restored = try recentConversation(local: local, locals: locals, directory: directory,
+                                              consoleAddress: address, consoleMailbox: consoleMailbox, cache: cache)
+        }
         return Snapshot(restoredConversation: restored, directory: directory, localSessions: locals,
                         conversations: conversations, messages: Array(messages.suffix(limit)),
                         hasEarlierMessages: messages.count > limit, consoleUnread: try cache.unreadCount(in: consoleMailbox),

@@ -57,6 +57,12 @@ elif sys.argv[1] in ('stop','setup'):
                    "an offline identity with no history restores a recent chat from a connected identity")
         let explicitlyChosen = try await service.snapshot(local: "offline-empty", peer: "")
         try expect(explicitlyChosen.restoredConversation == nil, "refreshing an explicitly selected identity never switches it")
+        let shared = try await service.snapshot(local: "offline-empty", peer: "peer/remote", includeAllLocalIdentities: true)
+        try expect(shared.messages.count == 1 && shared.messages.first?.localIdentity == "local",
+                   "chat history includes another local identity's messages for the same peer")
+        try expect(shared.conversations.first?.address == "peer/remote", "sidebar previews include other local identities")
+        let otherPeer = try await service.snapshot(local: "offline-empty", peer: "peer/other", includeAllLocalIdentities: true)
+        try expect(otherPeer.messages.isEmpty, "shared history stays scoped to the selected peer")
         try expect(snapshot.messages.count == 1, "held messages excluded")
         try expect(snapshot.messages.first?.attachments.first?.name == "notes.txt", "engine attachment metadata decoded")
         try expect(snapshot.conversations.first?.preview == "hello", "conversation preview uses the most recent message")

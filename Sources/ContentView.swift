@@ -84,7 +84,7 @@ struct ContentView: View {
                     LazyVStack(spacing: 22) {
                         if model.hasEarlierMessages {
                             Button("加载更早的消息", systemImage: "arrow.up") {
-                                restoreScrollTo = model.messages.first?.id
+                                restoreScrollTo = model.messages.first?.rowID
                                 Task { await model.loadEarlierMessages() }
                             }
                             .buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(.secondary)
@@ -95,9 +95,9 @@ struct ContentView: View {
                                 .font(.system(size: 14)).foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity).padding(.top, 70)
                         }
-                        ForEach(model.messages) { message in
+                        ForEach(model.messages, id: \.rowID) { message in
                             MessageRow(message: message, sender: model.peer?.person ?? "", maximumWidth: min(720, (viewport.size.width - 60) * 0.82))
-                                .id(message.id)
+                                .id(message.rowID)
                         }
                         Color.clear.frame(height: 1).id("bottom")
                     }
@@ -105,18 +105,18 @@ struct ContentView: View {
                 }
                 .modifier(ScrollPinObserver(nearBottom: $nearBottom))
                 .onAppear { proxy.scrollTo("bottom", anchor: .bottom) }
-                .onChange(of: model.conversationKey) { _, _ in
+                .onChange(of: model.selectedPeer) { _, _ in
                     restoreScrollTo = nil
                     nearBottom = true
                     proxy.scrollTo("bottom", anchor: .bottom)
                 }
-                .onChange(of: model.messages.first?.id) { _, _ in
+                .onChange(of: model.messages.first?.rowID) { _, _ in
                     if let restoreScrollTo {
                         proxy.scrollTo(restoreScrollTo, anchor: .top)
                         self.restoreScrollTo = nil
                     }
                 }
-                .onChange(of: model.messages.last?.id) { _, _ in
+                .onChange(of: model.messages.last?.rowID) { _, _ in
                     if nearBottom || model.messages.last?.outgoing == true { proxy.scrollTo("bottom", anchor: .bottom) }
                 }
             }
@@ -484,7 +484,8 @@ private struct MessageRow: View {
         HStack(alignment: .top, spacing: 0) {
             if message.outgoing { Spacer(minLength: 24) }
             VStack(alignment: message.outgoing ? .trailing : .leading, spacing: 6) {
-                Text((message.outgoing ? "我" : sender) + " · " + Date(timeIntervalSince1970: message.at).formatted(date: .omitted, time: .shortened))
+                let identity = message.outgoing ? "我 · " + message.localIdentity : sender + " → " + message.localIdentity
+                Text(identity + " · " + Date(timeIntervalSince1970: message.at).formatted(date: .omitted, time: .shortened))
                     .font(.system(size: 11)).foregroundStyle(.secondary)
                 MessageText(body: message.body, maximumWidth: maximumWidth - 32)
                     .padding(.horizontal, 16).padding(.vertical, 12)

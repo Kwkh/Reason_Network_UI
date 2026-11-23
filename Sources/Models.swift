@@ -108,6 +108,8 @@ struct Message: Identifiable, Equatable {
     var attachments: [MessageAttachment] = []
     var unread = false
     var outgoing: Bool { direction == "out" }
+    var rowID: String { local + "\u{0}" + direction + "\u{0}" + id }
+    var localIdentity: String { local.hasPrefix("console:") ? "独立控制台" : local }
     var delivery: String {
         if result.isEmpty || ["已排队", "已投递", "已发送", "已送达收件箱", "等待对方上线"].contains(result) { return result }
         let receipt = result.lowercased()

@@ -43,8 +43,8 @@ final class NetworkModel: ObservableObject {
             guard oldValue != selectedLocal else { return }
             restoreConversation = false
             UserDefaults.standard.set(selectedLocal, forKey: "selectedLocal")
-            conversations = []
-            changedConversation()
+            notice = ""
+            requestRefresh()
         }
     }
     @Published var selectedPeer: String {
@@ -134,8 +134,11 @@ final class NetworkModel: ObservableObject {
     private func changedConversation() {
         messageLimit = 100
         hasEarlierMessages = false
-        messages = Array((messageCache[conversationKey] ?? []).suffix(messageLimit))
+        messages = Array((messageCache[selectedPeer] ?? []).suffix(messageLimit))
         notice = ""
+        requestRefresh()
+    }
+    private func requestRefresh() {
         if refreshing { requestAgain = true }
         else { Task { await refresh() } }
     }
@@ -149,7 +152,8 @@ final class NetworkModel: ObservableObject {
             do {
                 let viewing = !showsUtilities && NSApp.isActive && NSApp.keyWindow?.isVisible == true
                 let snapshot = try await service.snapshot(local: local, peer: peer, limit: messageLimit,
-                                                          viewingConversation: viewing, restoreConversation: restoreConversation)
+                                                          viewingConversation: viewing, restoreConversation: restoreConversation,
+                                                          includeAllLocalIdentities: true)
                 if directory?.team != snapshot.directory.team || directory?.person != snapshot.directory.person {
                     messageCache.removeAll()
                 }
@@ -174,7 +178,7 @@ final class NetworkModel: ObservableObject {
                 }
                 conversations = snapshot.conversations
                 hasEarlierMessages = snapshot.hasEarlierMessages
-                messageCache[conversationKey] = snapshot.messages
+                messageCache[selectedPeer] = snapshot.messages
                 if messages != snapshot.messages { messages = snapshot.messages }
                 if !selectedPeer.isEmpty, self.peer == nil { selectedPeer = "" }
             } catch {

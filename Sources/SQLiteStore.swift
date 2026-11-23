@@ -78,14 +78,16 @@ final class SQLiteStore {
             """, [event.id, String(event.at), event.local, event.peer, event.direction, event.body, event.result, event.replyTo ?? "", files,
                   event.unread ? "1" : "0"])
     }
-    func conversations(in mailbox: String) throws -> [ConversationSummary] {
-        try rows("""
+    func conversations(in mailboxes: [String]) throws -> [ConversationSummary] {
+        let placeholders = Array(repeating: "?", count: mailboxes.count).joined(separator: ",")
+        return try rows("""
             SELECT peer, body, unread_count FROM (
-                SELECT peer, body, at, id, ROW_NUMBER() OVER (PARTITION BY peer ORDER BY at DESC,id DESC) AS rank,
+                SELECT peer, body, at, id,
+                       ROW_NUMBER() OVER (PARTITION BY peer ORDER BY at DESC,id DESC,local_session,direction) AS rank,
                        SUM(COALESCE(unread,0)) OVER (PARTITION BY peer) AS unread_count
-                FROM events WHERE local_session=?
-            ) WHERE rank=1 ORDER BY at DESC,id DESC
-            """, [mailbox]).compactMap { row in
+                FROM events WHERE local_session IN (\(placeholders))
+            ) WHERE rank=1 ORDER BY at DESC,id DESC,peer
+            """, mailboxes).compactMap { row in
                 guard let address = row["peer"] else { return nil }
                 return ConversationSummary(address: address, preview: row["body"] ?? "", unread: Int(row["unread_count"] ?? "") ?? 0)
             }
