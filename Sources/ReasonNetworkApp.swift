@@ -52,7 +52,7 @@ struct ReasonNetworkApp: App {
                         Text(option.rawValue).tag(option)
                     }
                 }.pickerStyle(.menu)
-                Button("刷新 Network") { Task { await model.refresh() } }.keyboardShortcut("r")
+                Button("刷新 Network") { Task { await model.refreshDirectory(); await model.refresh() } }.keyboardShortcut("r")
             }
         }
     }

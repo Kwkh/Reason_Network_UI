@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 // Extracts only successful Reason send tool calls. Never evaluates transcript code or acknowledges inboxes.
 final class TranscriptMirror {
@@ -22,6 +23,9 @@ final class TranscriptMirror {
         let thread = session.key.hasPrefix("codex:") ? String(session.key.dropFirst(6)) : session.key
         var events: [Message] = []
         for path in files where path.lastPathComponent.contains(thread) {
+            // A file provider can take arbitrarily long to hydrate an evicted transcript.
+            var info = stat()
+            if lstat(path.path, &info) == 0, info.st_flags & UInt32(SF_DATALESS) != 0 { continue }
             let handle = try FileHandle(forReadingFrom: path)
             defer { try? handle.close() }
             let size = try handle.seekToEnd()

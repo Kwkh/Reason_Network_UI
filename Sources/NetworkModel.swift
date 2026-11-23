@@ -3,6 +3,7 @@ import SwiftUI
 @MainActor
 final class NetworkModel: ObservableObject {
     @Published var directory: Directory?
+    @Published private(set) var directoryError: String?
     @Published var locals: [LocalSession] = []
     @Published private(set) var unjoinedCodexSessions: [PersonalSession] = []
     @Published var messages: [Message] = []
@@ -55,6 +56,8 @@ final class NetworkModel: ObservableObject {
     @Published var doctor = ""
     @Published var diagnosing = false
     private let service: ReasonService
+    private let presenceService: ReasonService
+    private var directoryRevision = 0
     @Published private(set) var mySessions: [PersonalSession] = []
     @Published private(set) var loadingMySessions = false
     @Published private(set) var changingSession: String?
@@ -63,8 +66,9 @@ final class NetworkModel: ObservableObject {
     private var running = false
     private var requestAgain = false
     private var messageCache: [String: [Message]] = [:]
-    init(service: ReasonService = ReasonService()) {
+    init(service: ReasonService = ReasonService(), presenceService: ReasonService = ReasonService()) {
         self.service = service
+        self.presenceService = presenceService
         selectedLocal = UserDefaults.standard.string(forKey: "selectedLocal") ?? ""
         selectedPeer = UserDefaults.standard.string(forKey: "selectedPeer") ?? ""
     }
@@ -78,35 +82,92 @@ final class NetworkModel: ObservableObject {
         }
     }
     var peers: [NetworkSession] {
-        var result = directory?.sessions.filter { session in
-            session.person != directory?.person ||
-                (session.machine == directory?.machine && session.agent == "codex" &&
-                 session.clientTitle != nil && session.name != selectedLocal)
+        let knownChats = Set(conversations)
+        var result = directory?.chatSessions.filter {
+            !$0.offline || $0.clientTitle?.nonEmpty != nil || knownChats.contains($0.address)
         } ?? []
         for address in conversations where !result.contains(where: { $0.address == address }) {
             let parts = address.split(separator: "/", maxSplits: 1).map(String.init)
-            result.append(NetworkSession(address: address, name: parts.last ?? address, person: parts.first ?? "", agent: "离线", status: "offline"))
+            let name = parts.last ?? address
+            let agent = NetworkSession.isGeneratedCodexAddress(name) ? "codex" : "离线"
+            result.append(NetworkSession(address: address, name: name, person: parts.first ?? "", agent: agent, status: "offline"))
         }
         return result
     }
     var peer: NetworkSession? { peers.first { $0.address == selectedPeer } }
     var own: LocalSession? { locals.first { $0.name == selectedLocal } }
     var canSend: Bool {
-        !leavingNetwork && !sending && error == nil && own?.historyOnly == false && peer?.offline == false && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !options.files.isEmpty)
+        !leavingNetwork && !sending && error == nil && own?.historyOnly == false && peer?.available == true && !isSelectedSender && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !options.files.isEmpty)
     }
-    var localServiceConnected: Bool { directory != nil && error == nil }
+    private var isSelectedSender: Bool {
+        guard let directory, let peer else { return false }
+        return directory.isLocal(peer) && peer.name == selectedLocal
+    }
+    var localServiceConnected: Bool { directory != nil && directoryError == nil }
     var localServiceStatus: String {
-        if error != nil { return "本机连接异常" }
+        if directoryError != nil { return "本机连接异常" }
         return localServiceConnected ? "本机已连接" : "本机连接中"
     }
     var tier: String? { directory?.sessions.first { $0.person == directory?.person && $0.name == selectedLocal }?.tier }
     func start() async {
         guard !running else { return }; running = true
         defer { running = false }
-        while !Task.isCancelled {
-            await refresh()
-            do { try await Task.sleep(for: .seconds(3)) } catch { break }
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await self.pollDirectory() }
+            while !Task.isCancelled {
+                await refresh()
+                do { try await Task.sleep(for: .seconds(3)) } catch { break }
+            }
+            group.cancelAll()
         }
+    }
+
+    private func pollDirectory() async {
+        while !Task.isCancelled {
+            await refreshDirectory()
+            do { try await Task.sleep(for: .seconds(2)) } catch { break }
+        }
+    }
+
+    func refreshDirectory() async {
+        guard !leavingNetwork else { return }
+        directoryRevision += 1
+        let revision = directoryRevision, departure = departureCount
+        do {
+            let current = try await presenceService.currentDirectory()
+            guard !leavingNetwork, departure == departureCount, revision == directoryRevision else { return }
+            directoryError = nil
+            updateDirectory(current)
+            if !mySessions.isEmpty { updatePersonalPresence(in: current) }
+        } catch {
+            guard !leavingNetwork, departure == departureCount, revision == directoryRevision else { return }
+            directoryError = error.localizedDescription
+        }
+    }
+
+    private func updateDirectory(_ current: Directory) {
+        if directory?.networkID != current.networkID {
+            messageCache.removeAll()
+            messages = []
+            conversations = []
+        }
+        if directory != current { directory = current }
+    }
+
+    private func updatePersonalPresence(in current: Directory) {
+        let local = Set(current.sessions.filter { current.isLocal($0) && $0.available }.map(\.address))
+        let updated = mySessions.map { session -> PersonalSession in
+            var item = session
+            switch session.connection {
+            case let .online(address), let .offline(address):
+                let baseAddress = address.split(separator: "@", maxSplits: 1).first.map(String.init) ?? address
+                let reachable = local.contains(baseAddress)
+                item.connection = reachable ? .online(address) : .offline(address)
+            case .paused, .notJoined: break
+            }
+            return item
+        }
+        if updated != mySessions { mySessions = updated }
     }
     private func changedConversation() {
         let cached = messageCache[historyKey]
@@ -138,8 +199,8 @@ final class NetworkModel: ObservableObject {
                 let snapshot = try await service.snapshot(local: local, peer: peer, acrossLocalIdentities: true)
                 guard !leavingNetwork, departure == departureCount else { return }
                 guard local == selectedLocal, peer == selectedPeer else { requestAgain = true; continue }
-                if directory?.networkID != snapshot.directory.networkID { messageCache.removeAll() }
-                if directory != snapshot.directory { directory = snapshot.directory }
+                if directory == nil { updateDirectory(snapshot.directory) }
+                guard directory?.networkID == snapshot.directory.networkID else { continue }
                 if locals != snapshot.localSessions { locals = snapshot.localSessions }
                 if unjoinedCodexSessions != snapshot.unjoinedCodexSessions {
                     unjoinedCodexSessions = snapshot.unjoinedCodexSessions
@@ -223,12 +284,14 @@ final class NetworkModel: ObservableObject {
                 if case .paused = session.connection, !session.supportsImmediateJoin {
                     mySessionsNotice = "已允许 \(address) 重新接入"
                 } else {
+                    unjoinedCodexSessions.removeAll { $0.id == session.id }
                     mySessionsNotice = "已加入 \(address)"
                 }
             } else {
                 let address = try await service.leavePersonalSession(session.id)
                 mySessionsNotice = "\(address) 已退出 Reason Network"
             }
+            await refreshDirectory()
             await refreshMySessions()
             await refresh()
         } catch {
@@ -243,6 +306,7 @@ final class NetworkModel: ObservableObject {
         defer { leavingNetwork = false }
         try await service.leaveNetwork(expected: id)
         directory = nil
+        directoryError = nil
         locals = []
         unjoinedCodexSessions = []
         conversations = []

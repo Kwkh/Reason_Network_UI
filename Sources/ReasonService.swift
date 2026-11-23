@@ -21,22 +21,18 @@ actor ReasonService {
         let cache = try store()
         try selectNetwork(network, in: cache)
         let paused = try pausedKeys(in: engine)
-        let registrations = try engine.rows("SELECT name,key,doing FROM sessions WHERE agent='codex' AND attached=1 ORDER BY last_seen DESC")
-            .filter { !paused.contains($0["key"] ?? "") }
+        let registrations = try codexRegistrations(in: engine).filter { !paused.contains($0["key"] ?? "") }
         let catalog = PersonalSessionCatalog(home: home)
-        let registered = try engine.rows("SELECT key FROM sessions WHERE agent='codex'")
-        let registeredKeys = Set(registered.compactMap { $0["key"]?.lowercased() }).union(paused.map { $0.lowercased() })
+        let registeredKeys = Set(registrations.compactMap { $0["key"]?.lowercased() }).union(paused.map { $0.lowercased() })
         let unjoined = (try? catalog.unjoinedCodex(excluding: registeredKeys)) ?? []
-        // A missing or temporarily unavailable agent index must not interrupt messaging.
-        let titles = (try? catalog.codexTitles(for: registrations.compactMap { $0["key"] })) ?? [:]
+        let titles = applyLocalTitles(to: &directory, registrations: registrations, catalog: catalog)
         var locals = registrations.compactMap { row -> LocalSession? in
             guard let name = row["name"], let key = row["key"] else { return nil }
-            let index = directory.sessions.firstIndex {
-                $0.person == directory.person && $0.machine == directory.machine && $0.name == name && $0.agent == "codex"
-            }
-            if let index, let title = titles[key.lowercased()] { directory.sessions[index].clientTitle = title }
-            let published = index.map { directory.sessions[$0] }
-            return LocalSession(name: name, key: key, doing: titles[key.lowercased()] ?? published?.clientTitle ?? published?.doing ?? row["doing"])
+            let published = directory.sessions.filter { directory.isLocal($0) && $0.name == name && $0.agent == "codex" }
+            let reachable = published.first { $0.available }
+            let preferred = reachable ?? published.first
+            guard row["attached"] == "1" || reachable != nil else { return nil }
+            return LocalSession(name: name, key: key, doing: titles[key.lowercased()] ?? preferred?.title ?? row["doing"])
         }
         try cache.recordInboxOwnership(network, engine: engine)
         let otherMail = Set(try cache.rows("SELECT id FROM network_inbox WHERE network<>?", [network]).compactMap { $0["id"] })
@@ -72,6 +68,38 @@ actor ReasonService {
         return Snapshot(directory: directory, localSessions: locals, unjoinedCodexSessions: unjoined,
                         conversations: conversations, messages: page.messages,
                         hasEarlier: page.hasEarlier, mirrorWarning: warning)
+    }
+
+    func currentDirectory() throws -> Directory {
+        var current = try directory()
+        let engine = try SQLiteStore(home.appendingPathComponent(".reason/network/network.db"), readOnly: true)
+        guard let network = try teamID(in: engine), current.team != nil else {
+            throw NetworkError("本机尚未加入 Network。")
+        }
+        current.networkID = network
+        let registrations = try codexRegistrations(in: engine)
+        _ = applyLocalTitles(to: &current, registrations: registrations, catalog: PersonalSessionCatalog(home: home))
+        return current
+    }
+
+    private func codexRegistrations(in engine: SQLiteStore) throws -> [[String: String]] {
+        try engine.rows("SELECT name,key,doing,attached FROM sessions WHERE agent='codex' ORDER BY last_seen DESC")
+    }
+
+    private func applyLocalTitles(to directory: inout Directory, registrations: [[String: String]],
+                                  catalog: PersonalSessionCatalog) -> [String: String] {
+        let titles = (try? catalog.codexTitles(for: registrations.compactMap { $0["key"] })) ?? [:]
+        let byName = Dictionary(registrations.compactMap { row -> (String, String)? in
+            guard let name = row["name"], let key = row["key"], let title = titles[key.lowercased()] else { return nil }
+            return (name, title)
+        }, uniquingKeysWith: { first, _ in first })
+        for index in directory.sessions.indices {
+            let session = directory.sessions[index]
+            if directory.isLocal(session), session.agent == "codex", let title = byName[session.name] {
+                directory.sessions[index].clientTitle = title
+            }
+        }
+        return titles
     }
 
     private func teamID(in engine: SQLiteStore) throws -> String? {
@@ -164,12 +192,15 @@ actor ReasonService {
             guard bytes <= 512 * 1024 else { throw NetworkError("附件合计不能超过 512 KiB。") }
         }
         let engine = try SQLiteStore(home.appendingPathComponent(".reason/network/network.db"), readOnly: true)
-        guard let key = try engine.rows("SELECT key FROM sessions WHERE name=? AND agent='codex' AND attached=1", [local]).first?["key"] else { throw NetworkError("本机 Codex 会话未连接") }
+        let registration = try engine.rows("SELECT key,attached FROM sessions WHERE name=? AND agent='codex'", [local]).first
+        guard let key = registration?["key"] else { throw NetworkError("本机 Codex 会话未连接") }
         guard try !pausedKeys(in: engine).contains(key) else { throw NetworkError("本机会话已退出 Network") }
         let directory = try directory()
+        guard registration?["attached"] == "1" || directory.sessions.contains(where: {
+            directory.isLocal($0) && $0.name == local && $0.agent == "codex" && $0.available
+        }) else { throw NetworkError("本机 Codex 会话未连接") }
         guard directory.sessions.contains(where: {
-            $0.address == to && $0.available &&
-                ($0.person != directory.person || ($0.machine == directory.machine && $0.agent == "codex" && $0.name != local))
+            $0.address == to && $0.available && !(directory.isLocal($0) && $0.name == local)
         }) else { throw NetworkError("该队友会话已离线，请刷新后重新选择") }
         guard try teamID(in: engine) == network else { throw NetworkError("当前 Network 已变化，请刷新后重试。") }
         var arguments = ["send", "--from", key]
@@ -194,7 +225,7 @@ actor ReasonService {
         let directory = try? directory()
         let participation = try? participationState()
         let discovered = try PersonalSessionCatalog(home: home).discover()
-        var sessions = Dictionary(discovered.sessions.map { ($0.id, $0) },
+        var sessions = Dictionary(discovered.sessions.map { ($0.id.lowercased(), $0) },
                                   uniquingKeysWith: { $0.updated > $1.updated ? $0 : $1 })
         let enginePath = home.appendingPathComponent(".reason/network/network.db")
         let knownRecords: [[String: String]]
@@ -206,13 +237,18 @@ actor ReasonService {
         }
         for row in knownRecords {
             guard let key = row["key"], !discovered.hidden.contains(key), !discovered.hidden.contains(key.lowercased()), let agent = row["agent"], let name = row["name"] else { continue }
-            let current = directory?.sessions.first {
+            let published = directory?.sessions.filter {
                 $0.person == directory?.person && $0.machine == directory?.machine &&
                 $0.name == name && $0.agent == agent && $0.tier != "none"
-            }
+            } ?? []
+            let current = published.first { $0.available } ?? published.first
             let address = current?.id ?? directory.map { $0.person + "/" + name } ?? name
-            var item = sessions[key] ?? PersonalSession(id: key, agent: agent, title: row["doing"]?.nonEmpty ?? name,
+            let fallback = NetworkSession(address: address, name: name, person: directory?.person ?? "",
+                                          agent: agent, doing: row["doing"], cwd: row["cwd"]).title
+            var item = sessions[key.lowercased()] ?? PersonalSession(id: key, agent: agent, title: fallback,
                                                          cwd: row["cwd"], updated: Date(timeIntervalSince1970: (Double(row["last_seen"] ?? "") ?? 0) / 1000))
+            item.id = key
+            if agent == "codex", item.nativeID != nil { item.nativeID = String(key.dropFirst("codex:".count)) }
             item.canManageParticipation = participation != nil
             if participation?.paused.contains(key) == true {
                 item.connection = .paused(address)
@@ -221,12 +257,12 @@ actor ReasonService {
             } else {
                 item.connection = .offline(address)
             }
-            sessions[key] = item
+            sessions[key.lowercased()] = item
         }
         return sessions.values.sorted { ($0.updated, $0.id) > ($1.updated, $1.id) }
     }
     func joinPersonalSession(_ key: String) throws -> String {
-        guard let chosen = try personalSessions().first(where: { $0.id == key }), chosen.canJoin else {
+        guard let chosen = try personalSessions().first(where: { $0.id.caseInsensitiveCompare(key) == .orderedSame }), chosen.canJoin else {
             throw NetworkError("这个会话还需要在原工具中打开，或已经在线。")
         }
         if case .paused = chosen.connection {
@@ -251,7 +287,7 @@ actor ReasonService {
         return address
     }
     func leavePersonalSession(_ key: String) throws -> String {
-        guard let chosen = try personalSessions().first(where: { $0.id == key }), chosen.canLeave else {
+        guard let chosen = try personalSessions().first(where: { $0.id.caseInsensitiveCompare(key) == .orderedSame }), chosen.canLeave else {
             throw NetworkError("当前后台服务不支持退出该会话。")
         }
         let address: String
@@ -259,7 +295,7 @@ actor ReasonService {
         case .online(let value), .offline(let value): address = value
         case .notJoined, .paused: throw NetworkError("该会话已经退出。")
         }
-        try setParticipation(key, paused: true)
+        try setParticipation(chosen.id, paused: true)
         return address
     }
 
@@ -308,7 +344,7 @@ actor ReasonService {
     }
     func diagnose() throws -> String { try run(["doctor"]) }
     private func directory() throws -> Directory {
-        let output = try run(["who", "--json"])
+        let output = try run(["who", "--json", "--all"])
         guard let data = output.data(using: .utf8) else { throw NetworkError("无法读取 Network 目录") }
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         return try decoder.decode(Directory.self, from: data)

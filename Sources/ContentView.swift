@@ -42,6 +42,9 @@ struct ContentView: View {
             }
         }
         .task { await model.start() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await model.refreshDirectory() }
+        }
         .fileImporter(isPresented: $pickingFiles, allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
             switch result {
             case .success(let urls): model.attach(urls, to: pickerConversation)
@@ -112,7 +115,9 @@ struct ContentView: View {
                 .foregroundStyle(Color(nsColor: .labelColor))
                 .truncationMode(.tail)
             HStack(spacing: 6) {
-                Text(address).font(.system(size: 10, design: .monospaced)).truncationMode(.middle)
+                if peer?.usesGeneratedCodexAddress != true {
+                    Text(address).font(.system(size: 10, design: .monospaced)).truncationMode(.middle)
+                }
                 if let peer {
                     Text(peer.statusText).font(.system(size: 10)).layoutPriority(1)
                 }
@@ -749,7 +754,7 @@ private struct ConversationSidebar: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(session.title).lineLimit(1)
-                    if session.title != session.name {
+                    if session.title != session.name && !session.usesGeneratedCodexAddress {
                         Text(session.name).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     }
                 }

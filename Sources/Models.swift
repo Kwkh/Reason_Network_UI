@@ -23,7 +23,22 @@ struct NetworkSession: Decodable, Identifiable, Equatable {
         return ["busy": "工作中", "idle": "空闲", "live": "在线"][status ?? ""] ?? "状态未知"
     }
     var id: String { address }
-    var title: String { clientTitle?.nonEmpty ?? doing?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? name }
+    var usesGeneratedCodexAddress: Bool { agent == "codex" && Self.isGeneratedCodexAddress(name) }
+    var title: String {
+        if let title = clientTitle?.nonEmpty { return title }
+        if let description = doing?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+           !usesGeneratedCodexAddress || description != name { return description }
+        return usesGeneratedCodexAddress ? Self.codexFallbackTitle(cwd: cwd) : name
+    }
+    static func isGeneratedCodexAddress(_ name: String) -> Bool {
+        name.range(of: #"(?:^|-)codex(?:-\d+)?$"#, options: [.regularExpression, .caseInsensitive]) != nil
+    }
+    static func codexFallbackTitle(cwd: String?) -> String {
+        if let cwd, !cwd.isEmpty, let project = URL(fileURLWithPath: cwd).lastPathComponent.nonEmpty {
+            return "Codex · " + project
+        }
+        return "Codex 会话"
+    }
     var titleHelp: String {
         if let clientTitle = clientTitle?.nonEmpty { return clientTitle + "\n" + address }
         if let description = doing?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
@@ -63,6 +78,24 @@ struct Directory: Decodable, Equatable {
     let machine: String
     var sessions: [NetworkSession]
     let machines: [Device]
+
+    func isLocal(_ session: NetworkSession) -> Bool {
+        session.person == person && session.machine == machine
+    }
+
+    var chatSessions: [NetworkSession] {
+        var sessions: [NetworkSession] = []
+        var byAddress: [String: Int] = [:]
+        for session in self.sessions where session.tier != "none" {
+            if let index = byAddress[session.address] {
+                if !sessions[index].available && session.available { sessions[index] = session }
+            } else {
+                byAddress[session.address] = sessions.count
+                sessions.append(session)
+            }
+        }
+        return sessions
+    }
 }
 struct LocalSession: Identifiable, Equatable {
     let name: String
@@ -70,7 +103,10 @@ struct LocalSession: Identifiable, Equatable {
     var doing: String?
     var historyOnly = false
     var id: String { key }
-    var title: String { doing?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? name }
+    var title: String {
+        if let title = doing?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty, title != name { return title }
+        return NetworkSession.isGeneratedCodexAddress(name) ? NetworkSession.codexFallbackTitle(cwd: nil) : name
+    }
 }
 struct MessageAttachment: Equatable, Codable {
     let name: String

@@ -18,7 +18,7 @@ struct PersonalSession: Identifiable, Equatable {
         }
     }
 
-    let id: String
+    var id: String
     let agent: String
     let title: String
     let cwd: String?

@@ -59,7 +59,12 @@ struct CoreChecks {
 import json,sys,pathlib
 home=pathlib.Path(__file__).resolve().parents[2]
 if sys.argv[1]=='who':
- print(json.dumps({'team':'fixture','person':'me','machine':'fixture-mac','sessions':[{'address':'peer/remote','name':'remote','person':'peer','doing':'Remote title','tier':'push'}],'machines':[{'person':'me','machine':'fixture-mac','endpoint':'fixture','is_me':True,'online':True}]}))
+ peers=[{'address':'peer/remote','name':'remote','person':'peer','doing':'Remote title','tier':'push'}]
+ override=home/'presence.json'
+ if override.exists():
+  assert '--all' in sys.argv
+  peers.extend(json.loads(override.read_text()))
+ print(json.dumps({'team':'fixture','person':'me','machine':'fixture-mac','sessions':peers,'machines':[{'person':'me','machine':'fixture-mac','endpoint':'fixture','is_me':True,'online':True}]}))
 elif sys.argv[1]=='leave':
  assert sys.argv[2:] == []
  if (home/'refuse').exists(): sys.exit("no teammate is online")
@@ -145,6 +150,26 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         try expect(reverted.localSessions.first { $0.name == "local" }?.title == "Generated", "refresh observes title changes, including removed custom name")
         let advertised = try JSONDecoder().decode(NetworkSession.self, from: Data(#"{"address":"other/s","name":"s","person":"other","title":"A · B","doing":"A · B · testing"}"#.utf8))
         try expect(advertised.title == "A · B", "explicit peer title takes precedence over activity")
+        let presenceFixture = home.appendingPathComponent("presence.json")
+        let offline: [String: String] = ["address": "me/host-codex-7", "name": "host-codex-7", "person": "me",
+                                          "machine": "fixture-mac", "agent": "codex", "status": "offline", "tier": "pull"]
+        try JSONSerialization.data(withJSONObject: [offline]).write(to: presenceFixture)
+        let beforeAttach = try await service.currentDirectory()
+        try expect(beforeAttach.chatSessions.first { $0.address == "me/host-codex-7" }?.offline == true,
+                   "the live directory reads remembered status without reading message history")
+        let live = offline.merging(["status": "idle", "cwd": "/tmp/demo-project"]) { _, fresh in fresh }
+        try JSONSerialization.data(withJSONObject: [offline, live]).write(to: presenceFixture)
+        _ = try engine.rows("INSERT INTO sessions(name,key,agent,doing,attached,last_seen) VALUES(?,?,?,?,0,2)",
+                            ["host-codex-7", "codex:new-presence", "codex", ""])
+        let connected = try await service.currentDirectory()
+        let matching = connected.chatSessions.filter { $0.address == "me/host-codex-7" }
+        try expect(matching.count == 1 && matching.first?.available == true && matching.first?.title == "Codex · demo-project",
+                   "a live copy replaces the stale offline row and the generated address is not the title")
+        let registered = try await service.snapshot(local: "local", peer: "peer/remote")
+        try expect(registered.localSessions.contains { $0.name == "host-codex-7" && $0.title == "Codex · demo-project" },
+                   "a joined and available Codex identity is visible before MCP attachment")
+        try fm.removeItem(at: presenceFixture)
+
         let unread = try engine.rows("SELECT read_at FROM messages WHERE id='incoming'").first
         try expect(unread?["read_at"] == nil, "mirror never acknowledges inbox")
         do { _ = try await service.send(network: "team-a", local: "missing", to: "peer/remote", body: "hello"); throw NetworkError("invalid local accepted") }
