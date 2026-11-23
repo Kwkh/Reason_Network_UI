@@ -8,10 +8,15 @@ struct ParticipationInstaller: Sendable {
     var binary = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/reason-network-backend")
     var launchctl = URL(fileURLWithPath: "/bin/launchctl")
     var probe: @Sendable (URL) -> Bool = { home in
+        capabilities(at: home)?["codex_queue_resume"] as? Bool == true
+    }
+
+    static func capabilities(at home: URL) -> [String: Any]? {
         let socket = SessionSocket(socketURL: home.appendingPathComponent(".reason/network/network.sock"))
         guard let data = try? socket.request(["op": "session_participation"], timeout: 1),
-              let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
-        return result["version"] as? Int == 1
+              let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              result["version"] as? Int == 1 else { return nil }
+        return result
     }
 
     var label = "com.reasonmachines.network"
@@ -96,7 +101,7 @@ struct ParticipationInstaller: Sendable {
                 if probe(home) { return }
                 try await Task.sleep(for: .milliseconds(250))
             }
-            throw NetworkError("后台未确认逐会话退出功能。")
+            throw NetworkError("后台未确认 Codex 会话唤醒功能。")
         } catch {
             let failure = error
             if bootstrapped { _ = try? await SetupCommand.run(launchctl, ["bootout", target], home: home) }

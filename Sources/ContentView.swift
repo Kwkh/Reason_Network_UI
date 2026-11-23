@@ -42,6 +42,10 @@ struct ContentView: View {
             }
         }
         .task { await model.start() }
+        .alert("接收模式未切换或未确认", isPresented: Binding(get: { model.receiveModeError != nil },
+                                                  set: { if !$0 { model.receiveModeError = nil } })) {
+            Button("好", role: .cancel) {}
+        } message: { Text(model.receiveModeError ?? "") }
         .fileImporter(isPresented: $pickingFiles, allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
             switch result {
             case .success(let urls): model.attach(urls, to: pickerConversation)
@@ -126,17 +130,28 @@ struct ContentView: View {
     }
 
     private var statusButton: some View {
-        Button { showStatus.toggle() } label: {
+        let indicator = model.senderPresence
+        return Button { showStatus.toggle() } label: {
             HStack(spacing: 7) {
-                Circle().fill(model.online ? Color.primary.opacity(0.85) : Color.gray).frame(width: 6, height: 6)
-                Text(model.online ? "在线" : model.directory == nil && model.error == nil ? "连接中" : "离线")
+                Image(systemName: indicator.symbol)
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(indicator.color)
+                    .frame(width: 8)
+                    .contentTransition(.opacity)
+                Text(indicator.shortLabel)
                     .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                    .contentTransition(reduceMotion ? .identity : .numericText())
             }
-            .padding(.horizontal, 13).padding(.vertical, 7)
+            .padding(.horizontal, 12).padding(.vertical, 7)
             .background(Capsule().stroke(Color.primary.opacity(0.16), lineWidth: 1))
             .contentShape(Capsule())
+            .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: indicator)
         }
-        .buttonStyle(.plain).help("设备状态与本机会话")
+        .buttonStyle(.plain)
+        .accessibilityLabel("本机会话状态")
+        .accessibilityValue(indicator.rawValue)
+        .help("当前本机会话 · " + indicator.rawValue + "。点击查看设备状态。")
         .popover(isPresented: $showStatus, arrowEdge: .bottom) { StatusView().environmentObject(model) }
     }
     private var history: some View {
@@ -193,50 +208,60 @@ struct ContentView: View {
                     }
                 }.scrollIndicators(.hidden)
             }
-            ZStack(alignment: .bottomTrailing) {
-                DraftField(text: Binding(get: { model.draft }, set: { model.draft = $0 }),
-                           focused: $composing,
-                           heightChanged: { editorHeight = $0 }, onSend: { Task { await model.send() } })
-                    .id(model.conversationKey)
-                    .padding(.leading, 32)
-                    .frame(height: editorHeight)
-                    .frame(maxWidth: .infinity)
-                HStack {
-                    Menu {
-                        Button("添加文本附件…", systemImage: "paperclip") {
-                            pickerConversation = model.conversationKey
-                            pickingFiles = true
-                        }
-                        Toggle("在对方电脑上弹窗提醒", isOn: $model.options.notify)
-                    } label: {
-                        Image(systemName: model.options.notify ? "bell.fill" : "plus")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundStyle(colorScheme == .dark ? Color(white: 0.92) : Color(white: 0.22))
-                            .frame(width: 28, height: 28)
-                            .contentShape(Rectangle())
+            VStack(alignment: .leading, spacing: 0) {
+                if model.senderOffline || model.reconnectingSender {
+                    Button { showStatus = true } label: {
+                        Label(model.reconnectingSender ? "正在重新接入本机会话…" : "本机会话离线 · 查看接入选项",
+                              systemImage: "network.slash")
                     }
-                    .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
-                    .disabled(model.selectedLocal.isEmpty || model.selectedPeer.isEmpty)
-                    .accessibilityLabel("附件与发送选项").help("附件与发送选项")
-                    Spacer()
-                    Button { Task { await model.send() } } label: {
-                        ZStack {
-                            Circle().fill(Color.primary.opacity(model.canSend ? 0.92 : 0.08))
-                            if model.sending {
-                                ProgressView().controlSize(.small)
-                            } else {
-                                Image(systemName: "arrow.up")
-                                    .font(.system(size: 15, weight: .medium))
-                                    .foregroundStyle(model.canSend ? Color(nsColor: .textBackgroundColor) : .secondary)
-                            }
-                        }
-                        .frame(width: 28, height: 28)
-                    }
-                    .buttonStyle(.plain).disabled(!model.canSend)
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .help("发送消息（Enter），换行（Shift＋Enter）").accessibilityLabel(model.sending ? "发送中" : "发送消息")
+                    .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
+                    .padding(.horizontal, 18).padding(.top, 10)
                 }
-                .padding(.horizontal, 12).padding(.bottom, 9)
+                ZStack(alignment: .bottomTrailing) {
+                    DraftField(text: Binding(get: { model.draft }, set: { model.draft = $0 }),
+                               focused: $composing,
+                               heightChanged: { editorHeight = $0 }, onSend: { Task { await model.send() } })
+                        .id(model.conversationKey)
+                        .padding(.leading, 32)
+                        .frame(height: editorHeight)
+                        .frame(maxWidth: .infinity)
+                    HStack {
+                        Menu {
+                            Button("添加文本附件…", systemImage: "paperclip") {
+                                pickerConversation = model.conversationKey
+                                pickingFiles = true
+                            }
+                            Toggle("在对方电脑上弹窗提醒", isOn: $model.options.notify)
+                        } label: {
+                            Image(systemName: model.options.notify ? "bell.fill" : "plus")
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundStyle(colorScheme == .dark ? Color(white: 0.92) : Color(white: 0.22))
+                                .frame(width: 28, height: 28)
+                                .contentShape(Rectangle())
+                        }
+                        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
+                        .disabled(model.selectedLocal.isEmpty || model.selectedPeer.isEmpty)
+                        .accessibilityLabel("附件与发送选项").help("附件与发送选项")
+                        Spacer()
+                        Button { Task { await model.send() } } label: {
+                            ZStack {
+                                Circle().fill(Color.primary.opacity(model.canSend ? 0.92 : 0.08))
+                                if model.sending {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    Image(systemName: "arrow.up")
+                                        .font(.system(size: 15, weight: .medium))
+                                        .foregroundStyle(model.canSend ? Color(nsColor: .textBackgroundColor) : .secondary)
+                                }
+                            }
+                            .frame(width: 28, height: 28)
+                        }
+                        .buttonStyle(.plain).disabled(!model.canSend)
+                        .keyboardShortcut(.return, modifiers: .command)
+                        .help("发送消息（Enter），换行（Shift＋Enter）").accessibilityLabel(model.sending ? "发送中" : "发送消息")
+                    }
+                    .padding(.horizontal, 12).padding(.bottom, 9)
+                }
             }
             .modifier(ComposerGlass(focused: composing))
             .animation(reduceMotion ? nil : .smooth(duration: 0.24), value: editorHeight)
@@ -535,6 +560,35 @@ private struct GroupHeading: View {
     }
 }
 
+private extension SenderPresence {
+    var color: Color {
+        switch self {
+        case .online: Color(nsColor: .systemGreen)
+        case .offline: Color(nsColor: .systemRed)
+        default: .secondary
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .online: "circle.fill"
+        case .offline: "circle"
+        case .reconnecting: "circle.lefthalf.filled"
+        case .history: "clock"
+        case .unknown: "minus.circle"
+        }
+    }
+
+    var shortLabel: String {
+        switch self {
+        case .reconnecting: "接入中"
+        case .unknown: "未知"
+        case .history: "历史"
+        default: rawValue
+        }
+    }
+}
+
 private struct ConversationSidebar: View {
     @EnvironmentObject private var model: NetworkModel
 
@@ -555,6 +609,42 @@ private struct ConversationSidebar: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var terms: [Substring] { query.split(whereSeparator: \.isWhitespace) }
 
+    private var senderMenu: some View {
+        let indicator = model.senderPresence
+        let title = model.own?.title ?? model.selectedLocal
+        return HStack(spacing: 6) {
+            Image(systemName: indicator.symbol)
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundStyle(indicator.color)
+                .frame(width: 10, height: 12)
+                .contentTransition(.opacity)
+                .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: indicator)
+                .help("本机会话 · " + indicator.rawValue)
+                .accessibilityHidden(true)
+            Menu {
+                Picker("本机会话", selection: $model.selectedLocal) {
+                    ForEach(model.locals) { session in
+                        Text(session.title + (session.historyOnly ? " · 历史记录" : "")).tag(session.name)
+                    }
+                }
+                .pickerStyle(.inline)
+                .labelsHidden()
+            } label: {
+                Text(title)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.visible)
+            .accessibilityLabel("选择本机会话")
+            .accessibilityValue(title + "，" + indicator.rawValue)
+            .help(title + "\n" + model.selectedLocal + " · " + indicator.rawValue)
+        }
+    }
+
     private func expansion(_ key: [String]) -> Binding<Bool> {
         Binding(get: { !terms.isEmpty || !collapsed.contains(key) }, set: { expanded in
             guard terms.isEmpty else { return }
@@ -574,26 +664,7 @@ private struct ConversationSidebar: View {
         let groups = Dictionary(grouping: sessions, by: \.person)
         VStack(alignment: .leading, spacing: 0) {
             if !model.locals.isEmpty {
-                Menu {
-                    Picker("本机会话", selection: $model.selectedLocal) {
-                        ForEach(model.locals) { session in
-                            Text(session.title + (session.historyOnly ? " · 历史记录" : "")).tag(session.name)
-                        }
-                    }
-                    .pickerStyle(.inline)
-                    .labelsHidden()
-                } label: {
-                    Text(model.own?.title ?? model.selectedLocal)
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.visible)
-                .accessibilityLabel("选择本机会话")
-                .help((model.own?.title ?? model.selectedLocal) + "\n" + model.selectedLocal)
+                senderMenu
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
             }
@@ -973,6 +1044,8 @@ private struct NativeTranscript: NSViewRepresentable {
                         if page.messages.isEmpty { self.latestHasEarlier = false }
                         self.applyMessages(anchor: anchor)
                     }
+                } catch is CancellationError {
+                    // The conversation changed while this page was loading.
                 } catch {
                     if let window = self?.scroll.window { _ = await NSAlert(error: error).beginSheetModal(for: window) }
                 }
@@ -1056,6 +1129,9 @@ private struct NativeTranscript: NSViewRepresentable {
             earlier = value.earlier
             openAttachment = value.openAttachment
             latestHasEarlier = value.hasEarlier
+            if reading.expanded, let first = reading.messages.first, first.rowKey == value.messages.first?.rowKey {
+                pageHasEarlier = value.hasEarlier
+            }
             defer { updateEarlierButton() }
             pendingChanged = value.pendingChanged
             let forceLatest = sentCount.map { $0 != value.sentCount } == true ||
@@ -1266,36 +1342,89 @@ struct StatusView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 11) {
-                HStack(spacing: 14) {
-                    Text("本机会话").font(.system(size: 12))
-                    VStack(alignment: .leading, spacing: 4) {
-                        Menu {
-                            ForEach(model.locals) { session in
-                                Button { model.selectedLocal = session.name } label: {
-                                    Label(session.title + "\n" + session.name, systemImage: model.selectedLocal == session.name ? "checkmark" : "terminal")
+                HStack(spacing: 8) {
+                    HStack(spacing: 14) {
+                        Text("本机会话").font(.system(size: 12))
+                        VStack(alignment: .leading, spacing: 4) {
+                            Menu {
+                                ForEach(model.locals) { session in
+                                    Button { model.selectedLocal = session.name } label: {
+                                        Label(session.title + "\n" + session.name, systemImage: model.selectedLocal == session.name ? "checkmark" : "terminal")
+                                    }
                                 }
+                                if model.locals.isEmpty { Text("暂无已连接的本机会话") }
+                            } label: {
+                                Text(model.own?.title ?? model.selectedLocal).font(.system(size: 13, weight: .semibold))
                             }
-                            if model.locals.isEmpty { Text("暂无已连接的本机会话") }
-                        } label: {
-                            Text(model.own?.title ?? model.selectedLocal).font(.system(size: 13, weight: .semibold))
+                            .menuStyle(.borderlessButton).accessibilityLabel("选择本机会话")
+                            Text((model.directory?.person ?? "") + "/" + model.selectedLocal).font(.system(size: 11, design: .monospaced)).lineLimit(2)
                         }
-                        .menuStyle(.borderlessButton).accessibilityLabel("选择本机会话")
-                        Text((model.directory?.person ?? "") + "/" + model.selectedLocal).font(.system(size: 11, design: .monospaced)).lineLimit(2)
                     }
+                    .foregroundStyle(.primary).padding(10)
+                    .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+                    .layoutPriority(1)
+                    Color.clear
+                        .frame(minWidth: 48, maxWidth: .infinity)
+                        .overlay {
+                            if model.senderOffline || model.reconnectingSender || model.tier != nil {
+                                Button {
+                                    Task { await model.reconnectSender() }
+                                } label: {
+                                    Text(model.reconnectingSender ? "接入中…" : model.senderOffline ? "重新接入" : "已接入")
+                                        .font(.system(size: 11, weight: .medium)).lineLimit(1)
+                                        .contentTransition(reduceMotion ? .identity : .numericText())
+                                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                        .background(Color.primary.opacity(model.senderOffline || model.reconnectingSender ? 0.06 : 0), in: RoundedRectangle(cornerRadius: 10))
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(!model.senderOffline || model.changingSession != nil || model.sending || model.leavingNetwork)
+                                .help(model.senderOffline ? "重新接入当前本机会话" : "本机会话接入状态")
+                                .transition(.opacity)
+                            }
+                        }
+                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: model.senderOffline || model.reconnectingSender)
+                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: model.reconnectingSender)
                 }
-                .foregroundStyle(.primary).padding(10)
-                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
-                if let tier = model.tier {
-                    Label(tier == "push" ? "即时推送" : tier == "turn" ? "回合接收" : "手动接收", systemImage: tier == "push" ? "bolt.horizontal" : "arrow.down.circle")
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                if let local = model.own, let network = model.directory?.networkID,
+                   let actual = model.tier.flatMap(ReceiveMode.init(rawValue:)) {
+                    Menu {
+                        Picker("偏好接收模式", selection: Binding(get: { actual }, set: { mode in
+                            Task { await model.changeReceiveMode(mode, local: local, network: network) }
+                        })) {
+                            ForEach(ReceiveMode.allCases, id: \.self) { mode in Text(mode.title).tag(mode) }
+                        }
+                        .pickerStyle(.inline).labelsHidden()
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: actual == .push ? "bolt.horizontal" : "arrow.down.circle")
+                                .frame(width: 14)
+                            Text(actual.title)
+                                .contentTransition(reduceMotion ? .identity : .numericText())
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 8, weight: .medium))
+                        }
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .frame(minHeight: 24)
+                        .contentShape(Rectangle())
+                    }
+                    .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
+                    .fixedSize()
+                    .padding(.bottom, 3)
+                    .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: actual)
+                    .disabled(model.changingSession != nil || model.senderPresence != .online)
+                    .accessibilityLabel("偏好接收模式").accessibilityValue(actual.title)
+                    .help("切换当前本机会话的接收模式")
                 }
                 ForEach(model.directory?.machines ?? []) { device in
-                    VStack(alignment: .leading, spacing: 5) {
+                    VStack(alignment: .leading, spacing: 7) {
                         HStack {
                             Text(device.person + (device.isMe ? " · 本机" : "")).font(.system(size: 12, weight: .medium))
                             Spacer()
-                            Circle().strokeBorder(Color.primary, lineWidth: 1).background(Circle().fill(device.online || device.isMe ? Color.primary : .clear)).frame(width: 5, height: 5)
-                            Text(device.state).font(.system(size: 11)).monospacedDigit()
+                            Circle().fill(model.online ? (device.online ? Color.primary : Color(nsColor: .systemRed)) : Color.secondary).frame(width: 5, height: 5)
+                            Text(model.online ? device.state : "状态未知").font(.system(size: 11)).monospacedDigit()
                         }
                         Text(device.machine).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     }

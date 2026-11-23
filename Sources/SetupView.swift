@@ -164,6 +164,9 @@ struct SetupView: View {
                     }
                 }.buttonStyle(.plain)
             }
+            if model.snapshot.needsBackendUpdate {
+                action("更新兼容后台") { await model.configure() }
+            }
             Button("进入聊天", action: completion)
                 .buttonStyle(SetupActionStyle())
                 .disabled(!model.snapshot.ready || model.busy)

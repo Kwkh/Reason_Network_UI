@@ -1,0 +1,160 @@
+diff --git a/src/daemon/mail.rs b/src/daemon/mail.rs
+index 79913b2..e864868 100644
+--- a/src/daemon/mail.rs
++++ b/src/daemon/mail.rs
+@@ -54,7 +54,7 @@ impl Inner {
+     pub(super) fn pending(&mut self, address: &str) -> Result<Vec<Message>> {
+         self.in_flight.retain(|_, at| at.elapsed() < IN_FLIGHT_TTL);
+         let msgs = self.store.unread(address)?;
+-        Ok(msgs.into_iter().filter(|m| !self.in_flight.contains_key(&m.id)).collect())
++        Ok(msgs.into_iter().filter(|m| !self.in_flight.contains_key(&m.id) && !self.codex_dispatching.contains(&m.id)).collect())
+     }
+ 
+     /// Records an agent-to-agent message; false if this pair has been talking suspiciously much.
+@@ -507,7 +507,7 @@ impl Daemon {
+             // In a turn, its next PostToolUse (or Stop) shows it; `codex queue` would hold it until the turn ends.
+             (Tier::Push, _, Some(_)) if codex_turn => Channel::Hook,
+             (Tier::Push, _, Some(id)) if l.reg.agent == "codex" && has("codex") => {
+-                Channel::Command("codex", vec!["queue".into(), "--thread".into(), id.clone(), "--message".into()])
++                Channel::Command("codex", vec!["queue".into(), "--resume".into(), "--thread".into(), id.clone(), "--message".into()])
+             }
+             (Tier::Push, _, Some(id)) if l.reg.agent == "reason" && has("reason") => {
+                 Channel::Command("reason", vec!["session".into(), "send".into(), id.clone(), "--message".into()])
+@@ -546,13 +546,17 @@ impl Daemon {
+             }
+             Channel::Command(bin, args) => {
+                 for id in &ids {
+-                    g.in_flight.insert(id.clone(), Instant::now());
++                    if bin == "codex" {
++                        g.codex_dispatching.insert(id.clone());
++                    } else {
++                        g.in_flight.insert(id.clone(), Instant::now());
++                    }
+                 }
+                 self.send_with(bin, args, key.to_string(), ids, text);
+                 (
+                     "pushed".into(),
+                     format!(
+-                        "queued into the {} session: it runs after the current turn, or now if idle",
++                        "sending to the {} session through its native input channel",
+                         agent::label(bin)
+                     ),
+                 )
+@@ -701,8 +705,18 @@ impl Daemon {
+                     .stdin(std::process::Stdio::null())
+                     .kill_on_drop(true)
+                     .output();
++                // Codex queues first, then asks its app server to resume. Killing it while
++                // waiting for the second step can replay an already queued message via hooks.
++                if bin == "codex" {
++                    let o = out.await.map_err(|e| e.to_string())?;
++                    if !o.status.success() {
++                        return Err(format!("queue exited with {}", o.status));
++                    }
++                    let stderr = String::from_utf8_lossy(&o.stderr).to_ascii_lowercase();
++                    return Ok(stderr.lines().any(|line| line.contains("resum") && line.contains("warn")));
++                }
+                 match tokio::time::timeout(Duration::from_secs(30), out).await {
+-                    Ok(Ok(o)) if o.status.success() => Ok(()),
++                    Ok(Ok(o)) if o.status.success() => Ok(false),
+                     Ok(Ok(o)) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+                     Ok(Err(e)) => Err(e.to_string()),
+                     Err(_) => Err("timed out".into()),
+@@ -712,9 +726,18 @@ impl Daemon {
+             let mut g = this.inner.lock().unwrap();
+             for id in &ids {
+                 g.in_flight.remove(id);
++                g.codex_dispatching.remove(id);
+             }
+             match res {
+-                Ok(()) => {
++                Ok(resume_pending) => {
++                    if bin == "codex" {
++                        if let Some(l) = g.live.get_mut(&key) {
++                            l.codex_resume_pending = resume_pending;
++                        }
++                        if resume_pending {
++                            log("Codex queued the message but could not resume the thread; open it in Codex");
++                        }
++                    }
+                     let changed = g.store.mark_read(&ids, util::now_ms()).unwrap_or_default();
+                     // A local native queue is an agent input handoff; the cloud command only acknowledges its server.
+                     if bin != "reason" {
+@@ -1470,7 +1493,13 @@ mod tests {
+         // Its turn runs.
+         let rollout = std::env::temp_dir().join(format!("reason-network-watch-{}.jsonl", Ulid::generate()));
+         std::fs::write(&rollout, "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n").unwrap();
+-        d.inner.lock().unwrap().live.get_mut("codex:2").unwrap().transcript = Some(rollout.clone());
++        {
++            // Seeding unread mail used a pull registration. Only push sessions watch the turn.
++            let mut g = d.inner.lock().unwrap();
++            let live = g.live.get_mut("codex:2").unwrap();
++            live.reg.tier = Tier::Push;
++            live.transcript = Some(rollout.clone());
++        }
+ 
+         let tasks = || tokio::runtime::Handle::current().metrics().num_alive_tasks();
+         let watching = || d.inner.lock().unwrap().codex_watch.contains("codex:2");
+diff --git a/src/daemon/mod.rs b/src/daemon/mod.rs
+index d3e2f41..2c06492 100644
+--- a/src/daemon/mod.rs
++++ b/src/daemon/mod.rs
+@@ -157,6 +157,8 @@ struct Inner {
+     team: Option<TeamState>,
+     /// Messages handed to a push channel or a hook and not yet confirmed; hidden from inbox and hooks meanwhile.
+     in_flight: HashMap<String, Instant>,
++    // A live native queue command can still acknowledge input after the hook timeout.
++    codex_dispatching: HashSet<String>,
+     /// Sessions waiting in `check_inbox` right now (they get new mail there instead of a push).
+     polling: HashMap<String, usize>,
+     /// Recent agent-to-agent message times per (from, to), for the loop guard.
+@@ -176,6 +178,7 @@ struct Live {
+     through_reason: Option<bool>,
+     reg: SessionReg,
+     preferred_mode: Option<Tier>,
++    codex_resume_pending: bool,
+     name: String,
+     /// The client connection (`reason network mcp`) that owns it; `None` for sessions known only through hooks.
+     conn: Option<u64>,
+@@ -256,6 +259,7 @@ impl Daemon {
+                 next_conn: 0,
+                 team,
+                 in_flight: HashMap::new(),
++                codex_dispatching: HashSet::new(),
+                 polling: HashMap::new(),
+                 pairs: HashMap::new(),
+                 swept: 0,
+@@ -361,7 +365,9 @@ impl Daemon {
+         Ok(match req {
+             Request::SessionParticipation => {
+                 let g = self.inner.lock().unwrap();
+-                json!({ "version": 1, "paused": g.paused, "receive_modes": true })
++                let pending: Vec<_> = g.live.iter().filter(|(_, l)| l.codex_resume_pending).map(|(key, _)| key).collect();
++                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true,
++                        "resume_pending": pending })
+             }
+             Request::SetReceiveMode { key, network, mode } => {
+                 json!({ "effective": self.set_receive_mode(&key, &network, mode).await? })
+diff --git a/src/daemon/sessions.rs b/src/daemon/sessions.rs
+index 280457a..f5cd7d8 100644
+--- a/src/daemon/sessions.rs
++++ b/src/daemon/sessions.rs
+@@ -66,8 +66,8 @@ impl Daemon {
+                 .await.map_err(|_| anyhow!("检查 Codex 推送通道超时。"))?
+                 .map_err(|e| anyhow!("无法启动 Codex 检查推送通道：{e}"))?;
+             let help = String::from_utf8_lossy(&output.stdout);
+-            if !output.status.success() || !help.contains("--thread") || !help.contains("--message") {
+-                bail!("当前 Codex 命令行版本不支持按线程排队投递，请更新 Codex。");
++            if !output.status.success() || !help.contains("--thread") || !help.contains("--message") || !help.contains("--resume") {
++                bail!("当前 Codex 命令行工具不支持按线程投递并唤醒，请更新 Codex。");
+             }
+         }
+         let mut g = self.inner.lock().unwrap();
+@@ -231,6 +231,7 @@ impl Daemon {
+                     status: None,
+                     last_hook: None,
+                     push_failed: false,
++                    codex_resume_pending: false,
+                     transcript: None,
+                     retry: None,
+                     stop_gen: 0,

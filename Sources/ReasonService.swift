@@ -10,23 +10,26 @@ actor ReasonService {
         self.home = home
         mirror = TranscriptMirror(root: home.appendingPathComponent(".codex/sessions"))
     }
-    func snapshot(local: String, peer: String) throws -> Snapshot {
-        var directory = try directory()
+    func snapshot(local: String, peer: String, readingFrom: Message.RowKey? = nil, readingNetwork: String? = nil) throws -> Snapshot {
         let engine = try SQLiteStore(home.appendingPathComponent(".reason/network/network.db"), readOnly: true)
+        let expectedNetwork = try teamID(in: engine)
+        var directory = try directory()
         _ = try engine.rows("BEGIN")
         guard let network = try teamID(in: engine), directory.team != nil else {
             throw NetworkError("本机尚未加入 Network。")
         }
+        guard network == expectedNetwork else { throw NetworkError("Network 正在切换，稍后将重新同步。") }
         directory.networkID = network
         let cache = try store()
         try selectNetwork(network, in: cache)
         let paused = try pausedKeys(in: engine)
-        let registrations = try engine.rows("SELECT name,key,doing FROM sessions WHERE agent='codex' AND attached=1 ORDER BY last_seen DESC")
+        let registrations = try engine.rows("SELECT name,key,doing,attached FROM sessions WHERE agent='codex' ORDER BY last_seen DESC")
             .filter { !paused.contains($0["key"] ?? "") }
         let catalog = PersonalSessionCatalog(home: home)
         // A missing or temporarily unavailable agent index must not interrupt messaging.
-        let titles = (try? catalog.codexTitles(for: registrations.compactMap { $0["key"] })) ?? [:]
-        var locals = registrations.compactMap { row -> LocalSession? in
+        let attached = registrations.filter { $0["attached"] == "1" }
+        let titles = (try? catalog.codexTitles(for: attached.compactMap { $0["key"] })) ?? [:]
+        var locals = attached.compactMap { row -> LocalSession? in
             guard let name = row["name"], let key = row["key"] else { return nil }
             let index = directory.sessions.firstIndex {
                 $0.person == directory.person && $0.machine == directory.machine && $0.name == name && $0.agent == "codex"
@@ -40,17 +43,39 @@ actor ReasonService {
         var warning: String?
         let hasFiles = try engine.rows("PRAGMA table_info(messages)").contains { $0["name"] == "files" }
         let fileColumn = hasFiles ? ",files" : ""
-        for session in locals {
+        // A registered mailbox can receive mail just before detaching, between UI polls.
+        for registration in registrations {
+            guard let name = registration["name"], let key = registration["key"] else { continue }
+            let session = LocalSession(name: name, key: key)
             do {
                 for row in try engine.rows("SELECT id,sent_at,sender,body,reply_to\(fileColumn) FROM messages WHERE recipient=? AND held=0 ORDER BY sent_at", [directory.person + "/" + session.name]) {
                     guard let id = row["id"], !otherMail.contains(id) else { continue }
                     try cache.insert(Message(id: id, at: (Double(row["sent_at"] ?? "") ?? 0) / 1000, local: session.name, peer: row["sender"] ?? "", direction: "in", body: row["body"] ?? "", result: "", replyTo: row["reply_to"], attachments: receivedFiles(row["files"])), network: network)
                 }
-                for event in try mirror.events(for: session) {
-                    let origin = try cache.rows("SELECT network FROM network_periods WHERE since<=? ORDER BY since DESC, rowid DESC LIMIT 1", [String(event.at)]).first?["network"]
-                    if let origin = origin?.nonEmpty { try cache.insert(event, network: origin) }
+                try mirror.sync(for: session) { batch in
+                    try cache.transaction {
+                        for event in batch {
+                            let origin = try cache.rows("SELECT network FROM network_periods WHERE since<=? ORDER BY since DESC, rowid DESC LIMIT 1", [String(event.at)]).first?["network"]
+                            if let origin = origin?.nonEmpty { try cache.insert(event, network: origin) }
+                        }
+                    }
                 }
             } catch { warning = "部分历史记录暂未同步：" + error.localizedDescription }
+        }
+        if try engine.rows("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sent_receipts'").first != nil {
+            let receipts = try engine.rows("SELECT id,sender,recipient,stage,sent_at FROM sent_receipts")
+            try cache.transaction {
+                for row in receipts {
+                    guard let id = row["id"], let sender = row["sender"], sender.hasPrefix(directory.person + "/"),
+                          let peer = row["recipient"], let stage = row["stage"], let at = row["sent_at"] else { continue }
+                    _ = try cache.rows("""
+                        UPDATE network_events SET receipt_stage=? WHERE network=? AND id=? AND direction='out'
+                          AND local_session=? AND peer=? AND receipt_stage IS NOT ?
+                          AND network=(SELECT network FROM network_periods WHERE since<=CAST(? AS REAL)/1000
+                                       ORDER BY since DESC,rowid DESC LIMIT 1)
+                        """, [stage, network, id, String(sender.dropFirst(directory.person.count + 1)), peer, stage, at])
+                }
+            }
         }
         let pausedNames = try engine.rows("SELECT key,name FROM sessions").filter { paused.contains($0["key"] ?? "") }.compactMap { $0["name"] }
         let knownNames = Set(locals.map(\.name) + pausedNames)
@@ -60,7 +85,12 @@ actor ReasonService {
             }
         }
         let conversations = try cache.rows("SELECT peer,MAX(at) AS recent FROM network_events WHERE network=? AND local_session=? GROUP BY peer ORDER BY recent DESC", [network, local]).compactMap { $0["peer"] }
-        let page = try history(network: network, local: local, peer: peer)
+        let page: MessagePage
+        if readingNetwork == network, let start = readingFrom, start.local == local {
+            page = try visibleHistory(network: network, local: local, peer: peer, startingAt: start)
+        } else {
+            page = try history(network: network, local: local, peer: peer)
+        }
         return Snapshot(directory: directory, localSessions: locals, conversations: conversations, messages: page.messages,
                         hasEarlier: page.hasEarlier, mirrorWarning: warning)
     }
@@ -133,6 +163,19 @@ actor ReasonService {
         return MessagePage(messages: rows.prefix(100).reversed().map(SQLiteStore.event), hasEarlier: rows.count > 100)
     }
 
+    // Refresh the entire range the user opened, including late backfills and updated receipts.
+    private func visibleHistory(network: String, local: String, peer: String, startingAt key: Message.RowKey) throws -> MessagePage {
+        let cache = try store()
+        let scope = [network, local, peer]
+        let filter = "FROM network_events WHERE network=? AND local_session=? AND peer=?"
+        let boundary = "SELECT at,id,direction " + filter + " AND id=? AND direction=?"
+        let args = scope + scope + [key.id, key.direction]
+        let rows = try cache.rows("SELECT * " + filter + " AND (at,id,direction)>=(" + boundary + ") ORDER BY at,id,direction", args)
+        guard !rows.isEmpty else { return try history(network: network, local: local, peer: peer) }
+        let earlier = try cache.rows("SELECT 1 " + filter + " AND (at,id,direction)<(" + boundary + ") LIMIT 1", args)
+        return MessagePage(messages: rows.map(SQLiteStore.event), hasEarlier: !earlier.isEmpty)
+    }
+
     func send(network: String, local: String, to: String, body: String, files: [URL] = [], notify: Bool = false) throws -> String {
         let typed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         let content = typed.isEmpty && !files.isEmpty ? "附件" : typed
@@ -149,12 +192,19 @@ actor ReasonService {
         guard let key = try engine.rows("SELECT key FROM sessions WHERE name=? AND agent='codex' AND attached=1", [local]).first?["key"] else { throw NetworkError("本机 Codex 会话未连接") }
         guard try !pausedKeys(in: engine).contains(key) else { throw NetworkError("本机会话已退出 Network") }
         let directory = try directory()
+        guard directory.liveLocalSession(named: local, agent: "codex") != nil else { throw LocalSenderOffline() }
         guard directory.sessions.contains(where: { $0.person != directory.person && $0.address == to }) else { throw NetworkError("该队友会话已离线，请刷新后重新选择") }
         guard try teamID(in: engine) == network else { throw NetworkError("当前 Network 已变化，请刷新后重试。") }
         var arguments = ["send", "--from", key]
         if notify { arguments.append("--notify") }
         for file in files { arguments += ["--file", file.path] }
-        let result = try run(arguments + [to, "-"], input: content, timeout: 30)
+        let result: String
+        do {
+            result = try run(arguments + [to, "-"], input: content, timeout: 30)
+        } catch let error as NetworkError where error.message.hasPrefix("Error: this session isn't registered with Reason Network") {
+            // The daemon lost the sender after the directory check and before dispatch.
+            throw LocalSenderOffline()
+        }
         guard let id = TranscriptMirror.match(#"message id ([0-9A-Z]{26})"#, in: result) else {
             throw NetworkError(result.nonEmpty ?? "后台没有返回消息编号，投递状态未知。")
         }
@@ -204,6 +254,20 @@ actor ReasonService {
         }
         return sessions.values.sorted { ($0.updated, $0.id) > ($1.updated, $1.id) }
     }
+    func reconnectLocal(_ local: LocalSession, network: String) throws {
+        let engine = try SQLiteStore(home.appendingPathComponent(".reason/network/network.db"), readOnly: true)
+        guard try teamID(in: engine) == network, !local.historyOnly,
+              try engine.rows("SELECT key FROM sessions WHERE name=? AND agent='codex' AND attached=1", [local.name]).first?["key"] == local.key,
+              try !pausedKeys(in: engine).contains(local.key) else {
+            throw NetworkError("本机会话或 Network 已变化，请刷新后重新选择。")
+        }
+        if try directory().liveLocalSession(named: local.name, agent: "codex") != nil { return }
+        guard let session = try PersonalSessionCatalog(home: home).discover().sessions.first(where: { $0.id == local.key }) else {
+            throw NetworkError("找不到这个本机 Codex 对话，请在 Codex 中打开后重试。")
+        }
+        _ = try registerPersonalSession(session)
+    }
+
     func joinPersonalSession(_ key: String) throws -> String {
         guard let chosen = try personalSessions().first(where: { $0.id == key }), chosen.canJoin else {
             throw NetworkError("这个会话还需要在原工具中打开，或已经在线。")
@@ -261,12 +325,27 @@ actor ReasonService {
         return Set(try database.rows("SELECT key FROM paused_sessions").compactMap { $0["key"] })
     }
 
+    func setReceiveMode(_ mode: ReceiveMode, local: LocalSession, network: String) throws -> ReceiveMode {
+        struct Reply: Decodable { let effective: ReceiveMode }
+        do {
+            return try console.decode(["op": "set_receive_mode", "key": local.key, "network": network, "mode": mode.rawValue],
+                                      as: Reply.self).effective
+        } catch let error as NetworkError where error.message.contains("unknown variant") {
+            throw NetworkError("当前后台未支持接收模式设置，请在「环境配置」中更新兼容后台。")
+        }
+    }
+
     func supportsSessionExit() throws -> Bool {
         do { _ = try participationState(); return true }
         catch where error.localizedDescription.contains("unknown variant") { return false }
     }
 
-    private struct ParticipationState: Decodable { let version: Int; let paused: Set<String> }
+    private struct ParticipationState: Decodable {
+        let version: Int
+        let paused: Set<String>
+        let resumePending: Set<String>?
+        enum CodingKeys: String, CodingKey { case version, paused, resumePending = "resume_pending" }
+    }
     private func participationState() throws -> ParticipationState {
         let state = try console.decode(["op": "session_participation"], as: ParticipationState.self)
         guard state.version == 1 else { throw NetworkError("后台服务的会话管理版本不兼容。") }
@@ -285,7 +364,11 @@ actor ReasonService {
         }
         return link
     }
-    func diagnose() throws -> String { try run(["doctor"]) }
+    func diagnose(localKey: String?) throws -> String {
+        let detail = try run(["doctor"])
+        guard let localKey, let state = try? participationState(), state.resumePending?.contains(localKey) == true else { return detail }
+        return "最近一次推送已进入 Codex 队列，但未能唤醒此会话。请在 Codex 打开该对话，无需重发。\n\n" + detail
+    }
     private func directory() throws -> Directory {
         let output = try run(["who", "--json"])
         guard let data = output.data(using: .utf8) else { throw NetworkError("无法读取 Network 目录") }
@@ -299,8 +382,10 @@ actor ReasonService {
         let file = folder.appendingPathComponent("messages.sqlite3")
         let database = try SQLiteStore(file, readOnly: false)
         _ = try database.rows("CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, at REAL, local_session TEXT, peer TEXT, direction TEXT, body TEXT, result TEXT, reply_to TEXT)")
-        if !(try database.rows("PRAGMA table_info(events)")).contains(where: { $0["name"] == "attachments" }) {
-            _ = try database.rows("ALTER TABLE events ADD COLUMN attachments TEXT NOT NULL DEFAULT ''")
+        try database.transaction {
+            if !(try database.rows("PRAGMA table_info(events)")).contains(where: { $0["name"] == "attachments" }) {
+                _ = try database.rows("ALTER TABLE events ADD COLUMN attachments TEXT NOT NULL DEFAULT ''")
+            }
         }
         _ = try database.rows("CREATE INDEX IF NOT EXISTS events_conversation_time ON events(local_session,peer,at,id)")
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
@@ -331,6 +416,11 @@ actor ReasonService {
               peer TEXT,direction TEXT NOT NULL,body TEXT,result TEXT,reply_to TEXT,attachments TEXT NOT NULL DEFAULT '',
               PRIMARY KEY(network,id,local_session,direction))
             """)
+        try database.transaction {
+            if !(try database.rows("PRAGMA table_info(network_events)")).contains(where: { $0["name"] == "receipt_stage" }) {
+                _ = try database.rows("ALTER TABLE network_events ADD COLUMN receipt_stage TEXT")
+            }
+        }
         _ = try database.rows("CREATE INDEX IF NOT EXISTS network_history ON network_events(network,local_session,peer,at,id)")
         try database.prepareNetworkMetadata()
         cache = database

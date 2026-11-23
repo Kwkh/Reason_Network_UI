@@ -30,6 +30,74 @@ struct CoreChecks {
         try expect(!window.receive([], atBottom: false) && window.messages.isEmpty, "empty history clears visible rows")
     }
 
+    @MainActor
+    static func checkExpandedHistory(service: ReasonService, cache: SQLiteStore) async throws {
+        let model = NetworkModel(service: service)
+        model.selectedLocal = "local"
+        model.selectedPeer = "history"
+        await model.refresh()
+        guard let first = model.messages.first else { throw NetworkError("missing initial history") }
+        let earlier = try await model.loadEarlier(before: first)
+        try expect(earlier.messages.count == 100, "second history page loaded")
+        let delayed = Message(id: "page042-late", at: 42, local: "local", peer: "history", direction: "out",
+                              body: "第一段\u{0}第二段", result: "queued", receiptStage: nil)
+        try cache.insert(delayed, network: "team-a")
+        _ = try cache.rows("UPDATE network_events SET receipt_stage='replied' WHERE network='team-a' AND id='page042-late'")
+        await model.refresh()
+        try expect(model.messages.count == 201 && model.messages.first?.id == earlier.messages.first?.id,
+                   "poll keeps the loaded page including a delayed insertion")
+        let row = model.messages.first { $0.id == delayed.id }
+        try expect(row?.body == delayed.body && row?.delivery == "已回复", "backfilled body and receipt are visible on older page")
+        model.selectedPeer = "peer/remote"
+        do {
+            _ = try await model.loadEarlier(before: first)
+            throw NetworkError("wrong conversation's cursor was accepted")
+        } catch is CancellationError {}
+        await model.refresh()
+        try expect(model.messages.allSatisfy { $0.peer == "peer/remote" }, "peer switch discards old range")
+        model.selectedPeer = "history"
+        await model.refresh()
+        try expect(model.messages.count == 100, "reopening starts at the current latest page")
+    }
+
+    @MainActor
+    static func checkOfflineSender(home: URL, service: ReasonService) async throws {
+        let model = NetworkModel(service: service)
+        model.selectedLocal = "local"
+        model.selectedPeer = "peer/remote"
+        await model.refresh()
+        let original = NetworkModel.Draft(text: "待发送", files: [home.appendingPathComponent("notes.txt")], notify: true)
+        model.options = original
+        try expect(model.canSend, "registered local sender can send")
+        try expect(model.senderPresence == .online, "sidebar and toolbar share the registered sender state")
+        let connected = model.directory
+        if let directory = connected, let device = directory.machines.first(where: \.isMe) {
+            let unavailable = Device(person: device.person, machine: device.machine, endpoint: device.endpoint, isMe: true, online: false, link: nil, rttMs: nil)
+            model.directory = Directory(networkID: directory.networkID, team: directory.team, person: directory.person,
+                                        machine: directory.machine, sessions: directory.sessions, machines: [unavailable])
+            try expect(model.senderPresence == .offline && !model.canSend && unavailable.state == "离线", "an offline host overrides a stale live session")
+            model.directory = connected
+        }
+        model.error = "fixture unavailable"
+        try expect(model.senderPresence == .unknown, "a failed refresh cannot publish stale online status")
+        model.error = nil
+        let marker = home.appendingPathComponent("offline")
+        try Data().write(to: marker)
+        await model.refresh()
+        try expect(model.senderPresence == .offline && !model.canSend, "a live namesake on another machine cannot send for this one")
+        await model.send()
+        do {
+            _ = try await service.send(network: "team-a", local: "local", to: "peer/remote", body: "blocked")
+            throw NetworkError("offline send accepted")
+        } catch is LocalSenderOffline {}
+        try expect(!FileManager.default.fileExists(atPath: home.appendingPathComponent("sent.json").path), "offline sender never dispatched")
+        await model.reconnectSender()
+        try expect(!model.notice.isEmpty && model.senderOffline && model.options == original, "unavailable native thread leaves draft intact")
+        try FileManager.default.removeItem(at: marker)
+        await model.refresh()
+        try expect(model.canSend && model.options == original, "confirmed return enables sending with the original draft")
+    }
+
     static func main() async throws {
         try checkReadingWindow()
         let fm = FileManager.default
@@ -59,7 +127,9 @@ struct CoreChecks {
 import json,sys,pathlib
 home=pathlib.Path(__file__).resolve().parents[2]
 if sys.argv[1]=='who':
- print(json.dumps({'team':'fixture','person':'me','machine':'fixture-mac','sessions':[{'address':'peer/remote','name':'remote','person':'peer','doing':'Remote title','tier':'push'}],'machines':[{'person':'me','machine':'fixture-mac','endpoint':'fixture','is_me':True,'online':True}]}))
+ local={'address':'me/local','name':'local','agent':'codex','person':'me','machine':'fixture-mac','status':'live','tier':'pull'}
+ if (home/'offline').exists(): local['machine']='another-mac'
+ print(json.dumps({'team':'fixture','person':'me','machine':'fixture-mac','sessions':[{'address':'peer/remote','name':'remote','person':'peer','doing':'Remote title','tier':'push'},local],'machines':[{'person':'me','machine':'fixture-mac','endpoint':'fixture','is_me':True,'online':True}]}))
 elif sys.argv[1]=='leave':
  assert sys.argv[2:] == []
  if (home/'refuse').exists(): sys.exit("no teammate is online")
@@ -149,6 +219,7 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         catch { try expect(error.localizedDescription != "invalid local accepted", "reject detached local") }
         do { _ = try await service.send(network: "team-a", local: "local", to: "unknown/peer", body: "hello"); throw NetworkError("invalid peer accepted") }
         catch { try expect(error.localizedDescription != "invalid peer accepted", "reject unknown recipient") }
+        try await checkOfflineSender(home: home, service: service)
         let body = "literal `whoami` $(touch /tmp/no-execution)\n中文"
         let status = try await service.send(network: "team-a", local: "local", to: "peer/remote", body: body)
         try expect(status == "已排队", "queued is not read")
@@ -157,6 +228,14 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         try expect(sent["args"] as? [String] == ["--from", "codex:fixture", "peer/remote", "-"], "sender identity preserved")
         let after = try await service.snapshot(local: "local", peer: "peer/remote")
         try expect(after.messages.filter(\.outgoing).count == 1, "successful outgoing cached")
+        _ = try engine.rows("CREATE TABLE sent_receipts(id TEXT,sender TEXT,recipient TEXT,stage TEXT,sent_at INTEGER)")
+        _ = try engine.rows("INSERT INTO sent_receipts VALUES('01234567890123456789012345','me/local','peer/remote','replied',1000)")
+        let updated = try await service.snapshot(local: "local", peer: "peer/remote")
+        try expect(updated.messages.first(where: { $0.outgoing })?.delivery == "已回复", "remote reply replaces initial queue status")
+        var visible = ConversationReadingWindow()
+        visible.show(after.messages)
+        try expect(!visible.receive(updated.messages, atBottom: false) && visible.messages == updated.messages &&
+                   !visible.hasPendingUpdate, "receipt-only updates preserve scroll position")
         let other = try await service.snapshot(local: "local", peer: "other/peer")
         try expect(other.messages.isEmpty, "conversation isolation")
         let file = home.appendingPathComponent("log file.txt")
@@ -195,6 +274,12 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         reading.show(newest.messages)
         reading.prepend(middle, before: newest.messages[0].rowKey)
         try expect(!reading.receive(newest.messages, atBottom: false) && reading.messages.count == 200, "poll preserves explicitly loaded history")
+        try await checkExpandedHistory(service: service, cache: cache)
+        _ = try engine.rows("INSERT INTO sessions(name,key,agent,doing,attached,last_seen) VALUES('detached','codex:detached','codex',NULL,0,1)")
+        _ = try engine.rows("INSERT INTO messages(id,sent_at,sender,body,recipient,held) VALUES('late-in',2000,'peer/remote','late','me/detached',0)")
+        let offline = try await service.snapshot(local: "detached", peer: "peer/remote")
+        try expect(offline.messages.map(\.id) == ["late-in"] && offline.localSessions.first { $0.name == "detached" }?.historyOnly == true,
+                   "mail arriving before detach is mirrored without bringing the session online")
         // A second app using the same cache can have a per-mailbox primary key.
         let sharedDir = home.appendingPathComponent("shared-fixture")
         let dbDir = sharedDir.appendingPathComponent(".reason/network/local-ui")
@@ -253,6 +338,9 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         try expect(literal?["message"] as? String == "hi\nthere", "literal extraction")
         try expect(TranscriptMirror.literalSend(#"tools.mcp__reason_network__send_message({to:recipient,message:body})"#) == nil, "never evaluate variables")
         try expect(TranscriptMirror.literalSend(#"tools.mcp__reason_network__send_message({to:'peer/remote',message:'hello'})"#)?["to"] as? String == "peer/remote", "legacy single-quoted literals")
+        let withAttachment = TranscriptMirror.literalSend(#"tools.mcp__reason_network__send_message({to:"peer/remote",files:["/tmp/a.txt"],notify:true,message:`a\nb`})"#)
+        try expect(withAttachment?["files"] as? [String] == ["/tmp/a.txt"] && withAttachment?["message"] as? String == "a\nb", "static template with literal attachment array")
+        try expect(TranscriptMirror.literalSend(#"tools.mcp__reason_network__send_message({to:"peer",message:`a${variable}`})"#) == nil, "dynamic templates are never reconstructed")
         let log = home.appendingPathComponent(".codex/sessions/rollout-fixture.jsonl")
         func line(_ item: [String: Any]) throws -> Data {
             var result = try JSONSerialization.data(withJSONObject: ["type":"response_item","timestamp":"2026-11-22T00:00:00.000Z","payload":item]); result.append(10); return result
@@ -263,11 +351,37 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         var first = call; first.append(output.prefix(split)); try first.write(to: log)
         let mirror = TranscriptMirror(root: home.appendingPathComponent(".codex/sessions"))
         let local = LocalSession(name: "local", key: "codex:fixture")
-        try expect(try mirror.events(for: local).isEmpty, "partial JSONL output delayed")
+        func mirrored() throws -> [Message] {
+            var events: [Message] = []
+            try mirror.sync(for: local) { events += $0 }
+            return events
+        }
+        try expect(try mirrored().isEmpty, "partial JSONL output delayed")
         let handle = try FileHandle(forWritingTo: log); try handle.seekToEnd(); try handle.write(contentsOf: output.suffix(from: split)); try handle.close()
-        let events = try mirror.events(for: local)
+        do {
+            try mirror.sync(for: local) { _ in throw NetworkError("simulated cache lock") }
+            throw NetworkError("FAIL: missing mirror persistence attempt")
+        } catch { try expect(error.localizedDescription == "simulated cache lock", "cache failure reported") }
+        let events = try mirrored()
         try expect(events.count == 1 && events.first?.body == "from agent", "incremental transcript recovery")
-        try expect(try mirror.events(for: local).isEmpty, "transcript not duplicated")
+        try expect(try mirrored().isEmpty, "transcript not duplicated")
+        let replacement = try line(["type":"function_call_output","call_id":"one","output":"queued message id 21234567890123456789012345"])
+        try (call + replacement).write(to: log, options: .atomic)
+        try expect(try mirrored().map(\.id) == ["21234567890123456789012345"], "same path and size with a new inode is reread")
+        let archive = home.appendingPathComponent(".codex/archived_sessions")
+        try fm.createDirectory(at: archive, withIntermediateDirectories: true)
+        try (call + replacement).write(to: archive.appendingPathComponent("rollout-detached.jsonl"))
+        let archivedHistory = try await ReasonService(home: home).snapshot(local: "detached", peer: "peer/remote")
+        try expect(archivedHistory.messages.contains { $0.outgoing && $0.id == "21234567890123456789012345" },
+                   "network history survives archiving of a detached Codex thread")
+        var large = call + output
+        large.append(Data(repeating: 32, count: 8_100_000))
+        large.append(10)
+        try large.write(to: log)
+        let reopened = TranscriptMirror(root: log.deletingLastPathComponent())
+        var backfill: [Message] = []
+        try reopened.sync(for: local) { backfill += $0 }
+        try expect(backfill.map(\.id) == events.map(\.id), "fresh mirror reads records before the former 8 MB cutoff")
         print("PASS: native adapter, read-only inbox, held-message exclusion, conversation isolation, sender identity, literal extraction, partial JSONL, and send cache")
     }
 }

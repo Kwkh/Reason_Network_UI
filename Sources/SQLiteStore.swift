@@ -19,7 +19,7 @@ final class SQLiteStore {
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { throw failure() }
         defer { sqlite3_finalize(statement) }
         for (index, value) in values.enumerated() {
-            let code = value.withCString { sqlite3_bind_text(statement, Int32(index + 1), $0, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
+            let code = value.withCString { sqlite3_bind_text(statement, Int32(index + 1), $0, Int32(value.utf8.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
             guard code == SQLITE_OK else { throw failure() }
         }
         var result: [[String: String]] = []
@@ -30,7 +30,8 @@ final class SQLiteStore {
             var row: [String: String] = [:]
             for i in 0..<sqlite3_column_count(statement) {
                 if let value = sqlite3_column_text(statement, i) {
-                    row[String(cString: sqlite3_column_name(statement, i))] = String(cString: value)
+                    let bytes = UnsafeBufferPointer(start: value, count: Int(sqlite3_column_bytes(statement, i)))
+                    row[String(cString: sqlite3_column_name(statement, i))] = String(decoding: bytes, as: UTF8.self)
                 }
             }
             result.append(row)
@@ -101,6 +102,6 @@ final class SQLiteStore {
     }
 
     static func event(_ row: [String: String]) -> Message {
-        Message(id: row["id"] ?? "", at: Double(row["at"] ?? "") ?? 0, local: row["local_session"] ?? "", peer: row["peer"] ?? "", direction: row["direction"] ?? "", body: row["body"] ?? "", result: row["result"] ?? "", replyTo: row["reply_to"], attachments: row["attachments"].flatMap { try? JSONDecoder().decode([MessageAttachment].self, from: Data($0.utf8)) } ?? [])
+        Message(id: row["id"] ?? "", at: Double(row["at"] ?? "") ?? 0, local: row["local_session"] ?? "", peer: row["peer"] ?? "", direction: row["direction"] ?? "", body: row["body"] ?? "", result: row["result"] ?? "", replyTo: row["reply_to"], attachments: row["attachments"].flatMap { try? JSONDecoder().decode([MessageAttachment].self, from: Data($0.utf8)) } ?? [], receiptStage: row["receipt_stage"])
     }
 }

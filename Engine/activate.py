@@ -67,13 +67,13 @@ def main(binary):
                     sock.connect(str(home / ".reason/network/network.sock"))
                     sock.sendall(b'{"op":"session_participation","id":1}\n')
                     reply = json.loads(sock.makefile("rb").readline(1024 * 1024))
-                    if reply.get("ok") and reply["result"]["version"] == 1:
-                        print("Session participation v1 is available.")
+                    if reply.get("ok") and reply["result"]["version"] == 1 and reply["result"].get("codex_queue_resume"):
+                        print("Session participation and Codex queue resume are available.")
                         return
             except (OSError, ValueError):
                 pass
             time.sleep(0.5)
-        raise RuntimeError("Daemon did not advertise session participation v1")
+        raise RuntimeError("Daemon did not advertise Codex queue resume")
     except BaseException:
         subprocess.run(["launchctl", "bootout", service], check=False)
         replace_plist(old)

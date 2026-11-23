@@ -22,6 +22,7 @@ enum NetworkPaths {
 
 struct SetupSnapshot: Equatable {
     var installed = false
+    var needsBackendUpdate = false
     var participation = false
     var background = false
     var codex = false
@@ -150,7 +151,13 @@ actor SetupService: SetupServicing {
             result.team = directory.team
             result.sessions = directory.sessions.filter { $0.person == directory.person && $0.agent == "codex" && $0.tier != "none" }.count
         } catch { result.issue = SetupInput.redacted(error.localizedDescription) }
-        result.participation = installer.configured && installer.probe(home)
+        if installer.configured {
+            result.participation = installer.probe(home)
+            if !result.participation && ParticipationInstaller.capabilities(at: home) != nil {
+                result.participation = true
+                result.needsBackendUpdate = true
+            }
+        }
         return result
     }
 
@@ -176,7 +183,7 @@ actor SetupService: SetupServicing {
         _ = try await SetupCommand.run(executable, arguments, home: home, timeout: 90).checked()
         try await installer.activate()
         let result = await inspect()
-        guard result.background && result.participation else { throw NetworkError("后台服务未安装成功，请展开详情或重试配置。") }
+        guard result.background && result.participation && !result.needsBackendUpdate else { throw NetworkError("后台服务未安装成功，请展开详情或重试配置。") }
         if result.codex && !result.wired { throw NetworkError("Codex 接入未完成，请检查配置文件权限后重试。") }
     }
     func join(invitation: String, name: String) async throws {

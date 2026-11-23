@@ -1,5 +1,9 @@
 import SwiftUI
 
+enum SenderPresence: String {
+    case online = "在线", offline = "离线", reconnecting = "正在重新接入", history = "仅历史记录", unknown = "状态未知"
+}
+
 @MainActor
 final class NetworkModel: ObservableObject {
     @Published var directory: Directory?
@@ -26,9 +30,17 @@ final class NetworkModel: ObservableObject {
         guard item.files.count <= 10 else { notice = "每条消息最多添加 10 个附件。"; return }
         drafts[key] = item
     }
+    private var readingFrom: Message.RowKey?
+    private var selectionGeneration = 0
+
     func loadEarlier(before message: Message) async throws -> MessagePage {
         guard let network = directory?.networkID else { throw NetworkError("本机尚未加入 Network。") }
-        return try await service.history(network: network, local: message.local, peer: message.peer, before: message.rowKey)
+        guard message.local == selectedLocal, message.peer == selectedPeer else { throw CancellationError() }
+        let generation = selectionGeneration
+        let page = try await service.history(network: network, local: message.local, peer: message.peer, before: message.rowKey)
+        guard generation == selectionGeneration, directory?.networkID == network, !leavingNetwork else { throw CancellationError() }
+        if let first = page.messages.first { readingFrom = first.rowKey }
+        return page
     }
     func readAttachment(_ attachment: MessageAttachment) async throws -> String {
         try await service.attachmentText(attachment)
@@ -76,11 +88,48 @@ final class NetworkModel: ObservableObject {
     }
     var peer: NetworkSession? { peers.first { $0.address == selectedPeer } }
     var own: LocalSession? { locals.first { $0.name == selectedLocal } }
+    var senderPresence: SenderPresence {
+        guard let own else { return .unknown }
+        if own.historyOnly { return .history }
+        if reconnectingSender { return .reconnecting }
+        guard online else { return .unknown }
+        return senderOffline ? .offline : .online
+    }
+    var senderOffline: Bool {
+        online && own?.historyOnly == false && directory?.liveLocalSession(named: selectedLocal, agent: "codex") == nil
+    }
+    var reconnectingSender: Bool { own != nil && reconnectingKey == own?.key }
+    @Published private(set) var reconnectingKey: String?
     var canSend: Bool {
-        !leavingNetwork && !sending && error == nil && own?.historyOnly == false && peer?.offline == false && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !options.files.isEmpty)
+        !leavingNetwork && !sending && online && !senderOffline && !reconnectingSender && own?.historyOnly == false && peer?.offline == false && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !options.files.isEmpty)
     }
     var online: Bool { directory != nil && error == nil }
-    var tier: String? { directory?.sessions.first { $0.person == directory?.person && $0.name == selectedLocal }?.tier }
+    var tier: String? { guard online else { return nil }; return directory?.liveLocalSession(named: selectedLocal, agent: "codex")?.tier }
+    @Published var receiveModeError: String?
+
+    func changeReceiveMode(_ mode: ReceiveMode, local: LocalSession, network: String) async {
+        guard own?.key == local.key, directory?.networkID == network, changingSession == nil,
+              !leavingNetwork, senderPresence == .online else { return }
+        changingSession = local.key
+        defer { changingSession = nil }
+        do {
+            let confirmed = try await service.setReceiveMode(mode, local: local, network: network)
+            await refresh()
+            guard own?.key == local.key, directory?.networkID == network else { return }
+            guard let actual = tier.flatMap(ReceiveMode.init(rawValue:)) else {
+                throw NetworkError("暂时无法获得该会话的最新状态。")
+            }
+            if confirmed != mode || actual != mode {
+                throw NetworkError("后台当前生效的是「" + actual.title + "」，所选通道暂不可用。")
+            }
+        } catch {
+            if own?.key == local.key && directory?.networkID == network {
+                receiveModeError = "「" + local.title + "」无法确认切换到「" + mode.title + "」。" + error.localizedDescription
+            }
+            await refresh()
+        }
+    }
+
     func start() async {
         guard !running else { return }; running = true
         defer { running = false }
@@ -90,6 +139,8 @@ final class NetworkModel: ObservableObject {
         }
     }
     private func changedConversation() {
+        selectionGeneration += 1
+        readingFrom = nil
         let cached = messageCache[conversationKey]
         waitingForHistory = cached == nil
         messages = cached ?? []
@@ -115,10 +166,15 @@ final class NetworkModel: ObservableObject {
         repeat {
             requestAgain = false
             let local = selectedLocal, peer = selectedPeer
+            let generation = selectionGeneration, floor = readingFrom, network = directory?.networkID
             do {
-                let snapshot = try await service.snapshot(local: local, peer: peer)
+                let snapshot = try await service.snapshot(local: local, peer: peer, readingFrom: floor, readingNetwork: network)
                 guard !leavingNetwork, departure == departureCount else { return }
-                guard local == selectedLocal, peer == selectedPeer else { requestAgain = true; continue }
+                guard generation == selectionGeneration, floor == readingFrom else { requestAgain = true; continue }
+                if network != snapshot.directory.networkID {
+                    selectionGeneration += 1
+                    readingFrom = nil
+                }
                 if directory != snapshot.directory { directory = snapshot.directory }
                 if locals != snapshot.localSessions { locals = snapshot.localSessions }
                 if !locals.contains(where: { $0.name == selectedLocal }), selectedLocal != (locals.first?.name ?? "") {
@@ -131,7 +187,7 @@ final class NetworkModel: ObservableObject {
                 if waitingForHistory { waitingForHistory = false }
                 if conversations != snapshot.conversations { conversations = snapshot.conversations }
                 if hasEarlier != snapshot.hasEarlier { hasEarlier = snapshot.hasEarlier }
-                messageCache[conversationKey] = snapshot.messages
+                messageCache[conversationKey] = Array(snapshot.messages.suffix(100))
                 if messages != snapshot.messages { messages = snapshot.messages }
                 if !peers.contains(where: { $0.address == selectedPeer }), selectedPeer != (peers.first?.address ?? "") {
                     selectedPeer = peers.first?.address ?? ""
@@ -139,7 +195,7 @@ final class NetworkModel: ObservableObject {
                 }
             } catch {
                 guard !leavingNetwork, departure == departureCount else { return }
-                guard local == selectedLocal, peer == selectedPeer else { requestAgain = true; continue }
+                guard generation == selectionGeneration, floor == readingFrom else { requestAgain = true; continue }
                 self.error = error.localizedDescription
             }
         } while requestAgain && !Task.isCancelled
@@ -154,10 +210,31 @@ final class NetworkModel: ObservableObject {
             if key == conversationKey { notice = status }
             await refresh()
             if key == conversationKey { sentCount += 1 }
+        } catch is LocalSenderOffline {
+            if key == conversationKey { notice = "本次消息未发送。" }
+            await refresh()
         } catch {
             if key == conversationKey { notice = error.localizedDescription + "；请确认投递状态后再重试。" }
         }
         sending = false
+    }
+    func reconnectSender() async {
+        guard senderOffline, let local = own, let network = directory?.networkID,
+              changingSession == nil, !sending, !leavingNetwork else { return }
+        changingSession = local.key
+        reconnectingKey = local.key
+        let key = conversationKey
+        defer { changingSession = nil; reconnectingKey = nil }
+        do {
+            try await service.reconnectLocal(local, network: network)
+            await refresh()
+            if key == conversationKey {
+                notice = senderOffline ? "后台尚未确认接入，请稍后重试。" : ""
+            }
+        } catch {
+            if key == conversationKey { notice = error.localizedDescription }
+            await refresh()
+        }
     }
     func refreshMySessions() async {
         guard !loadingMySessions else { return }
@@ -209,6 +286,8 @@ final class NetworkModel: ObservableObject {
         leavingNetwork = true
         defer { leavingNetwork = false }
         try await service.leaveNetwork(expected: id)
+        selectionGeneration += 1
+        readingFrom = nil
         directory = nil
         locals = []
         conversations = []
@@ -239,7 +318,7 @@ final class NetworkModel: ObservableObject {
     func diagnose() async {
         guard !diagnosing else { return }; diagnosing = true
         defer { diagnosing = false }
-        do { doctor = try await service.diagnose().nonEmpty ?? "本次检查未返回诊断信息。" }
+        do { doctor = try await service.diagnose(localKey: own?.key).nonEmpty ?? "本次检查未返回诊断信息。" }
         catch { doctor = error.localizedDescription }
     }
 }

@@ -4,7 +4,7 @@ SwiftUI 原生消息控制台。界面不使用 WebView，不启动浏览器、H
 
 ## 安装与首次配置
 
-从 [GitHub Releases](https://github.com/Kwkh/Reason_Network_UI/releases) 下载 Universal DMG，将 App 拖入 Applications。当前预览包使用本地临时签名，尚未完成 Developer ID 签名与公证；首次打开可能需要在系统设置 → 隐私与安全性中允许。系统没有允许入口时，可从源码在 Xcode 中运行。请勿关闭 Gatekeeper。
+从 [GitHub Releases](https://github.com/Kwkh/Reason_Network_UI/releases) 下载 Universal DMG，将 App 拖入 Applications。GitHub 上的 1.1.3 发行包内含 Developer ID 签名并通过 Apple 公证的 App。已有安装请打开「环境配置」，点击「更新兼容后台」启用新版 Codex 唤醒功能。
 
 首次启动自动检查内置兼容后台、登录服务、Codex 接入与 Network 状态；已配置的机器直接进入聊天。新机流程：
 
@@ -53,7 +53,7 @@ Reason 引擎数据库 `~/.reason/network/network.db` 以 SQLite **只读**方�
 - `Resources/AppIcon.icon`：当前实际编译的 Icon Composer 分层图标；`Assets/Bubble.svg` 与 `Assets/Prompt.svg` 是 1024×1024 画布的两层前景，`icon.json` 定义背景与材质。`Tools/Icon.swift` 和旧 PNG / ICNS 仅保留作绘制与对比参考。
 - `Tests/CoreChecks.swift`：隔离临时目录＋模拟 CLI，检查只读访问、held 消息排除、会话隔离、发送参数／正文、日志增量与半行恢复。不会向真实队友发测试消息。
 
-此配套工具需要访问用户目录内的 CLI、数据库及日志，因此未开启 App Sandbox。当前 DMG 为未公证的本地签名预览包，不是 App Store 安装包。
+此配套工具需要访问用户目录内的 CLI、数据库及日志，因此未开启 App Sandbox。正式版使用 Developer ID 分发。Tools/package-release.sh 生成的本地开发包使用临时签名。
 
 ## 图标适配检查（2026-11-22）
 

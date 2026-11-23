@@ -63,7 +63,7 @@ struct NetworkOverview: View {
                         CopyInvitationButton().disabled(directory.team?.nonEmpty == nil)
                         HStack(spacing: 40) {
                             metric("在线会话", directory.sessions.filter(\.available).count)
-                            metric("在线设备", directory.machines.filter { $0.isMe || $0.online }.count)
+                            metric("在线设备", directory.machines.filter(\.online).count)
                         }
                         Divider()
                         sessionList(directory)
@@ -94,6 +94,7 @@ struct NetworkOverview: View {
             }
         }
         .frame(width: 540, height: 510)
+        .background(Color(nsColor: .textBackgroundColor))
     }
 
     private func metric(_ title: String, _ value: Int) -> some View {

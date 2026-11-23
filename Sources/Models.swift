@@ -50,7 +50,7 @@ struct Device: Decodable, Identifiable, Equatable {
     let rttMs: Double?
     var id: String { endpoint }
     var state: String {
-        guard isMe || online else { return "离线" }
+        guard online else { return "离线" }
         let route = link == "direct" ? "直连" : link == "relay" ? "中继" : nil
         guard let route, !isMe else { return "在线" }
         return "在线 · " + route + (rttMs.map { " \(Int($0)) ms" } ?? "")
@@ -63,7 +63,27 @@ struct Directory: Decodable, Equatable {
     let machine: String
     var sessions: [NetworkSession]
     let machines: [Device]
+
+    func liveLocalSession(named name: String, agent: String) -> NetworkSession? {
+        guard !machines.contains(where: { $0.isMe && !$0.online }) else { return nil }
+        return sessions.first {
+            $0.person == person && $0.machine == machine && $0.name == name && $0.agent == agent &&
+                $0.available && $0.tier != nil
+        }
+    }
 }
+enum ReceiveMode: String, CaseIterable, Decodable {
+    case push, turn, pull
+
+    var title: String {
+        switch self {
+        case .push: "即时推送"
+        case .turn: "回合接收"
+        case .pull: "手动接收"
+        }
+    }
+}
+
 struct LocalSession: Identifiable, Equatable {
     let name: String
     let key: String
@@ -127,8 +147,19 @@ struct Message: Identifiable, Equatable {
     let result: String
     var replyTo: String? = nil
     var attachments: [MessageAttachment] = []
+    var receiptStage: String? = nil
     var outgoing: Bool { direction == "out" }
     var delivery: String {
+        switch receiptStage {
+        case "queued": return "已排队"
+        case "accepted": return "对方设备已接收"
+        case "handed_to_agent": return "已交给对方会话"
+        case "replied": return "已回复"
+        case "held": return "待批准"
+        case "rejected": return "已拒收"
+        case "expired": return "已过期"
+        default: break
+        }
         if result.contains("queued") { return "已排队" }
         if result.contains("delivered") { return "已投递" }
         return result.isEmpty ? "" : "已发送"
@@ -163,7 +194,7 @@ struct ConversationReadingWindow {
             show(latest)
             return !latest.isEmpty
         }
-        if latest.starts(with: messages) {
+        if latest.starts(with: messages, by: { $0.rowKey == $1.rowKey }) {
             show(latest)
         } else {
             hasPendingUpdate = true
@@ -186,6 +217,10 @@ struct Snapshot {
     let hasEarlier: Bool
     let mirrorWarning: String?
 }
+struct LocalSenderOffline: LocalizedError {
+    var errorDescription: String? { "本机会话已离线，消息未发送。" }
+}
+
 struct NetworkError: LocalizedError {
     let message: String
     var errorDescription: String? { message }

@@ -1,0 +1,188 @@
+--- a/src/proto.rs
++++ b/src/proto.rs
+@@ -93,6 +93,7 @@
+ #[serde(tag = "op", rename_all = "snake_case")]
+ pub enum Request {
+     SessionParticipation,
++    SetReceiveMode { key: String, network: String, mode: Tier },
+     SetSessionParticipation {
+         key: String,
+         paused: bool,
+--- a/src/daemon/mod.rs
++++ b/src/daemon/mod.rs
+@@ -175,6 +175,7 @@
+ struct Live {
+     through_reason: Option<bool>,
+     reg: SessionReg,
++    preferred_mode: Option<Tier>,
+     name: String,
+     /// The client connection (`reason network mcp`) that owns it; `None` for sessions known only through hooks.
+     conn: Option<u64>,
+@@ -360,7 +361,10 @@
+         Ok(match req {
+             Request::SessionParticipation => {
+                 let g = self.inner.lock().unwrap();
+-                json!({ "version": 1, "paused": g.paused })
++                json!({ "version": 1, "paused": g.paused, "receive_modes": true })
++            }
++            Request::SetReceiveMode { key, network, mode } => {
++                json!({ "effective": self.set_receive_mode(&key, &network, mode).await? })
+             }
+             Request::SetSessionParticipation { key, paused } => {
+                 self.set_session_participation(&key, paused)?;
+--- a/src/daemon/sessions.rs
++++ b/src/daemon/sessions.rs
+@@ -28,7 +28,64 @@
+ const OFF_TURN_MS: i64 = 10 * 60_000;
+ const SESSION_PAUSED: &str = "this session was disconnected from Reason Network by its user";
+ 
++impl Live {
++    fn hook_mode(&self) -> Tier {
++        if self.last_hook.is_some() { Tier::Turn } else { Tier::Pull }
++    }
++
++    fn push_problem(&self) -> Option<&'static str> {
++        if self.reg.agent_session_id.as_deref().is_none_or(str::is_empty) {
++            Some("后台没有收到这个 Codex 对话的线程 ID。")
++        } else if self.push_failed {
++            Some("这个会话上一次即时投递失败，请在 Codex 中重新打开该对话后再试。")
++        } else if agent::find_bin("codex").is_none() {
++            Some("后台找不到 Codex 命令行工具。")
++        } else {
++            None
++        }
++    }
++
++    pub(super) fn effective_tier(&self) -> Tier {
++        match self.preferred_mode {
++            Some(Tier::Push) if self.push_problem().is_some() => self.hook_mode(),
++            Some(Tier::Turn) => self.hook_mode(),
++            Some(mode) => mode,
++            None => self.reg.tier,
++        }
++    }
++}
++
+ impl Daemon {
++    pub(super) async fn set_receive_mode(&self, key: &str, network: &str, mode: Tier) -> Result<Tier> {
++        // Probe outside the daemon lock and never inject a test message into a real thread.
++        if mode == Tier::Push {
++            let cmd = agent::command_for("codex").ok_or_else(|| anyhow!("后台找不到 Codex 命令行工具。"))?;
++            let mut cmd = tokio::process::Command::from(cmd);
++            let output = tokio::time::timeout(std::time::Duration::from_secs(3),
++                cmd.args(["queue", "--help"]).stdin(std::process::Stdio::null()).kill_on_drop(true).output())
++                .await.map_err(|_| anyhow!("检查 Codex 推送通道超时。"))?
++                .map_err(|e| anyhow!("无法启动 Codex 检查推送通道：{e}"))?;
++            let help = String::from_utf8_lossy(&output.stdout);
++            if !output.status.success() || !help.contains("--thread") || !help.contains("--message") {
++                bail!("当前 Codex 命令行版本不支持按线程排队投递，请更新 Codex。");
++            }
++        }
++        let mut g = self.inner.lock().unwrap();
++        self.prune(&mut g);
++        if g.team.as_ref().map(|t| t.id.as_str()) != Some(network) { bail!("当前 Network 已变化，请刷新。"); }
++        let live = g.live.get(key).ok_or_else(|| anyhow!("本机会话已离线，请重新接入。"))?;
++        if live.reg.agent != "codex" || mode == Tier::None { bail!("该会话不支持此接收模式。"); }
++        if mode == Tier::Push && let Some(reason) = live.push_problem() { bail!("{reason}"); }
++        if mode == Tier::Turn && live.last_hook.is_none() { bail!("该会话尚未建立回合接收通道，请在 Codex 中运行一个回合后重试。"); }
++        g.store.set(&format!("receive-mode:{key}"), mode.as_str())?;
++        let live = g.live.get_mut(key).expect("validated under lock");
++        live.preferred_mode = Some(mode);
++        let effective = live.effective_tier();
++        drop(g);
++        self.presence_changed();
++        Ok(effective)
++    }
++
+     pub(super) fn set_session_participation(&self, key: &str, paused: bool) -> Result<()> {
+         let mut g = self.inner.lock().unwrap();
+         if paused && !g.live.contains_key(key) && g.store.session_by_key(key)?.is_none() {
+@@ -158,9 +215,12 @@
+                 crate::usage::Dimensions { source: crate::usage::family(&reg.agent), ..Default::default() },
+                 1,
+             );
++            let preferred_mode = g.store.get(&format!("receive-mode:{key}"))?
++                .map(|value| Tier::parse(&value)).filter(|mode| *mode != Tier::None);
+             g.live.insert(
+                 key.clone(),
+                 Live {
++                    preferred_mode,
+                     through_reason: Some(conn.is_none() && reg.agent == "reason"),
+                     reg,
+                     name,
+@@ -466,6 +526,7 @@
+         }
+         let address = self.addr(&l.name);
+         let agent_kind = l.reg.agent.clone();
++        let hook_mail = mail && l.preferred_mode != Some(Tier::Pull);
+         let native_app = agent == "antigravity"
+             && l.transcript.as_ref().is_some_and(|p| crate::antigravity::app_transcript(&p.to_string_lossy()));
+         if native_app {
+@@ -476,7 +537,7 @@
+             g.store.remember_native_app(&key, Some(now), &native_dirs)?;
+         }
+         // Mid-turn, only what should interrupt; at a pause, everything.
+-        let msgs: Vec<Message> = if mail {
++        let msgs: Vec<Message> = if hook_mail {
+             g.pending(&address)?.into_iter().filter(|m| event != "tool" || m.wake).collect()
+         } else {
+             Vec::new()
+@@ -627,7 +688,7 @@
+         repo: l.git.repo.clone(),
+         branch: l.git.branch.clone(),
+         doing: l.doing.clone(),
+-        tier: l.reg.tier,
++        tier: l.effective_tier(),
+         last_seen: now,
+         attached: l.attached,
+         mailbox: l.mailbox,
+--- a/src/daemon/mail.rs
++++ b/src/daemon/mail.rs
+@@ -491,10 +491,12 @@
+         }
+         let has = |bin: &str| !l.push_failed && agent::find_bin(bin).is_some();
+         // A Codex turn is running (and `codex queue` is there for when it ends).
+-        let codex_turn = l.reg.agent == "codex"
++        let tier = l.effective_tier();
++        let codex_turn = tier == Tier::Push && l.reg.agent == "codex"
+             && has("codex")
+             && l.transcript.as_deref().and_then(codex::turn_running) == Some(true);
+-        let channel = match (l.reg.tier, l.conn, &l.reg.agent_session_id) {
++        let channel = match (tier, l.conn, &l.reg.agent_session_id) {
++            (Tier::Pull, _, _) if l.preferred_mode.is_some() => Channel::Pull,
+             // These adapters take Deliver events on this connection. Codex and Reason still
+             // use their native channels below, even when their MCP client registers as push.
+             (Tier::Push, Some(conn), _)
+@@ -591,6 +593,10 @@
+                     g.codex_watch.remove(&key);
+                     return;
+                 };
++                if l.effective_tier() != Tier::Push {
++                    g.codex_watch.remove(&key);
++                    return;
++                }
+                 let (address, transcript) = (this.addr(&l.name), l.transcript.clone());
+                 if !g.store.unread_wakes(&address).unwrap_or_default() {
+                     g.codex_watch.remove(&key);
+--- a/src/daemon/directory.rs
++++ b/src/daemon/directory.rs
+@@ -141,7 +141,7 @@
+                 }
+             }
+             row.doing = l.doing.clone().or_else(|| doings.get(&l.reg.key).cloned());
+-            row.tier = l.reg.tier;
++            row.tier = l.effective_tier();
+             row.unread = g.store.unread_count(&row.address)?;
+             row.is_me = me == Some(l.reg.key.as_str());
+             rows.push(row);
+--- a/src/daemon/diagnostics.rs
++++ b/src/daemon/diagnostics.rs
+@@ -12,7 +12,7 @@
+         for l in g.live.values().take(64) {
+             let (unread, oldest) = g.store.queue_health(&self.addr(&l.name))?;
+             sessions.push(json!({
+-                "agent": crate::usage::family(&l.reg.agent), "tier": l.reg.tier,
++                "agent": crate::usage::family(&l.reg.agent), "tier": l.effective_tier(),
+                 "status": l.status.as_ref().map_or("live", |(s, _)| s.as_str()),
+                 "hookAgeMs": l.last_hook.map(|at| now.saturating_sub(at).max(0)),
+                 "sessionLinked": l.reg.agent_session_id.as_ref().is_some_and(|id| l.reg.key == format!("{}:{id}", l.reg.agent)),
