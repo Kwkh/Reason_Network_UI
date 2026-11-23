@@ -45,16 +45,23 @@ struct ContentView: View {
                 Text(model.peer?.title ?? "Reason Network")
                     .font(.system(size: 20, weight: .semibold)).lineLimit(1)
                 if let peer = model.peer {
-                    Text(peer.id)
-                        .font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1)
+                    HStack(spacing: 8) {
+                        Text(peer.id).font(.system(size: 12, design: .monospaced))
+                        Text(peer.statusText)
+                            .font(.system(size: 12))
+                            .accessibilityLabel("会话状态 \(peer.statusText)")
+                            .layoutPriority(1)
+                    }
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             Spacer(minLength: 0)
             Button { showStatus.toggle() } label: {
                 HStack(spacing: 7) {
-                    Circle().fill(model.online ? Color.primary : Color.gray).frame(width: 6, height: 6)
-                    Text(model.online ? "在线" : model.directory == nil && model.error == nil ? "连接中" : "离线")
+                    Circle().fill(model.localServiceConnected ? Color.primary : Color.gray).frame(width: 6, height: 6)
+                    Text("本机\(model.localServiceStatusText)")
                         .font(.system(size: 12, weight: .medium))
                     if model.consoleUnread > 0 {
                         Text("\(model.consoleUnread)").font(.system(size: 11, weight: .semibold)).monospacedDigit()
@@ -65,7 +72,7 @@ struct ContentView: View {
                 .background(Capsule().stroke(Color.primary.opacity(0.16), lineWidth: 1))
                 .contentShape(Capsule())
             }
-            .buttonStyle(.plain).help("设备状态与本机会话")
+            .buttonStyle(.plain).help("本机连接、设备和发送身份")
             .popover(isPresented: $showStatus, arrowEdge: .bottom) { StatusView() }
         }
         .padding(.horizontal, 30).padding(.top, 14).padding(.bottom, 23)

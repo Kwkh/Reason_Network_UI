@@ -323,7 +323,7 @@ private struct NetworkSettings: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 settingsSection("网络连接") {
-                    setting("本机服务", model.online ? "已连接" : "未连接")
+                    setting("本机服务", model.localServiceStatusText)
                     setting("当前账号", model.directory?.person ?? "未登录")
                     setting("中继", model.team?.relay_connected.map { $0 ? "已连接" : "未连接" } ?? "状态未知")
                     if let udp = model.team?.udp {

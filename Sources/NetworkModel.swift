@@ -106,7 +106,11 @@ final class NetworkModel: ObservableObject {
         (selectedLocal != LocalSession.console.name || consoleAddress != nil) &&
         !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
-    var online: Bool { directory != nil && error == nil }
+    var localServiceConnected: Bool { directory != nil && error == nil }
+    var localServiceStatusText: String {
+        if error != nil { return "连接异常" }
+        return localServiceConnected ? "已连接" : "连接中"
+    }
     var tier: String? {
         if selectedLocal == LocalSession.console.name { return "console" }
         return directory?.sessions.first { $0.person == directory?.person && $0.name == selectedLocal && $0.machine == directory?.machine }?.tier
