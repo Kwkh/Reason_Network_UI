@@ -14,6 +14,12 @@ struct NetworkSession: Decodable, Identifiable, Equatable {
     var offline: Bool = false
     var id: String { address }
     var title: String { doing?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? name }
+    static func agentDisplayName(_ agent: String?) -> String {
+        let names = ["codex": "Codex", "claude-code": "Claude Code", "cursor": "Cursor",
+                     "gemini": "Gemini CLI", "cli": "终端与控制台", "reason": "Reason",
+                     "dsh": "DeepSeek Harness", "deepseek": "DeepSeek Harness", "copilot": "Copilot CLI"]
+        return agent.map { names[$0] ?? $0 } ?? "其他会话"
+    }
     enum CodingKeys: String, CodingKey { case address, name, person, machine, agent, repo, branch, doing, tier, status }
 }
 struct Device: Decodable, Identifiable, Equatable {

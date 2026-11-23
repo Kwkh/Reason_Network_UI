@@ -1,11 +1,20 @@
 // !$*UTF8*$!
 { archiveVersion = 1; classes = {}; objectVersion = 56; objects = {
+AA5500000000000000000020 = { isa = PBXFileReference; lastKnownFileType = folder; path = ReasonNetworkLicenses; sourceTree = "<group>"; };
+AA5500000000000000000021 = { isa = PBXBuildFile; fileRef = AA5500000000000000000020; };
+AA5500000000000000000011 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParticipationInstaller.swift; sourceTree = "<group>"; };
+AA5500000000000000000012 = { isa = PBXBuildFile; fileRef = AA5500000000000000000011; };
+AA5500000000000000000013 = { isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.executable"; path = "Engine/Bin/reason-network-backend"; sourceTree = SOURCE_ROOT; };
+AA5500000000000000000014 = { isa = PBXBuildFile; fileRef = AA5500000000000000000013; settings = { ATTRIBUTES = (CodeSignOnCopy,); }; };
+AA5500000000000000000015 = { isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = ""; dstSubfolderSpec = 6; files = (AA5500000000000000000014,); name = "Embed Reason backend"; runOnlyForDeploymentPostprocessing = 0; };
 019B01000000000000000002 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SetupView.swift"; sourceTree = "<group>"; };
 019B02000000000000000002 = { isa = PBXBuildFile; fileRef = 019B01000000000000000002; };
 019B01000000000000000001 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SetupModel.swift"; sourceTree = "<group>"; };
 019B02000000000000000001 = { isa = PBXBuildFile; fileRef = 019B01000000000000000001; };
 019B01000000000000000000 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SetupService.swift"; sourceTree = "<group>"; };
 019B02000000000000000000 = { isa = PBXBuildFile; fileRef = 019B01000000000000000000; };
+1B403C8EF0C94A7A9BD1AC19 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PersonalSessions.swift; sourceTree = "<group>"; };
+2C9BBD18CAAE4A779A6D34A3 = { isa = PBXBuildFile; fileRef = 1B403C8EF0C94A7A9BD1AC19; };
 B7DE17A84141995A5B954A3E = { isa = PBXFileReference; lastKnownFileType = folder.icon; path = AppIcon.icon; sourceTree = "<group>"; };
 5A8FF8D5269D50BF4CEA16EB = { isa = PBXBuildFile; fileRef = B7DE17A84141995A5B954A3E; };
 3685E330EC5277A9DD5661C6 = { isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -27,12 +36,12 @@ E61F3B813ABBBA028600C4D2 = { isa = PBXBuildFile; fileRef = 998F5FEC26C75CFE5D677
 F8995BA5891B07E328C60D6B = { isa = PBXFileReference; lastKnownFileType = image.icns; path = AppIcon.icns; sourceTree = "<group>"; };
 74C2431FE30C4A47C8443B80 = { isa = PBXBuildFile; fileRef = F8995BA5891B07E328C60D6B; };
 38A007151ABE87CC01A5B6E9 = { isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Reason Network.app"; sourceTree = BUILT_PRODUCTS_DIR; };
-BCE16DD0260827ECF338C787 = { isa = PBXGroup; children = (019B01000000000000000001,019B01000000000000000002,019B01000000000000000000,D3CC244FE3B63DFF710117B7,1B0C8FAFE1B09544C5912233,ED4D2F0A9C386F22271DAA9D,4DF35952E95FEDC34BDC8BAC,998F5FEC26C75CFE5D677351,3A4D42AD28E380E19183E171,7A4CE6E389CC10EA67D01AC7,); path = Sources; sourceTree = "<group>"; };
-0189424A5A60FED329FA868E = { isa = PBXGroup; children = (B7DE17A84141995A5B954A3E,F8995BA5891B07E328C60D6B,3685E330EC5277A9DD5661C6,); path = Resources; sourceTree = "<group>"; };
+BCE16DD0260827ECF338C787 = { isa = PBXGroup; children = (AA5500000000000000000011,1B403C8EF0C94A7A9BD1AC19,019B01000000000000000001,019B01000000000000000002,019B01000000000000000000,D3CC244FE3B63DFF710117B7,1B0C8FAFE1B09544C5912233,ED4D2F0A9C386F22271DAA9D,4DF35952E95FEDC34BDC8BAC,998F5FEC26C75CFE5D677351,3A4D42AD28E380E19183E171,7A4CE6E389CC10EA67D01AC7,); path = Sources; sourceTree = "<group>"; };
+0189424A5A60FED329FA868E = { isa = PBXGroup; children = (AA5500000000000000000020,B7DE17A84141995A5B954A3E,F8995BA5891B07E328C60D6B,3685E330EC5277A9DD5661C6,); path = Resources; sourceTree = "<group>"; };
 FBDC4F23F93125BBEEAE800C = { isa = PBXGroup; children = (38A007151ABE87CC01A5B6E9,); name = Products; sourceTree = "<group>"; };
-DC76E9F0C0006E8F919E0C51 = { isa = PBXGroup; children = (BCE16DD0260827ECF338C787,0189424A5A60FED329FA868E,FBDC4F23F93125BBEEAE800C,); sourceTree = "<group>"; };
-D3C3E067FC1BBCCEAA4D9313 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (019B02000000000000000002,019B02000000000000000001,019B02000000000000000000,2A8F5CFFD87674FB2B9862C3,C28E3B592A560C32484F497E,304884C9684A23D1E6BAA76E,8FDF6F622957FA0D3D8FF421,E61F3B813ABBBA028600C4D2,20AC74E57108A895E9331ADF,67774CBA3525020546D859F1,); runOnlyForDeploymentPostprocessing = 0; };
-ECE2D868E17AEF81A05610A3 = { isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (5A8FF8D5269D50BF4CEA16EB,); runOnlyForDeploymentPostprocessing = 0; };
+DC76E9F0C0006E8F919E0C51 = { isa = PBXGroup; children = (AA5500000000000000000013,BCE16DD0260827ECF338C787,0189424A5A60FED329FA868E,FBDC4F23F93125BBEEAE800C,); sourceTree = "<group>"; };
+D3C3E067FC1BBCCEAA4D9313 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (AA5500000000000000000012,2C9BBD18CAAE4A779A6D34A3,019B02000000000000000002,019B02000000000000000001,019B02000000000000000000,2A8F5CFFD87674FB2B9862C3,C28E3B592A560C32484F497E,304884C9684A23D1E6BAA76E,8FDF6F622957FA0D3D8FF421,E61F3B813ABBBA028600C4D2,20AC74E57108A895E9331ADF,67774CBA3525020546D859F1,); runOnlyForDeploymentPostprocessing = 0; };
+ECE2D868E17AEF81A05610A3 = { isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (AA5500000000000000000021,5A8FF8D5269D50BF4CEA16EB,); runOnlyForDeploymentPostprocessing = 0; };
 BEE832DE65DB5CA7507F7EF9 = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 89E1FD6268CC0F221A2BE178 = { isa = XCBuildConfiguration; name = Debug; buildSettings = { MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; CLANG_ENABLE_MODULES = YES; SWIFT_VERSION = 5.0; SWIFT_STRICT_CONCURRENCY = minimal; }; };
 7082CC0B6FC1282FCEABD07A = { isa = XCBuildConfiguration; name = Debug; buildSettings = {
@@ -40,7 +49,7 @@ BEE832DE65DB5CA7507F7EF9 = { isa = PBXFrameworksBuildPhase; buildActionMask = 21
  GENERATE_INFOPLIST_FILE = YES; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
  INFOPLIST_KEY_CFBundleDisplayName = "Reason Network"; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
  INFOPLIST_KEY_NSHumanReadableCopyright = "Reason Network local companion";
- CURRENT_PROJECT_VERSION = 9; MARKETING_VERSION = 1.1.0;
+ CURRENT_PROJECT_VERSION = 10; MARKETING_VERSION = 1.1.1;
  CODE_SIGN_STYLE = Manual; CODE_SIGN_IDENTITY = "-"; ENABLE_APP_SANDBOX = NO;
  ENABLE_HARDENED_RUNTIME = YES; OTHER_LDFLAGS = "$(inherited) -lsqlite3";
  SWIFT_OPTIMIZATION_LEVEL = "-Onone";
@@ -53,7 +62,7 @@ E6DE6C99132752C914FEF632 = { isa = XCBuildConfiguration; name = Release; buildSe
  GENERATE_INFOPLIST_FILE = YES; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
  INFOPLIST_KEY_CFBundleDisplayName = "Reason Network"; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
  INFOPLIST_KEY_NSHumanReadableCopyright = "Reason Network local companion";
- CURRENT_PROJECT_VERSION = 9; MARKETING_VERSION = 1.1.0;
+ CURRENT_PROJECT_VERSION = 10; MARKETING_VERSION = 1.1.1;
  CODE_SIGN_STYLE = Manual; CODE_SIGN_IDENTITY = "-"; ENABLE_APP_SANDBOX = NO;
  ENABLE_HARDENED_RUNTIME = YES; OTHER_LDFLAGS = "$(inherited) -lsqlite3";
  SWIFT_OPTIMIZATION_LEVEL = "-O";
@@ -62,6 +71,6 @@ E6DE6C99132752C914FEF632 = { isa = XCBuildConfiguration; name = Release; buildSe
  }; };
 862894B703A6DEDF96A9DD6C = { isa = XCConfigurationList; buildConfigurations = (89E1FD6268CC0F221A2BE178,E6DE6C99132752C914FEF632,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 C57128001CE614BF8549D6BB = { isa = XCConfigurationList; buildConfigurations = (7082CC0B6FC1282FCEABD07A,639A7CA24D39909E713B47F7,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
-0E8A3AD980EC179856012B7E = { isa = PBXNativeTarget; buildConfigurationList = C57128001CE614BF8549D6BB; buildPhases = (D3C3E067FC1BBCCEAA4D9313,BEE832DE65DB5CA7507F7EF9,ECE2D868E17AEF81A05610A3,); buildRules = (); dependencies = (); name = "Reason Network"; productName = "Reason Network"; productReference = 38A007151ABE87CC01A5B6E9; productType = "com.apple.product-type.application"; };
+0E8A3AD980EC179856012B7E = { isa = PBXNativeTarget; buildConfigurationList = C57128001CE614BF8549D6BB; buildPhases = (D3C3E067FC1BBCCEAA4D9313,BEE832DE65DB5CA7507F7EF9,ECE2D868E17AEF81A05610A3,AA5500000000000000000015,); buildRules = (); dependencies = (); name = "Reason Network"; productName = "Reason Network"; productReference = 38A007151ABE87CC01A5B6E9; productType = "com.apple.product-type.application"; };
 98F54143AB4E86B28C3AFEE0 = { isa = PBXProject; attributes = { LastUpgradeCheck = 2650; }; buildConfigurationList = 862894B703A6DEDF96A9DD6C; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en,Base,); mainGroup = DC76E9F0C0006E8F919E0C51; productRefGroup = FBDC4F23F93125BBEEAE800C; projectDirPath = ""; projectRoot = ""; targets = (0E8A3AD980EC179856012B7E,); };
 }; rootObject = 98F54143AB4E86B28C3AFEE0; }

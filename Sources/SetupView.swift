@@ -113,8 +113,8 @@ struct SetupView: View {
     }
     private var dependencies: some View {
         VStack(alignment: .leading, spacing: 18) {
-            checkRow("官方后台", complete: model.snapshot.installed)
-            checkRow("后台服务", complete: model.snapshot.background)
+            checkRow("Reason 命令行工具", complete: model.snapshot.installed)
+            checkRow("逐会话管理后台", complete: model.snapshot.background && model.snapshot.participation)
             checkRow("Codex 接入", complete: model.snapshot.wired)
             if !model.snapshot.codex {
                 Text("请先安装并打开 Codex，再回来继续配置。")
@@ -126,7 +126,7 @@ struct SetupView: View {
             } else {
                 action("安装并配置") { await model.install() }
             }
-            Text("下载官方后台并添加代理接入配置，无需管理员密码。")
+            Text("安装 App 内置的兼容后台，并为已安装的代理配置接入。")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
         }
     }

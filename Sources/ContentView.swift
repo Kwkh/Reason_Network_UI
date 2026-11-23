@@ -50,7 +50,10 @@ struct ContentView: View {
                 } else {
                     titleItem
                 }
-                ToolbarItem(placement: .primaryAction) { statusButton }
+                let statusItem = ToolbarItem(placement: .primaryAction) { statusButton }
+                if #available(macOS 26, *) {
+                    statusItem.sharedBackgroundVisibility(.hidden)
+                } else { statusItem }
             }
             // A window-wide toolbar fill covers the top of the native floating sidebar.
             .toolbarBackground(.hidden, for: .windowToolbar)
@@ -424,11 +427,60 @@ private struct SidebarSizing: NSViewRepresentable {
     func updateNSView(_ view: Marker, context: Context) {}
 }
 
+private struct GroupHeading: View {
+    let title: String
+    let icon: String
+    let expanded: Bool
+    let toggle: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        Button(action: toggle) {
+            HStack(spacing: 7) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .rotationEffect(.degrees(expanded ? 90 : 0))
+                    .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: expanded)
+                    .frame(width: 11)
+                Image(systemName: icon).foregroundStyle(.secondary)
+                Text(title).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 5).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .accessibilityValue(expanded ? "已展开" : "已收起")
+    }
+}
+
 private struct ConversationSidebar: View {
     @EnvironmentObject private var model: NetworkModel
 
+    @State private var query = ""
+    @State private var showPersonal = false
+    @State private var collapsed: Set<[String]> = []
+    @FocusState private var searchFocused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private var terms: [Substring] { query.split(whereSeparator: \.isWhitespace) }
+
+    private func expansion(_ key: [String]) -> Binding<Bool> {
+        Binding(get: { !terms.isEmpty || !collapsed.contains(key) }, set: { expanded in
+            guard terms.isEmpty else { return }
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.18)) {
+                if expanded { collapsed.remove(key) } else { collapsed.insert(key) }
+            }
+        })
+    }
+
     var body: some View {
-        let groups = Dictionary(grouping: model.peers, by: \.person)
+        let tokens = terms
+        let sessions = model.peers.filter { session in
+            let haystack = [session.person, NetworkSession.agentDisplayName(session.agent), session.title,
+                            session.address, session.repo ?? "", session.machine ?? ""].joined(separator: " ")
+            return tokens.allSatisfy { haystack.localizedCaseInsensitiveContains(String($0)) }
+        }
+        let groups = Dictionary(grouping: sessions, by: \.person)
         VStack(alignment: .leading, spacing: 0) {
             if !model.locals.isEmpty {
                 Menu {
@@ -454,44 +506,83 @@ private struct ConversationSidebar: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
             }
-            List(selection: Binding<String?>(
-                get: { model.selectedPeer.nonEmpty },
-                set: { if let address = $0 { model.selectedPeer = address } }
-            )) {
-                ForEach(groups.keys.sorted(), id: \.self) { person in
-                    Section {
-                        ForEach(groups[person] ?? []) { session in
-                            HStack {
-                                Text(session.title).lineLimit(1)
-                                Spacer(minLength: 4)
-                                if session.offline {
-                                    Text("离线").font(.caption).foregroundStyle(.secondary)
-                                }
-                            }
-                            .font(.system(size: 13))
-                            .foregroundStyle(.primary)
-                            .padding(.leading, 28)
-                            .tag(session.address)
-                            .help(session.address)
-                        }
-                    } header: {
-                        Label(person, systemImage: "person")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(.primary)
-                            .textCase(nil)
-                            .padding(.top, 8)
-                            .padding(.bottom, 4)
+            VStack(spacing: 6) {
+                HStack(spacing: 7) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("搜索会话", text: $query).textFieldStyle(.plain)
+                        .focused($searchFocused)
+                    if !query.isEmpty {
+                        Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
+                            .buttonStyle(.plain).foregroundStyle(.secondary).accessibilityLabel("清除搜索")
                     }
                 }
+                .padding(.horizontal, 9).frame(height: 28)
+                .background(.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 7))
+                Button { showPersonal = true } label: {
+                    Label("我的会话", systemImage: "person.crop.rectangle.stack")
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 6).contentShape(Rectangle())
+                }.buttonStyle(.plain).keyboardShortcut("5")
             }
-            .listStyle(.sidebar)
+            .padding(.horizontal, 14).padding(.bottom, 6)
+            .background {
+                Button("搜索会话") { searchFocused = true }.keyboardShortcut("k").hidden()
+            }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    ForEach(groups.keys.sorted(), id: \.self) { person in
+                        let people = expansion([person])
+                        GroupHeading(title: person, icon: "person", expanded: people.wrappedValue) {
+                            people.wrappedValue.toggle()
+                        }
+                        if people.wrappedValue {
+                            let agents = Dictionary(grouping: groups[person] ?? []) { NetworkSession.agentDisplayName($0.agent) }
+                            ForEach(agents.keys.sorted(), id: \.self) { agent in
+                                let branch = expansion([person, agent])
+                                GroupHeading(title: agent, icon: "terminal", expanded: branch.wrappedValue) {
+                                    branch.wrappedValue.toggle()
+                                }.padding(.leading, 13)
+                                if branch.wrappedValue {
+                                    ForEach(agents[agent] ?? []) { session in
+                                        peerButton(session)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding(.leading, 16)
+                .padding(.trailing, 10)
+            }
             .accessibilityLabel("队友会话")
             .overlay(alignment: .top) {
                 if groups.isEmpty && model.directory != nil {
-                    Text("暂无队友会话").font(.callout).foregroundStyle(.secondary).padding(.top)
+                    Text(terms.isEmpty ? "暂无队友会话" : "没有匹配的会话")
+                        .font(.callout).foregroundStyle(.secondary).padding(.top)
                 }
             }
         }
+        .sheet(isPresented: $showPersonal) {
+            PersonalSessionsView().frame(minWidth: 540, idealWidth: 620, minHeight: 420, idealHeight: 520)
+        }
+    }
+    private func peerButton(_ session: NetworkSession) -> some View {
+        let selected = model.selectedPeer == session.address
+        return Button { model.selectedPeer = session.address } label: {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(session.title).lineLimit(1)
+                    if session.title != session.name {
+                        Text(session.name).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                }
+                Spacer(minLength: 3)
+                if session.offline { Text("离线").font(.caption2).foregroundStyle(.secondary) }
+            }
+            .padding(.leading, 36).padding(.trailing, 5).padding(.vertical, 5)
+            .background(.primary.opacity(selected ? 0.10 : 0), in: RoundedRectangle(cornerRadius: 7))
+            .contentShape(Rectangle())
+        }.buttonStyle(.plain).help(session.address)
+            .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 
@@ -936,7 +1027,11 @@ private struct NativeTranscript: NSViewRepresentable {
 struct StatusView: View {
     @EnvironmentObject private var setup: SetupModel
     @EnvironmentObject private var model: NetworkModel
+    @State private var exitSupported = false
+    @State private var exitStatus: String?
     @State private var diagnostics = false
+    @State private var copyingInvite = false
+    @State private var inviteFeedback: String?
     @State private var refreshing = false
     @State private var refreshResult: String?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -1009,8 +1104,41 @@ struct StatusView: View {
                 }
                 .font(.system(size: 12))
                 .foregroundStyle(.primary)
+                HStack {
+                    Button("复制邀请链接", systemImage: "link") {
+                        copyingInvite = true
+                        inviteFeedback = nil
+                        Task {
+                            defer { copyingInvite = false }
+                            do {
+                                let link = try await model.invitation()
+                                NSPasteboard.general.clearContents()
+                                inviteFeedback = NSPasteboard.general.setString(link, forType: .string) ? "已复制" : "复制失败"
+                            } catch { inviteFeedback = "获取失败，请检查连接" }
+                        }
+                    }.buttonStyle(.plain).disabled(copyingInvite)
+                    Spacer()
+                    Text(copyingInvite ? "获取中…" : inviteFeedback ?? "").foregroundStyle(.secondary)
+                        .accessibilityAddTraits(.updatesFrequently)
+                }.font(.system(size: 12))
                 Button("环境配置", systemImage: "slider.horizontal.3") { setup.presented = true }
                     .buttonStyle(.plain).font(.system(size: 12))
+                VStack(alignment: .leading, spacing: 4) {
+                    Button("退出当前会话", systemImage: "rectangle.portrait.and.arrow.right") {
+                        guard let local = model.own else { return }
+                        exitStatus = "正在退出 " + local.name + "…"
+                        Task {
+                            do { exitStatus = "已退出 " + (try await model.exitLocal(local)) }
+                            catch { exitStatus = error.localizedDescription }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!exitSupported || model.own == nil || model.changingSession != nil)
+                    if let exitStatus {
+                        Text(exitStatus).font(.caption).foregroundStyle(.secondary)
+                            .accessibilityAddTraits(.updatesFrequently)
+                    }
+                }.font(.system(size: 12))
                 DisclosureGroup("诊断", isExpanded: $diagnostics) {
                     VStack(alignment: .leading, spacing: 12) {
                         if model.diagnosing { ProgressView().controlSize(.small) }
@@ -1024,8 +1152,152 @@ struct StatusView: View {
             }
             .padding(22)
         }
-        .frame(width: 390, height: diagnostics ? 580 : min(520, 250 + CGFloat(model.directory?.machines.count ?? 0) * 65))
+        .frame(width: 390, height: diagnostics ? 600 : min(580, 350 + CGFloat(model.directory?.machines.count ?? 0) * 65))
         .background(Color(nsColor: .windowBackgroundColor))
+        .task {
+            do {
+                exitSupported = try await model.supportsSessionExit()
+                if !exitSupported { exitStatus = "当前后台不支持单独退出会话" }
+            } catch { exitStatus = "无法连接会话管理服务" }
+        }
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.22), value: diagnostics)
+    }
+}
+
+private struct PersonalSessionsView: View {
+    @EnvironmentObject private var model: NetworkModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var query = ""
+    @State private var selectedAgent = ""
+
+    @State private var collapsed: Set<[String]> = []
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private func heading(_ title: String, icon: String, key: [String]) -> some View {
+        GroupHeading(title: title, icon: icon, expanded: !collapsed.contains(key)) {
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.18)) {
+                if collapsed.contains(key) { collapsed.remove(key) } else { collapsed.insert(key) }
+            }
+        }
+    }
+
+    private var agents: [String] {
+        Set(model.mySessions.map(\.agentName)).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+    private var matches: [PersonalSession] {
+        model.mySessions.filter { (selectedAgent.isEmpty || $0.agentName == selectedAgent) && $0.matches(query) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("我的会话").font(.title2.weight(.semibold))
+                Spacer()
+                Button("完成") { dismiss() }.keyboardShortcut(.cancelAction)
+            }.padding(.horizontal, 22).padding(.top, 18)
+            HStack(spacing: 12) {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("搜索本机会话或项目", text: $query).textFieldStyle(.plain)
+                }
+                .padding(8).background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+                Menu {
+                    Picker("工具", selection: $selectedAgent) {
+                        Text("全部工具").tag("")
+                        ForEach(agents, id: \.self) { Text($0).tag($0) }
+                    }.pickerStyle(.inline).labelsHidden()
+                } label: {
+                    Text(selectedAgent.nonEmpty ?? "全部工具").lineLimit(1)
+                }.menuStyle(.borderlessButton).fixedSize().accessibilityLabel("选择工具")
+                Button { Task { await model.refreshMySessions() } } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .disabled(model.loadingMySessions).help("刷新本机会话").accessibilityLabel("刷新本机会话")
+            }
+            .padding(.horizontal, 22).padding(.top, 16)
+
+            if let status = model.mySessionsError ?? model.mySessionsNotice {
+                Text(status).font(.system(size: 12)).textSelection(.enabled).padding(.horizontal, 22)
+            }
+            if matches.isEmpty {
+                Group {
+                    if model.loadingMySessions { ProgressView().controlSize(.small) }
+                    else { Text(query.isEmpty ? "暂无本机会话" : "没有找到匹配的会话").font(.system(size: 12)).foregroundStyle(.secondary) }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 7) {
+                        let byAgent = Dictionary(grouping: matches, by: \.agentName)
+                        ForEach(byAgent.keys.sorted(), id: \.self) { agent in
+                            heading(agent, icon: "terminal", key: [agent])
+                            if !collapsed.contains([agent]) {
+                                let projects = Dictionary(grouping: byAgent[agent] ?? [], by: \.displayProject)
+                                let recent = projects.mapValues { $0.first?.updated ?? .distantPast }
+                                let ordered = projects.keys.sorted {
+                                    if agent == NetworkSession.agentDisplayName("codex"), recent[$0] != recent[$1] {
+                                        return (recent[$0] ?? .distantPast) > (recent[$1] ?? .distantPast)
+                                    }
+                                    return ($0.position, $0.name, $0.id) < ($1.position, $1.name, $1.id)
+                                }
+                                ForEach(ordered, id: \.id) { project in
+                                    heading(project.name, icon: "folder", key: [agent, project.id])
+                                        .padding(.leading, 15)
+                                    if !collapsed.contains([agent, project.id]) {
+                                        let sessions = (projects[project] ?? []).sorted {
+                                            if $0.pinned != $1.pinned { return $0.pinned }
+                                            return ($0.updated, $0.id) > ($1.updated, $1.id)
+                                        }
+                                        ForEach(sessions) { session in
+                                            sessionRow(session).padding(.leading, 42)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 22).padding(.bottom, 20)
+                }
+            }
+        }
+        .task { await model.refreshMySessions() }
+    }
+
+    private func sessionRow(_ session: PersonalSession) -> some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(session.title).font(.system(size: 13, weight: .medium)).lineLimit(1).help(session.title)
+            }
+            Spacer(minLength: 0)
+            Text(session.connection.label).font(.system(size: 11)).foregroundStyle(.secondary)
+            if model.changingSession == session.id {
+                ProgressView().controlSize(.small).frame(width: 56)
+            } else if session.canLeave {
+                Button("退出") { Task { await model.leaveMySession(session) } }
+                    .disabled(model.changingSession != nil)
+                    .help("停止该会话接入 Reason Network，直到你重新加入。")
+                    .accessibilityLabel("退出 \(session.title)")
+            } else if session.canJoin {
+                Button(joinTitle(session)) {
+                    Task { await model.joinMySession(session) }
+                }
+                .disabled(model.changingSession != nil)
+                .help("将这个会话加入当前 Reason Network")
+                .accessibilityLabel("加入 \(session.title)")
+            } else if session.connection == .notJoined {
+                Text("在原工具打开").font(.system(size: 11)).foregroundStyle(.secondary)
+            } else if case .online = session.connection {
+                Text("需要新版后台").font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 6)
+    }
+
+    private func joinTitle(_ session: PersonalSession) -> String {
+        switch session.connection {
+        case .notJoined: "加入"
+        case .paused where !session.supportsImmediateJoin: "允许接入"
+        default: "重新接入"
+        }
     }
 }

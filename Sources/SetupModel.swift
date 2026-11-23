@@ -14,7 +14,7 @@ final class SetupModel: ObservableObject {
     init(service: any SetupServicing = SetupService()) { self.service = service }
 
     var step: Int {
-        if !snapshot.installed || !snapshot.background || !snapshot.wired { return 0 }
+        if !snapshot.installed || !snapshot.background || !snapshot.participation || !snapshot.wired { return 0 }
         if !snapshot.joined { return 1 }
         return 2
     }
@@ -25,7 +25,7 @@ final class SetupModel: ObservableObject {
         checked = true; busy = false
     }
     func install() async {
-        await perform("正在安装官方后台…") {
+        await perform("正在安装内置后台…") {
             try await self.service.install()
             self.activity = "正在接入后台与 Codex…"
             try await self.service.configure()

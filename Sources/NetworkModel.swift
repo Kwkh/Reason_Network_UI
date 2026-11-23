@@ -20,6 +20,11 @@ final class NetworkModel: ObservableObject {
     @Published var doctor = ""
     @Published var diagnosing = false
     private let service: ReasonService
+    @Published private(set) var mySessions: [PersonalSession] = []
+    @Published private(set) var loadingMySessions = false
+    @Published private(set) var changingSession: String?
+    @Published private(set) var mySessionsNotice: String?
+    @Published private(set) var mySessionsError: String?
     private var running = false
     private var requestAgain = false
     private var messageCache: [String: [Message]] = [:]
@@ -120,6 +125,62 @@ final class NetworkModel: ObservableObject {
         }
         sending = false
     }
+    func refreshMySessions() async {
+        guard !loadingMySessions else { return }
+        loadingMySessions = true
+        defer { loadingMySessions = false }
+        do {
+            mySessions = try await service.personalSessions()
+            mySessionsError = nil
+        } catch {
+            mySessionsError = error.localizedDescription
+        }
+    }
+    func joinMySession(_ session: PersonalSession) async {
+        guard session.canJoin else { return }
+        await changeMySession(session, joining: true)
+    }
+    func leaveMySession(_ session: PersonalSession) async {
+        guard session.canLeave else { return }
+        await changeMySession(session, joining: false)
+    }
+    private func changeMySession(_ session: PersonalSession, joining: Bool) async {
+        guard changingSession == nil else { return }
+        changingSession = session.id
+        mySessionsNotice = nil
+        mySessionsError = nil
+        defer { changingSession = nil }
+        do {
+            if joining {
+                let address = try await service.joinPersonalSession(session.id)
+                if case .paused = session.connection, !session.supportsImmediateJoin {
+                    mySessionsNotice = "已允许 \(address) 重新接入"
+                } else {
+                    mySessionsNotice = "已加入 \(address)"
+                }
+            } else {
+                let address = try await service.leavePersonalSession(session.id)
+                mySessionsNotice = "\(address) 已退出 Reason Network"
+            }
+            await refreshMySessions()
+            await refresh()
+        } catch {
+            mySessionsError = error.localizedDescription
+        }
+    }
+    func supportsSessionExit() async throws -> Bool { try await service.supportsSessionExit() }
+
+    func exitLocal(_ local: LocalSession) async throws -> String {
+        guard own?.key == local.key, changingSession == nil else { throw NetworkError("本机会话已变化，请重新选择。") }
+        changingSession = local.key
+        defer { changingSession = nil }
+        let address = try await service.leavePersonalSession(local.key)
+        await refresh()
+        if selectedLocal == local.name { selectedLocal = locals.first(where: { $0.key != local.key })?.name ?? "" }
+        return address
+    }
+
+    func invitation() async throws -> String { try await service.inviteLink() }
     func diagnose() async {
         guard !diagnosing else { return }; diagnosing = true
         defer { diagnosing = false }

@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 import Darwin
 
 /// The standalone installer and the official Reason CLI use different engine locations.
@@ -23,6 +22,7 @@ enum NetworkPaths {
 
 struct SetupSnapshot: Equatable {
     var installed = false
+    var participation = false
     var background = false
     var codex = false
     var wired = false
@@ -30,7 +30,7 @@ struct SetupSnapshot: Equatable {
     var sessions = 0
     var team: String?
     var issue: String?
-    var ready: Bool { installed && background && wired && joined }
+    var ready: Bool { installed && background && participation && wired && joined }
 }
 
 enum SetupInput {
@@ -69,39 +69,46 @@ struct SetupCommand {
     let output: String
     let status: Int32
     static func run(_ executable: URL, _ arguments: [String], home: URL, timeout: TimeInterval = 30) async throws -> SetupCommand {
-        try await Task.detached(priority: .userInitiated) {
-            let fm = FileManager.default
-            let folder = fm.temporaryDirectory.appendingPathComponent("reason-setup-" + UUID().uuidString)
-            try fm.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            defer { try? fm.removeItem(at: folder) }
-            let log = folder.appendingPathComponent("output")
-            fm.createFile(atPath: log.path, contents: Data(), attributes: [.posixPermissions: 0o600])
-            let handle = try FileHandle(forUpdating: log)
-            defer { try? handle.close() }
-            let process = Process()
-            process.executableURL = executable; process.arguments = arguments
-            process.environment = NetworkPaths.environment(home: home)
-            process.currentDirectoryURL = home
-            process.standardInput = FileHandle.nullDevice
-            process.standardOutput = handle; process.standardError = handle
-            try Task.checkCancellation()
-            try process.run()
-            let start = Date()
-            while process.isRunning {
-                if Task.isCancelled || Date().timeIntervalSince(start) > timeout {
-                    process.terminate()
-                    try? await Task.sleep(for: .milliseconds(100))
-                    if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-                    process.waitUntilExit()
-                    throw NetworkError("操作超时，请重新检查当前状态。加入请求可能已完成，请勿立即重复加入。")
-                }
-                try await Task.sleep(for: .milliseconds(25))
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(with: Result { try execute(executable, arguments, home: home, timeout: timeout) })
             }
-            process.waitUntilExit()
-            try handle.seek(toOffset: 0)
-            let output = String(decoding: try handle.readToEnd() ?? Data(), as: UTF8.self)
-            return SetupCommand(output: output, status: process.terminationStatus)
-        }.value
+        }
+    }
+
+    private static func execute(_ executable: URL, _ arguments: [String], home: URL, timeout: TimeInterval) throws -> SetupCommand {
+        let fm = FileManager.default
+        let folder = fm.temporaryDirectory.appendingPathComponent("reason-setup-" + UUID().uuidString)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        defer { try? fm.removeItem(at: folder) }
+        let log = folder.appendingPathComponent("output")
+        fm.createFile(atPath: log.path, contents: Data(), attributes: [.posixPermissions: 0o600])
+        let handle = try FileHandle(forUpdating: log)
+        defer { try? handle.close() }
+        let process = Process()
+        process.executableURL = executable; process.arguments = arguments
+        process.environment = NetworkPaths.environment(home: home)
+        process.currentDirectoryURL = home
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = handle; process.standardError = handle
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
+        try process.run()
+        let deadline = DispatchTime.now() + timeout
+        // Observe termination before launch so even a fast child cannot finish between checks.
+        while finished.wait(timeout: .now() + .milliseconds(100)) == .timedOut {
+            if DispatchTime.now() >= deadline {
+                if process.isRunning { process.terminate() }
+                if finished.wait(timeout: .now() + .milliseconds(250)) == .timedOut, process.isRunning {
+                    kill(process.processIdentifier, SIGKILL)
+                    _ = finished.wait(timeout: .now() + .seconds(2))
+                }
+                throw NetworkError("操作超时，请重新检查当前状态。加入请求可能已完成，请勿立即重复加入。")
+            }
+        }
+        try handle.seek(toOffset: 0)
+        let output = String(decoding: try handle.readToEnd() ?? Data(), as: UTF8.self)
+        return SetupCommand(output: output, status: process.terminationStatus)
     }
     func checked() throws -> String {
         guard status == 0 else { throw NetworkError(SetupInput.redacted(output).nonEmpty ?? "操作未完成，请重试。") }
@@ -119,7 +126,11 @@ protocol SetupServicing: Sendable {
 actor SetupService: SetupServicing {
     static let engineVersion = "0.12.17"
     private let home: URL
-    init(home: URL = FileManager.default.homeDirectoryForCurrentUser) { self.home = home }
+    private let installer: ParticipationInstaller
+    init(home: URL = FileManager.default.homeDirectoryForCurrentUser, installer: ParticipationInstaller? = nil) {
+        self.home = home
+        self.installer = installer ?? ParticipationInstaller(home: home)
+    }
 
     func inspect() async -> SetupSnapshot {
         let fm = FileManager.default
@@ -139,63 +150,38 @@ actor SetupService: SetupServicing {
             result.team = directory.team
             result.sessions = directory.sessions.filter { $0.person == directory.person && $0.agent == "codex" && $0.tier != "none" }.count
         } catch { result.issue = SetupInput.redacted(error.localizedDescription) }
+        result.participation = installer.configured && installer.probe(home)
         return result
     }
 
     func install() async throws {
         guard NetworkPaths.executable(home: home) == nil else { return }
-        #if arch(arm64)
-        let target = "aarch64-apple-darwin"
-        let expected = "6676e806abba74b313ee027b5b4020634077b0ef4c01c0a9eb4dd61ec77ea705"
-        #else
-        let target = "x86_64-apple-darwin"
-        let expected = "e71fbd5c7c080048c1220025e2aa716c3af6b18901f18e5beece1323cfcdd96f"
-        #endif
-        let url = URL(string: "https://github.com/reason-machines/reason-network/releases/download/v\(Self.engineVersion)/reason-network-\(target).tar.gz")!
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 45; configuration.timeoutIntervalForResource = 180
-        let session = URLSession(configuration: configuration)
-        defer { session.invalidateAndCancel() }
-        let (file, response) = try await session.download(from: url)
-        defer { try? FileManager.default.removeItem(at: file) }
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw NetworkError("官方后台下载失败，请检查网络后重试。") }
-        let data = try Data(contentsOf: file, options: .mappedIfSafe)
-        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        guard digest == expected else { throw NetworkError("下载校验失败，未安装任何文件。请稍后重试。") }
         let fm = FileManager.default
-        let folder = fm.temporaryDirectory.appendingPathComponent("reason-engine-" + UUID().uuidString)
-        try fm.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        defer { try? fm.removeItem(at: folder) }
-        // The archive has a pinned digest; still restrict extraction to the expected member.
-        _ = try await SetupCommand.run(URL(fileURLWithPath: "/usr/bin/tar"), ["-xzf", file.path, "-C", folder.path, "reason-network"], home: home).checked()
-        let candidate = folder.appendingPathComponent("reason-network")
-        let values = try candidate.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-        guard values.isRegularFile == true, values.isSymbolicLink != true else { throw NetworkError("官方后台文件格式异常。") }
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: candidate.path)
-        let version = try await SetupCommand.run(candidate, ["--version"], home: home).checked()
-        guard version.trimmingCharacters(in: .whitespacesAndNewlines) == "reason-network \(Self.engineVersion)" else {
-            throw NetworkError("官方后台版本校验失败。")
-        }
+        let candidate = installer.binary
+        try await installer.validate(cli: candidate)
         let bin = home.appendingPathComponent(".local/bin")
         try fm.createDirectory(at: bin, withIntermediateDirectories: true)
         let staging = bin.appendingPathComponent(".reason-network-" + UUID().uuidString)
         defer { try? fm.removeItem(at: staging) }
         try fm.copyItem(at: candidate, to: staging)
-        // Never overwrite an engine another installer put here while we were downloading.
+        // Never overwrite an engine another installer put here while we were staging the copy.
         guard NetworkPaths.executable(home: home) == nil else { return }
         try fm.moveItem(at: staging, to: bin.appendingPathComponent("reason-network"))
     }
 
     func configure() async throws {
-        guard let executable = NetworkPaths.executable(home: home) else { throw NetworkError("请先安装官方后台。") }
-        _ = try await SetupCommand.run(executable, ["setup"], home: home, timeout: 90).checked()
+        guard let executable = NetworkPaths.executable(home: home) else { throw NetworkError("请先安装内置后台。") }
+        try await installer.validate(cli: executable)
+        let arguments = installer.configured ? ["setup", "--no-service"] : ["setup"]
+        _ = try await SetupCommand.run(executable, arguments, home: home, timeout: 90).checked()
+        try await installer.activate()
         let result = await inspect()
-        guard result.background else { throw NetworkError("后台服务未安装成功，请展开详情或重试配置。") }
+        guard result.background && result.participation else { throw NetworkError("后台服务未安装成功，请展开详情或重试配置。") }
         if result.codex && !result.wired { throw NetworkError("Codex 接入未完成，请检查配置文件权限后重试。") }
     }
     func join(invitation: String, name: String) async throws {
         let ticket = try SetupInput.invitation(invitation), person = try SetupInput.name(name)
-        guard let executable = NetworkPaths.executable(home: home) else { throw NetworkError("请先安装官方后台。") }
+        guard let executable = NetworkPaths.executable(home: home) else { throw NetworkError("请先安装内置后台。") }
         let before = await inspect()
         guard before.issue == nil else { throw NetworkError("尚无法确认此机器的 Network 状态，请先重新检查。") }
         guard !before.joined else { throw NetworkError("此机器已经加入 Network。请返回聊天，无需重复加入。") }
