@@ -3,13 +3,20 @@ import SQLite3
 
 // The Reason database is always opened read-only. Only the UI's existing cache is writable.
 final class SQLiteStore {
+    struct OpenFailure: LocalizedError {
+        let url: URL
+        let code: Int32
+        var errorDescription: String? { "暂时无法打开数据库（" + url.lastPathComponent + "，SQLite " + String(code) + "）。" }
+    }
+    private let url: URL
     private var db: OpaquePointer?
     init(_ url: URL, readOnly: Bool) throws {
+        self.url = url
         let flags = readOnly ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
         guard sqlite3_open_v2(url.path, &db, flags | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else {
-            let error = db.map { String(cString: sqlite3_errmsg($0)) } ?? "数据库不可用"
+            let error = failure()
             if let db { sqlite3_close(db) }; db = nil
-            throw NetworkError(error)
+            throw error
         }
         sqlite3_busy_timeout(db, 3000)
     }
@@ -37,7 +44,12 @@ final class SQLiteStore {
             result.append(row)
         }
     }
-    private func failure() -> NetworkError { NetworkError(String(cString: sqlite3_errmsg(db))) }
+    private func failure() -> Error {
+        guard let db else { return NetworkError("数据库不可用") }
+        let code = sqlite3_extended_errcode(db)
+        if (code & 0xff) == SQLITE_CANTOPEN { return OpenFailure(url: url, code: code) }
+        return NetworkError(String(cString: sqlite3_errmsg(db)))
+    }
     func insert(_ event: Message, network: String? = nil) throws {
         let files = event.attachments.isEmpty ? "" : String(decoding: try JSONEncoder().encode(event.attachments), as: UTF8.self)
         let table = network == nil ? "events" : "network_events"

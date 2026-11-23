@@ -10,9 +10,11 @@ git apply --check "$engine_dir/session-participation.patch"
 git apply "$engine_dir/session-participation.patch"
 git apply "$engine_dir/receive-mode.patch"
 git apply "$engine_dir/codex-wake.patch"
+git apply "$engine_dir/connection-recovery.patch"
 export MACOSX_DEPLOYMENT_TARGET=14.0
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 cargo test --locked --release paused_session_rejects_hooks_and_mcp_until_explicitly_resumed
+cargo test --locked --release dropping_an_unpublished_connection_closes_its_peer
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
     cargo build --locked --release --target "$target"
 done

@@ -53,7 +53,7 @@ fi
             assert proc.poll() is None, "daemon exited early"
             try:
                 capabilities = call("session_participation")
-                assert capabilities["receive_modes"] and capabilities["codex_queue_resume"]
+                assert capabilities["receive_modes"] and capabilities["codex_queue_resume"] and capabilities["connection_recovery"]
                 return
             except OSError:
                 time.sleep(.08)
@@ -145,6 +145,14 @@ fi
         hook("alpha")
         hook("beta")
         assert tiers()["alpha"] == "pull" and tiers()["beta"] == before
+        call("set_session_participation", key="codex:alpha", paused=True)
+        def register(name):
+            return request("register", session=dict(key="codex:" + name, agent="codex", cwd=root, tier="pull"))
+        paused = register("alpha")
+        assert not paused["ok"] and paused["error"] == "Your user turned Reason Network off for this folder"
+        assert register("beta")["ok"]
+        assert "codex:alpha" in call("session_participation")["paused"]
+        print("PASS: paused registration compatible with stock MCP, sibling can register")
         print("PASS: effective mode, manual inbox, turn hook, native wake, FYI, failed resume without replay, diagnostic recovery, unavailable push preserves mode, sibling isolation, network guard, restart")
     finally:
         stop()

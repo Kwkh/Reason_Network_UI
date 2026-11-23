@@ -8,7 +8,7 @@ struct ParticipationInstaller: Sendable {
     var binary = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/reason-network-backend")
     var launchctl = URL(fileURLWithPath: "/bin/launchctl")
     var probe: @Sendable (URL) -> Bool = { home in
-        capabilities(at: home)?["codex_queue_resume"] as? Bool == true
+        capabilities(at: home)?["connection_recovery"] as? Bool == true
     }
 
     static func capabilities(at home: URL) -> [String: Any]? {
@@ -97,11 +97,16 @@ struct ParticipationInstaller: Sendable {
             try replacement.write(to: plist, options: .atomic)
             try await bootstrap()
             bootstrapped = true
+            let socket = SessionSocket(socketURL: home.appendingPathComponent(".reason/network/network.sock"))
+            var handedOff = false
             for _ in 0..<40 {
                 if probe(home) { return }
+                if !handedOff, let cli = NetworkPaths.executable(home: home) {
+                    handedOff = (try? socket.request(["op": "shutdown"], timeout: 1, onlyFrom: cli)) != nil
+                }
                 try await Task.sleep(for: .milliseconds(250))
             }
-            throw NetworkError("后台未确认 Codex 会话唤醒功能。")
+            throw NetworkError("后台未确认连接恢复功能。")
         } catch {
             let failure = error
             if bootstrapped { _ = try? await SetupCommand.run(launchctl, ["bootout", target], home: home) }

@@ -70,6 +70,12 @@ struct CoreChecks {
         model.options = original
         try expect(model.canSend, "registered local sender can send")
         try expect(model.senderPresence == .online, "sidebar and toolbar share the registered sender state")
+        let sibling = LocalSession(name: "other", key: "codex:other")
+        let history = LocalSession(name: "previous", key: "history:previous", historyOnly: true)
+        try expect(model.presence(for: sibling) == .offline && model.presence(for: history) == .history,
+                   "menu items have independent states while the selected sender is online")
+        try expect(model.peers.contains { $0.address == "me/sibling" && $0.statusText == "工作中" }
+                   && !model.peers.contains { $0.address == "me/local" }, "sidebar lists sibling Codex sessions and excludes sender")
         let connected = model.directory
         if let directory = connected, let device = directory.machines.first(where: \.isMe) {
             let unavailable = Device(person: device.person, machine: device.machine, endpoint: device.endpoint, isMe: true, online: false, link: nil, rttMs: nil)
@@ -127,9 +133,11 @@ struct CoreChecks {
 import json,sys,pathlib
 home=pathlib.Path(__file__).resolve().parents[2]
 if sys.argv[1]=='who':
+ if (home/'waiting-engine').exists(): (home/'waiting-engine').rename(home/'.reason/network/network.db')
  local={'address':'me/local','name':'local','agent':'codex','person':'me','machine':'fixture-mac','status':'live','tier':'pull'}
+ sibling=dict(local,address='me/sibling',name='sibling',status='busy')
  if (home/'offline').exists(): local['machine']='another-mac'
- print(json.dumps({'team':'fixture','person':'me','machine':'fixture-mac','sessions':[{'address':'peer/remote','name':'remote','person':'peer','doing':'Remote title','tier':'push'},local],'machines':[{'person':'me','machine':'fixture-mac','endpoint':'fixture','is_me':True,'online':True}]}))
+ print(json.dumps({'team':'fixture','person':'me','machine':'fixture-mac','sessions':[{'address':'peer/remote','name':'remote','person':'peer','doing':'Remote title','tier':'push'},local,sibling],'machines':[{'person':'me','machine':'fixture-mac','endpoint':'fixture','is_me':True,'online':True}]}))
 elif sys.argv[1]=='leave':
  assert sys.argv[2:] == []
  if (home/'refuse').exists(): sys.exit("no teammate is online")
@@ -138,7 +146,7 @@ elif sys.argv[1]=='leave':
  print("Left fixture.")
 elif sys.argv[1]=='send':
  (home/'sent.json').write_text(json.dumps({'args':sys.argv[2:],'body':sys.stdin.read()}))
- print('queued\nmessage id 01234567890123456789012345')
+ print('queued\nmessage id '+('01234567890123456789012346' if 'me/sibling@fixture-mac' in sys.argv else '01234567890123456789012345'))
 elif sys.argv[1]=='link': print('Join the Reason Network: https://reasonmachines.com/network/join/#rn1-fixture')
 elif sys.argv[1]=='doctor': print('fixture healthy')
 """#
@@ -199,16 +207,25 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         try expect(personal.first?.canLeave == false, "stock daemon cannot pause a session")
         let invitation = try await service.inviteLink()
         try expect(invitation == "https://reasonmachines.com/network/join/#rn1-fixture", "copy only the invitation URL")
+        // Simulate the daemon making the database available on first contact.
+        let recoveryHome = home.appendingPathComponent("recovery")
+        for path in [".reason/network", ".local/bin"] {
+            try fm.createDirectory(at: recoveryHome.appendingPathComponent(path), withIntermediateDirectories: true)
+        }
+        try fm.copyItem(at: cli, to: recoveryHome.appendingPathComponent(".local/bin/reason-network"))
+        _ = try engine.rows("VACUUM INTO ?", [recoveryHome.appendingPathComponent("waiting-engine").path])
+        let recovered = try await ReasonService(home: recoveryHome).snapshot(local: "local", peer: "peer/remote")
+        try expect(recovered.directory.networkID == "team-a" && recovered.messages.count == 1, "daemon wake recovers read-only history")
         let snapshot = try await service.snapshot(local: "local", peer: "peer/remote")
         try expect(snapshot.messages.count == 1, "held messages excluded")
         try expect(snapshot.localSessions.first?.title == "Local title", "local title retained")
         try expect(snapshot.directory.sessions.first?.title == "Remote title", "remote title decoded")
         try expect(snapshot.directory.machines.first?.isMe == true, "snake case device fields decoded")
         _ = try catalog.rows("ALTER TABLE threads ADD COLUMN name TEXT")
-        _ = try catalog.rows("INSERT INTO threads(id,title,name) VALUES('fixture','Generated','Renamed in Codex')")
+        _ = try catalog.rows("INSERT INTO threads(id,title,name) VALUES('FIXTURE','Generated','Renamed in Codex')")
         let renamed = try await service.snapshot(local: "local", peer: "peer/remote")
         try expect(renamed.localSessions.first { $0.name == "local" }?.title == "Renamed in Codex", "local picker uses native title when absent from directory")
-        _ = try catalog.rows("UPDATE threads SET name='' WHERE id='fixture'")
+        _ = try catalog.rows("UPDATE threads SET name='' WHERE id='FIXTURE'")
         let reverted = try await service.snapshot(local: "local", peer: "peer/remote")
         try expect(reverted.localSessions.first { $0.name == "local" }?.title == "Generated", "refresh observes title changes, including removed custom name")
         let advertised = try JSONDecoder().decode(NetworkSession.self, from: Data(#"{"address":"other/s","name":"s","person":"other","title":"A · B","doing":"A · B · testing"}"#.utf8))
@@ -220,6 +237,12 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         do { _ = try await service.send(network: "team-a", local: "local", to: "unknown/peer", body: "hello"); throw NetworkError("invalid peer accepted") }
         catch { try expect(error.localizedDescription != "invalid peer accepted", "reject unknown recipient") }
         try await checkOfflineSender(home: home, service: service)
+        let siblingStatus = try await service.send(network: "team-a", local: "local", to: "me/sibling", body: "same Mac")
+        try expect(siblingStatus == "已排队", "same-Mac recipient accepted")
+        let localSend = try JSONSerialization.jsonObject(with: Data(contentsOf: home.appendingPathComponent("sent.json"))) as! [String: Any]
+        try expect(localSend["args"] as? [String] == ["--from", "codex:fixture", "me/sibling@fixture-mac", "-"], "local route is machine-qualified")
+        do { _ = try await service.send(network: "team-a", local: "local", to: "me/local", body: "self"); throw NetworkError("self accepted") }
+        catch { try expect(error.localizedDescription != "self accepted", "reject self delivery") }
         let body = "literal `whoami` $(touch /tmp/no-execution)\n中文"
         let status = try await service.send(network: "team-a", local: "local", to: "peer/remote", body: body)
         try expect(status == "已排队", "queued is not read")

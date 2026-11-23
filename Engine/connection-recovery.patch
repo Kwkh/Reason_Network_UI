@@ -1,0 +1,245 @@
+diff --git a/src/client.rs b/src/client.rs
+index 026daa9..786dcd5 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -55,6 +55,7 @@ pub struct Link {
+     regs: Mutex<HashMap<String, SessionReg>>,
+     /// Where pushed events go. `None` for one-shot clients, which also don't reconnect.
+     events: Option<mpsc::UnboundedSender<Event>>,
++    reconnect_tx: Option<mpsc::Sender<()>>,
+     next_id: AtomicU64,
+     /// Start the daemon when it isn't running.
+     start: bool,
+@@ -71,7 +72,20 @@ impl Link {
+     }
+ 
+     fn with(events: Option<mpsc::UnboundedSender<Event>>, start: bool) -> Arc<Self> {
+-        Arc::new(Link { conn: Default::default(), regs: Default::default(), events, next_id: AtomicU64::new(1), start })
++        let (tx, mut rx) = mpsc::channel(1);
++        let reconnect_tx = events.as_ref().map(|_| tx);
++        let link = Arc::new(Link {
++            conn: Default::default(), regs: Default::default(), events, reconnect_tx, next_id: AtomicU64::new(1), start,
++        });
++        if link.reconnect_tx.is_some() {
++            let weak = Arc::downgrade(&link);
++            tokio::spawn(async move {
++                while rx.recv().await.is_some() {
++                    reconnect(weak.clone()).await;
++                }
++            });
++        }
++        link
+     }
+ 
+     pub async fn call<T: DeserializeOwned>(self: &Arc<Self>, req: Request) -> Result<T> {
+@@ -98,9 +112,12 @@ impl Link {
+     async fn raw_within(&self, conn: &Conn, req: &Request, patience: Duration) -> Result<Value> {
+         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+         let (tx, rx) = oneshot::channel();
+-        conn.pending.lock().unwrap().insert(id, tx);
+         let line = serde_json::to_string(&Frame { id, body: req })?;
+-        conn.tx.send(line).map_err(|_| anyhow!("network daemon connection closed"))?;
++        conn.pending.lock().unwrap().insert(id, tx);
++        if conn.tx.send(line).is_err() {
++            conn.pending.lock().unwrap().remove(&id);
++            bail!("network daemon connection closed");
++        }
+         let reply = match tokio::time::timeout(patience, rx).await {
+             Ok(reply) => reply.map_err(|_| anyhow!("network daemon connection closed"))?,
+             Err(_) => {
+@@ -129,7 +146,7 @@ impl Link {
+         for reg in regs {
+             if let Err(e) = self.raw(&c, &Request::Register { session: reg.clone() }).await {
+                 // Its folder was turned off meanwhile: it stays off, and the rest reconnect.
+-                if e.to_string() != crate::config::OFF_HERE {
++                if !matches!(e.to_string().as_str(), crate::config::OFF_HERE | crate::config::SESSION_PAUSED) {
+                     return Err(e);
+                 }
+                 self.regs.lock().unwrap().remove(&reg.key);
+@@ -148,26 +165,29 @@ impl Link {
+             alive: Arc::new(AtomicBool::new(true)),
+             unmatched: Default::default(),
+         };
++        // Only callers own tx. Dropping a rejected candidate closes rx and both socket halves.
++        let (pending, unmatched, alive) = (conn.pending.clone(), conn.unmatched.clone(), conn.alive.clone());
++        let (events, reconnect_tx) = (self.events.clone(), self.reconnect_tx.clone());
+         tokio::spawn(async move {
+-            while let Some(mut line) = rx.recv().await {
+-                line.push('\n');
+-                if wr.write_all(line.as_bytes()).await.is_err() {
+-                    break;
++            let write = async {
++                while let Some(mut line) = rx.recv().await {
++                    line.push('\n');
++                    if wr.write_all(line.as_bytes()).await.is_err() { return true; }
+                 }
+-            }
+-        });
+-        let (reader, alive, events, link) =
+-            (conn.clone(), conn.alive.clone(), self.events.clone(), Arc::downgrade(self));
+-        let pending = conn.pending.clone();
+-        tokio::spawn(async move {
+-            let mut lines = BufReader::new(rd).lines();
+-            while let Ok(Some(line)) = lines.next_line().await {
+-                reader.dispatch(&line, events.as_ref());
+-            }
++                false
++            };
++            let read = async {
++                let mut lines = BufReader::new(rd).lines();
++                while let Ok(Some(line)) = lines.next_line().await {
++                    Conn::dispatch(&pending, &unmatched, &line, events.as_ref());
++                }
++            };
++            let lost = tokio::select! { failed = write => failed, _ = read => true };
++            drop(rx);
+             alive.store(false, Ordering::Relaxed);
+             pending.lock().unwrap().clear();
+-            if events.is_some() {
+-                tokio::spawn(reconnect(link));
++            if lost && let Some(tx) = reconnect_tx {
++                let _ = tx.try_send(());
+             }
+         });
+         conn
+@@ -176,7 +196,7 @@ impl Link {
+ 
+ impl Conn {
+     /// A line from the daemon: an event, or the reply to a call, which it hands over.
+-    fn dispatch(&self, line: &str, events: Option<&mpsc::UnboundedSender<Event>>) {
++    fn dispatch(pending: &Pending, unmatched: &Mutex<Option<String>>, line: &str, events: Option<&mpsc::UnboundedSender<Event>>) {
+         let Ok(v) = serde_json::from_str::<Value>(line) else { return };
+         if v.get("event").is_some() {
+             if let (Some(events), Ok(ev)) = (events, serde_json::from_value::<Event>(v)) {
+@@ -185,11 +205,11 @@ impl Conn {
+             return;
+         }
+         let Ok(reply) = serde_json::from_value::<Reply>(v) else { return };
+-        match self.pending.lock().unwrap().remove(&reply.id) {
++        match pending.lock().unwrap().remove(&reply.id) {
+             Some(tx) => {
+                 let _ = tx.send(reply);
+             }
+-            None if !reply.ok => *self.unmatched.lock().unwrap() = reply.error,
++            None if !reply.ok => *unmatched.lock().unwrap() = reply.error,
+             None => {}
+         }
+     }
+@@ -330,7 +350,7 @@ mod tests {
+         // What 0.12.6 answers: a failure under no request's id.
+         let line = sent.recv().await.unwrap();
+         assert!(line.contains("push_failed"), "{line}");
+-        conn.dispatch(r#"{"id":0,"ok":false,"error":"bad request: unknown variant `push_failed`"}"#, None);
++        Conn::dispatch(&conn.pending, &conn.unmatched, r#"{"id":0,"ok":false,"error":"bad request: unknown variant `push_failed`"}"#, None);
+         let e = call.await.unwrap().unwrap_err().to_string();
+         assert!(
+             e.starts_with("no answer from the network daemon") && e.contains("unknown variant `push_failed`"),
+@@ -344,10 +364,21 @@ mod tests {
+         };
+         let line = sent.recv().await.unwrap();
+         let id = serde_json::from_str::<Value>(&line).unwrap()["id"].as_u64().unwrap();
+-        conn.dispatch(&serde_json::to_string(&Reply::ok(id, serde_json::json!(7))).unwrap(), None);
++        Conn::dispatch(&conn.pending, &conn.unmatched, &serde_json::to_string(&Reply::ok(id, serde_json::json!(7))).unwrap(), None);
+         assert_eq!(call.await.unwrap().unwrap(), serde_json::json!(7));
+     }
+ 
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn dropping_an_unpublished_connection_closes_its_peer() {
++        let link = Link::existing();
++        let (stream, peer) = ipc::Stream::pair().unwrap();
++        let conn = link.spawn_io(stream);
++        drop(conn);
++        let eof = tokio::time::timeout(Duration::from_secs(2), BufReader::new(peer).lines().next_line()).await;
++        assert_eq!(eof.unwrap().unwrap(), None);
++    }
++
+     #[test]
+     fn a_reconnect_registers_only_the_conversation_a_server_is_in_now() {
+         let reg = |key: &str, agent: &str| crate::proto::SessionReg {
+diff --git a/src/config.rs b/src/config.rs
+index 809671b..a2a951f 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -36,6 +36,7 @@ pub struct Config {
+ }
+ 
+ /// What an agent's tools say in a folder whose sessions are off the network.
++pub const SESSION_PAUSED: &str = "this session was disconnected from Reason Network by its user";
+ pub const OFF_HERE: &str = "Your user turned Reason Network off for this folder";
+ 
+ /// What a call naming no session gets, from an agent whose sessions share one MCP server, while one of them works in a
+diff --git a/src/daemon/mod.rs b/src/daemon/mod.rs
+index 2c06492..eb345df 100644
+--- a/src/daemon/mod.rs
++++ b/src/daemon/mod.rs
+@@ -84,9 +84,24 @@ pub async fn run(service: bool) -> Result<()> {
+     if std::env::var_os("REASON_NETWORK_LOCAL_PARTICIPATION").is_none() && update::allowed(daemon.cfg.auto_update) {
+         tokio::spawn(daemon.clone().update_loop());
+     }
++    #[cfg(unix)]
++    let mut retry = Duration::from_millis(200);
+     loop {
+-        let stream = listener.accept().await?;
+-        tokio::spawn(daemon.clone().serve(stream));
++        match listener.accept().await {
++            Ok(stream) => {
++                #[cfg(unix)]
++                { retry = Duration::from_millis(200); }
++                tokio::spawn(daemon.clone().serve(stream));
++            }
++            Err(e) if matches!(e.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted) => continue,
++            #[cfg(unix)]
++            Err(e) if matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) => {
++                if retry == Duration::from_millis(200) { log(&format!("IPC accept paused: {e}")); }
++                tokio::time::sleep(retry).await;
++                retry = (retry * 2).min(Duration::from_secs(3));
++            }
++            Err(e) => return Err(e.into()),
++        }
+     }
+ }
+ 
+@@ -366,7 +381,7 @@ impl Daemon {
+             Request::SessionParticipation => {
+                 let g = self.inner.lock().unwrap();
+                 let pending: Vec<_> = g.live.iter().filter(|(_, l)| l.codex_resume_pending).map(|(key, _)| key).collect();
+-                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true,
++                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true,
+                         "resume_pending": pending })
+             }
+             Request::SetReceiveMode { key, network, mode } => {
+@@ -378,7 +393,11 @@ impl Daemon {
+             }
+             Request::Register { session } => {
+                 let git = self.git(&session.cwd).await;
+-                json!(self.register(Some(conn), session, git)?)
++                // Stock MCP clients skip this single registration only for their known opt-out reply.
++                let registered = self.register(Some(conn), session, git).map_err(|error| {
++                    if error.to_string() == crate::config::SESSION_PAUSED { anyhow!(crate::config::OFF_HERE) } else { error }
++                })?;
++                json!(registered)
+             }
+             Request::SetStatus { key, doing, name } => json!(self.set_status(&key, doing, name)?),
+             Request::Who { me, filter, all } => json!(self.who(me, filter, all).await?),
+diff --git a/src/daemon/sessions.rs b/src/daemon/sessions.rs
+index f5cd7d8..3308273 100644
+--- a/src/daemon/sessions.rs
++++ b/src/daemon/sessions.rs
+@@ -4,7 +4,7 @@
+ use super::{Daemon, Inner, Live, log};
+ use crate::{
+     agent,
+-    config::{BUSY_OFF, OFF_HERE},
++    config::{BUSY_OFF, OFF_HERE, SESSION_PAUSED},
+     git::GitInfo,
+     proto::*,
+     render,
+@@ -26,7 +26,6 @@ const HOOK_TTL_MS: i64 = 6 * 3_600_000;
+ pub(super) const FORGET_MS: i64 = 24 * 3_600_000;
+ /// A session in a folder that is off counts as mid-turn this long after its last prompt or tool call.
+ const OFF_TURN_MS: i64 = 10 * 60_000;
+-const SESSION_PAUSED: &str = "this session was disconnected from Reason Network by its user";
+ 
+ impl Live {
+     fn hook_mode(&self) -> Tier {

@@ -4,7 +4,7 @@ SwiftUI 原生消息控制台。界面不使用 WebView，不启动浏览器、H
 
 ## 安装与首次配置
 
-从 [GitHub Releases](https://github.com/Kwkh/Reason_Network_UI/releases) 下载 Universal DMG，将 App 拖入 Applications。GitHub 上的 1.1.3 发行包内含 Developer ID 签名并通过 Apple 公证的 App。已有安装请打开「环境配置」，点击「更新兼容后台」启用新版 Codex 唤醒功能。
+从 [GitHub Releases](https://github.com/Kwkh/Reason_Network_UI/releases) 下载 Universal DMG，将 App 拖入 Applications。GitHub 上的 1.1.4 发行包内含 Developer ID 签名并通过 Apple 公证的 App。已有安装请打开「环境配置」，点击「更新兼容后台」启用后台重连修复。
 
 首次启动自动检查内置兼容后台、登录服务、Codex 接入与 Network 状态；已配置的机器直接进入聊天。新机流程：
 
@@ -30,7 +30,7 @@ xcodebuild -project 'Reason Network.xcodeproj' -scheme 'Reason Network' -configu
 
 ## 界面与行为
 
-- 使用工具栏的侧栏按钮展开或收起会话列表。侧栏顶部可切换本机会话，列表按队友分组，支持键盘选择；右侧标题下方显示所选会话的地址。切换时消息区短暂交叉淡化，并响应系统的减少动态效果设置。这不是读取对方完整聊天或确认其侧边栏标题。
+- 使用工具栏的侧栏按钮展开或收起会话列表。侧栏顶部可切换本机会话并查看各自的在线状态。列表按联系人和 Agent 分组，同一台 Mac 上的 Codex 会话可互发消息。右侧标题下方显示收件会话的地址和状态。切换时消息区短暂交叉淡化，并响应系统的减少动态效果设置。这不是读取对方完整聊天或确认其侧边栏标题。
 - 右上角在线状态打开设备面板：本机会话选择、push/turn/pull 接收模式、设备名、在线状态、连接方式及延迟；诊断可展开并刷新。
 - 消息按本机会话＋队友会话隔离，默认显示最近 100 条，滚到顶部可继续加载，每次最多 100 条；切换时分别保留草稿。Enter 发送、Shift + Enter 换行，⌘ R 刷新；长草稿在输入框内原生滚动。输入框左侧的「＋」可添加 UTF-8 文本附件，或为本条消息请求对方桌面提醒。每条最多 10 个附件，单个上限 256 KiB，合计 512 KiB。点击收到的附件名可在 App 内阅读。
 - 目录及消息约每 3 秒更新。App 的显示刷新与 Codex 的即时消息接收是独立机制；它不会把一个 pull 会话伪装为 push。

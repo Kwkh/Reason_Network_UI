@@ -64,6 +64,10 @@ struct Directory: Decodable, Equatable {
     var sessions: [NetworkSession]
     let machines: [Device]
 
+    func isRecipient(_ session: NetworkSession, sendingAs local: String) -> Bool {
+        session.person != person || (session.machine == machine && session.agent == "codex" && session.name != local)
+    }
+
     func liveLocalSession(named name: String, agent: String) -> NetworkSession? {
         guard !machines.contains(where: { $0.isMe && !$0.online }) else { return nil }
         return sessions.first {
@@ -212,7 +216,7 @@ struct ConversationReadingWindow {
 struct Snapshot {
     let directory: Directory
     let localSessions: [LocalSession]
-    let conversations: [String]
+    let conversations: [NetworkSession]
     let messages: [Message]
     let hasEarlier: Bool
     let mirrorWarning: String?

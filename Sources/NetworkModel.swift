@@ -10,7 +10,7 @@ final class NetworkModel: ObservableObject {
     @Published var locals: [LocalSession] = []
     @Published var messages: [Message] = []
     @Published private(set) var waitingForHistory = true
-    @Published var conversations: [String] = []
+    @Published var conversations: [NetworkSession] = []
     @Published var selectedLocal: String { didSet { guard oldValue != selectedLocal else { return }; UserDefaults.standard.set(selectedLocal, forKey: "selectedLocal"); changedConversation() } }
     @Published var selectedPeer: String { didSet { guard oldValue != selectedPeer else { return }; UserDefaults.standard.set(selectedPeer, forKey: "selectedPeer"); changedConversation() } }
     struct Draft: Equatable {
@@ -79,21 +79,31 @@ final class NetworkModel: ObservableObject {
         }
     }
     var peers: [NetworkSession] {
-        var result = directory?.sessions.filter { $0.person != directory?.person } ?? []
-        for address in conversations where !result.contains(where: { $0.address == address }) {
-            let parts = address.split(separator: "/", maxSplits: 1).map(String.init)
-            result.append(NetworkSession(address: address, name: parts.last ?? address, person: parts.first ?? "", agent: "离线", status: "offline"))
+        guard let directory else { return [] }
+        var result = directory.sessions.filter { directory.isRecipient($0, sendingAs: selectedLocal) }
+        let ownAddress = directory.person + "/" + selectedLocal
+        for session in locals where !session.historyOnly && session.name != selectedLocal {
+            let address = directory.person + "/" + session.name
+            if !result.contains(where: { $0.address == address }) {
+                result.append(NetworkSession(address: address, name: session.name, person: directory.person,
+                                             machine: directory.machine, agent: "codex", status: "offline", clientTitle: session.title))
+            }
+        }
+        for previous in conversations where previous.address != ownAddress && !result.contains(where: { $0.address == previous.address }) {
+            result.append(previous)
         }
         return result
     }
     var peer: NetworkSession? { peers.first { $0.address == selectedPeer } }
     var own: LocalSession? { locals.first { $0.name == selectedLocal } }
     var senderPresence: SenderPresence {
-        guard let own else { return .unknown }
-        if own.historyOnly { return .history }
-        if reconnectingSender { return .reconnecting }
-        guard online else { return .unknown }
-        return senderOffline ? .offline : .online
+        own.map(presence(for:)) ?? .unknown
+    }
+    func presence(for session: LocalSession) -> SenderPresence {
+        if session.historyOnly { return .history }
+        if reconnectingKey == session.key { return .reconnecting }
+        guard error == nil, let directory else { return .unknown }
+        return directory.liveLocalSession(named: session.name, agent: "codex") == nil ? .offline : .online
     }
     var senderOffline: Bool {
         online && own?.historyOnly == false && directory?.liveLocalSession(named: selectedLocal, agent: "codex") == nil
@@ -101,7 +111,7 @@ final class NetworkModel: ObservableObject {
     var reconnectingSender: Bool { own != nil && reconnectingKey == own?.key }
     @Published private(set) var reconnectingKey: String?
     var canSend: Bool {
-        !leavingNetwork && !sending && online && !senderOffline && !reconnectingSender && own?.historyOnly == false && peer?.offline == false && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !options.files.isEmpty)
+        !leavingNetwork && !sending && online && !senderOffline && !reconnectingSender && own?.historyOnly == false && peer?.available == true && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !options.files.isEmpty)
     }
     var online: Bool { directory != nil && error == nil }
     var tier: String? { guard online else { return nil }; return directory?.liveLocalSession(named: selectedLocal, agent: "codex")?.tier }

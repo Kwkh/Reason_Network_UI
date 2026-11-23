@@ -18,7 +18,7 @@ struct PersonalSession: Identifiable {
         }
     }
 
-    let id: String
+    var id: String
     let agent: String
     let title: String
     let cwd: String?
@@ -152,20 +152,21 @@ struct PersonalSessionCatalog {
     }
 
     /// Read only the registered Codex threads during the periodic network refresh.
-    func codexTitles(for keys: [String]) throws -> [String: String] {
+    func codexTitles(for keys: [String]) throws -> [String: String]? {
         let ids = keys.compactMap { key -> String? in
             guard key.hasPrefix("codex:") else { return nil }
             return String(key.dropFirst(6))
         }
-        guard !ids.isEmpty, let db = try codexDatabase() else { return [:] }
+        guard !ids.isEmpty else { return [:] }
+        guard let db = try codexDatabase() else { return nil }
         let fields = Set(try db.rows("PRAGMA table_info(threads)").compactMap { $0["name"] })
         guard fields.contains("title") else { return [:] }
         var titles = [String: String]()
         for offset in stride(from: 0, to: ids.count, by: 500) {
             let batch = Array(ids[offset..<min(offset + 500, ids.count)])
             let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ",")
-            for row in try db.rows("SELECT id, \(titleColumn(fields)) FROM threads WHERE id IN (\(placeholders))", batch) {
-                if let id = row["id"], let title = row["title"]?.nonEmpty { titles["codex:" + id] = title }
+            for row in try db.rows("SELECT id, \(titleColumn(fields)) FROM threads WHERE id COLLATE NOCASE IN (\(placeholders))", batch) {
+                if let id = row["id"], let title = row["title"]?.nonEmpty { titles["codex:" + id.lowercased()] = title }
             }
         }
         return titles
@@ -191,7 +192,7 @@ struct PersonalSessionCatalog {
             guard let id = row["id"], UUID(uuidString: id) != nil else { return nil }
             if row["archived"] == "1" || row["archived_at"] != nil || row["rollout_path"]?.hasPrefix(archivePrefix) == true ||
                 row["attached_thread_parent_id"]?.nonEmpty != nil || isInternalThread(row) {
-                hidden.insert("codex:" + id)
+                hidden.insert("codex:" + id.lowercased())
                 return nil
             }
             hidden.remove("codex:" + id.lowercased())
@@ -314,7 +315,7 @@ struct PersonalSessionCatalog {
 
 struct SessionSocket {
     let socketURL: URL
-    func request(_ payload: [String: Any], timeout: Int = 5) throws -> Data {
+    func request(_ payload: [String: Any], timeout: Int = 5, onlyFrom executable: URL? = nil) throws -> Data {
         let path = socketURL.path
         guard path.utf8.count < 104 else { throw NetworkError("数据目录路径过长，无法连接本机服务。") }
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
@@ -338,6 +339,17 @@ struct SessionSocket {
             }
         }
         guard connected == 0 else { throw NetworkError("本机网络服务尚未就绪，请检查本机服务。") }
+        if let executable {
+            // Verify the server on this very socket before asking a fallback CLI daemon to exit.
+            var pid: pid_t = 0
+            var length = socklen_t(MemoryLayout<pid_t>.size)
+            var bytes = [CChar](repeating: 0, count: 4096)
+            guard getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &length) == 0, pid > 0,
+                  proc_pidpath(pid, &bytes, UInt32(bytes.count)) > 0,
+                  URL(fileURLWithPath: String(cString: bytes)).resolvingSymlinksInPath().path == executable.resolvingSymlinksInPath().path else {
+                throw NetworkError("本机连接由其他后台处理。")
+            }
+        }
         var body = payload
         body["id"] = 1
         var encoded = try JSONSerialization.data(withJSONObject: body)

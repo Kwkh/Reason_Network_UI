@@ -7,6 +7,7 @@ struct ContentView: View {
     @State private var showStatus = false
     @State private var composerHeight: CGFloat = 70
     @State private var editorHeight: CGFloat = 46
+    @State private var senderHintHeight: CGFloat = 0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
     @State private var composing = false
@@ -78,7 +79,7 @@ struct ContentView: View {
             ZStack(alignment: .bottom) {
                 history.clipped()
                 composer
-                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { composerHeight = $0 }
+                    .onGeometryChange(for: CGFloat.self) { ceil($0.size.height) } action: { composerHeight = $0 }
             }
             .background(Color(nsColor: .textBackgroundColor).ignoresSafeArea(.container, edges: .top))
             .foregroundStyle(.primary)
@@ -115,10 +116,20 @@ struct ContentView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(Color(nsColor: .labelColor))
                 .truncationMode(.tail)
-            Text(address)
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(Color(nsColor: .secondaryLabelColor))
-                .truncationMode(.middle)
+            HStack(spacing: 5) {
+                Text(address)
+                    .font(.system(size: 10, design: .monospaced))
+                    .truncationMode(.middle)
+                if let peer {
+                    let status = model.online ? peer.statusText : "状态未知"
+                    Text(status)
+                        .font(.system(size: 10))
+                        .layoutPriority(1)
+                        .contentTransition(reduceMotion ? .identity : .numericText())
+                        .animation(conversationFade, value: status)
+                }
+            }
+            .foregroundStyle(Color(nsColor: .secondaryLabelColor))
         }
         .lineLimit(1)
         .frame(maxWidth: maxWidth)
@@ -143,7 +154,8 @@ struct ContentView: View {
                     .lineLimit(1)
                     .contentTransition(reduceMotion ? .identity : .numericText())
             }
-            .padding(.horizontal, 12).padding(.vertical, 7)
+            .padding(.horizontal, 6).padding(.vertical, 7)
+            .frame(minWidth: 64)
             .background(Capsule().stroke(Color.primary.opacity(0.16), lineWidth: 1))
             .contentShape(Capsule())
             .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: indicator)
@@ -187,7 +199,8 @@ struct ContentView: View {
         }
     }
     private var composer: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        let showsSenderHint = model.senderOffline || model.reconnectingSender
+        return VStack(alignment: .leading, spacing: 4) {
             if !model.notice.isEmpty {
                 Text(model.notice)
                     .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)
@@ -209,14 +222,22 @@ struct ContentView: View {
                 }.scrollIndicators(.hidden)
             }
             VStack(alignment: .leading, spacing: 0) {
-                if model.senderOffline || model.reconnectingSender {
-                    Button { showStatus = true } label: {
-                        Label(model.reconnectingSender ? "正在重新接入本机会话…" : "本机会话离线 · 查看接入选项",
-                              systemImage: "network.slash")
-                    }
-                    .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
-                    .padding(.horizontal, 18).padding(.top, 10)
+                Button { showStatus = true } label: {
+                    Label(model.reconnectingSender ? "正在重新接入本机会话…" : "本机会话离线 · 查看接入选项",
+                          systemImage: "network.slash")
+                        .contentTransition(reduceMotion ? .identity : .numericText())
+                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: model.reconnectingSender)
                 }
+                .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
+                .padding(.horizontal, 18).padding(.top, 10)
+                .fixedSize(horizontal: false, vertical: true)
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { senderHintHeight = $0 }
+                .modifier(SenderHintViewport(height: showsSenderHint ? senderHintHeight : 0))
+                .opacity(showsSenderHint ? 1 : 0)
+                .animation(reduceMotion ? nil : .smooth(duration: 0.24), value: showsSenderHint)
+                .disabled(!showsSenderHint)
+                .allowsHitTesting(showsSenderHint)
+                .accessibilityHidden(!showsSenderHint)
                 ZStack(alignment: .bottomTrailing) {
                     DraftField(text: Binding(get: { model.draft }, set: { model.draft = $0 }),
                                focused: $composing,
@@ -267,6 +288,19 @@ struct ContentView: View {
             .animation(reduceMotion ? nil : .smooth(duration: 0.24), value: editorHeight)
         }
         .padding(.horizontal, 16).padding(.top, 8).padding(.bottom, 16)
+    }
+}
+
+// Interpolate the height reported to the glass shell, keeping the native editor anchored below.
+private struct SenderHintViewport: AnimatableModifier {
+    var height: CGFloat
+    var animatableData: CGFloat {
+        get { height }
+        set { height = newValue }
+    }
+
+    func body(content: Content) -> some View {
+        content.frame(height: height, alignment: .bottomLeading).clipped()
     }
 }
 
@@ -579,6 +613,23 @@ private extension SenderPresence {
         }
     }
 
+    var menuImage: Image {
+        let size = NSImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
+        let palette = NSImage.SymbolConfiguration(paletteColors: [NSColor(color)])
+        guard let symbolImage = NSImage(systemSymbolName: symbol, accessibilityDescription: rawValue)?
+            .withSymbolConfiguration(size.applying(palette)) else { return Image(systemName: symbol) }
+        // The native menu scales its image slot. Center the smaller glyph on a full-size canvas.
+        let menuIcon = NSImage(size: NSSize(width: 16, height: 16), flipped: false) { bounds in
+            let scale = 8 / max(symbolImage.size.width, symbolImage.size.height)
+            let size = NSSize(width: symbolImage.size.width * scale, height: symbolImage.size.height * scale)
+            let rect = NSRect(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2,
+                              width: size.width, height: size.height)
+            symbolImage.draw(in: rect)
+            return true
+        }
+        return Image(nsImage: menuIcon).renderingMode(.original)
+    }
+
     var shortLabel: String {
         switch self {
         case .reconnecting: "接入中"
@@ -624,7 +675,14 @@ private struct ConversationSidebar: View {
             Menu {
                 Picker("本机会话", selection: $model.selectedLocal) {
                     ForEach(model.locals) { session in
-                        Text(session.title + (session.historyOnly ? " · 历史记录" : "")).tag(session.name)
+                        let presence = model.presence(for: session)
+                        Label {
+                            Text(session.title + (session.historyOnly ? " · 历史记录" : ""))
+                        } icon: {
+                            presence.menuImage
+                        }
+                        .accessibilityLabel(session.title + "，" + presence.rawValue)
+                        .tag(session.name)
                     }
                 }
                 .pickerStyle(.inline)
@@ -654,7 +712,21 @@ private struct ConversationSidebar: View {
         })
     }
 
-    var body: some View {
+    private enum SidebarRow: Identifiable {
+        case person(String)
+        case agent(person: String, name: String)
+        case session(NetworkSession)
+
+        var id: [String] {
+            switch self {
+            case .person(let person): ["person", person]
+            case .agent(let person, let name): ["agent", person, name]
+            case .session(let session): ["session", session.person] + session.overviewID
+            }
+        }
+    }
+
+    private var visibleRows: [SidebarRow] {
         let tokens = terms
         let sessions = model.peers.filter { session in
             let haystack = [session.person, NetworkSession.agentDisplayName(session.agent), session.title,
@@ -662,6 +734,25 @@ private struct ConversationSidebar: View {
             return tokens.allSatisfy { haystack.localizedCaseInsensitiveContains(String($0)) }
         }
         let groups = Dictionary(grouping: sessions, by: \.person)
+        var rows: [SidebarRow] = []
+        for person in groups.keys.sorted() {
+            rows.append(.person(person))
+            guard expansion([person]).wrappedValue else { continue }
+            let agents = Dictionary(grouping: groups[person] ?? []) {
+                $0.offline ? "离线" : NetworkSession.agentDisplayName($0.agent)
+            }
+            for name in agents.keys.sorted() {
+                rows.append(.agent(person: person, name: name))
+                if expansion([person, name]).wrappedValue {
+                    rows.append(contentsOf: (agents[name] ?? []).map(SidebarRow.session))
+                }
+            }
+        }
+        return rows
+    }
+
+    var body: some View {
+        let rows = visibleRows
         VStack(alignment: .leading, spacing: 0) {
             if !model.locals.isEmpty {
                 senderMenu
@@ -691,34 +782,32 @@ private struct ConversationSidebar: View {
             }
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
-                    ForEach(groups.keys.sorted(), id: \.self) { person in
-                        let people = expansion([person])
-                        GroupHeading(title: person, icon: "person", expanded: people.wrappedValue) {
-                            people.wrappedValue.toggle()
-                        }
-                        if people.wrappedValue {
-                            let agents = Dictionary(grouping: groups[person] ?? []) { NetworkSession.agentDisplayName($0.agent) }
-                            ForEach(agents.keys.sorted(), id: \.self) { agent in
-                                let branch = expansion([person, agent])
-                                GroupHeading(title: agent, icon: "terminal", expanded: branch.wrappedValue) {
-                                    branch.wrappedValue.toggle()
-                                }.padding(.leading, 13)
-                                if branch.wrappedValue {
-                                    ForEach(agents[agent] ?? []) { session in
-                                        peerButton(session)
-                                    }
-                                }
+                    ForEach(rows) { row in
+                        switch row {
+                        case .person(let person):
+                            let people = expansion([person])
+                            GroupHeading(title: person == model.directory?.person ? person + " · 我" : person,
+                                         icon: "person", expanded: people.wrappedValue) {
+                                people.wrappedValue.toggle()
                             }
+                        case .agent(let person, let name):
+                            let branch = expansion([person, name])
+                            GroupHeading(title: name, icon: "terminal", expanded: branch.wrappedValue) {
+                                branch.wrappedValue.toggle()
+                            }
+                            .padding(.leading, 13)
+                        case .session(let session):
+                            peerButton(session)
                         }
                     }
                 }
                 .padding(.leading, 16)
                 .padding(.trailing, 10)
             }
-            .accessibilityLabel("队友会话")
+            .accessibilityLabel("会话联系人")
             .overlay(alignment: .top) {
-                if groups.isEmpty && model.directory != nil {
-                    Text(terms.isEmpty ? "暂无队友会话" : "没有匹配的会话")
+                if rows.isEmpty && model.directory != nil {
+                    Text(terms.isEmpty ? "暂无可查看的会话" : "没有匹配的会话")
                         .font(.callout).foregroundStyle(.secondary).padding(.top)
                 }
             }
@@ -1373,8 +1462,9 @@ struct StatusView: View {
                                     Text(model.reconnectingSender ? "接入中…" : model.senderOffline ? "重新接入" : "已接入")
                                         .font(.system(size: 11, weight: .medium)).lineLimit(1)
                                         .contentTransition(reduceMotion ? .identity : .numericText())
-                                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                                        .background(Color.primary.opacity(model.senderOffline || model.reconnectingSender ? 0.06 : 0), in: RoundedRectangle(cornerRadius: 10))
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 48)
+                                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
                                         .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
@@ -1387,20 +1477,22 @@ struct StatusView: View {
                         .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: model.reconnectingSender)
                 }
                 .fixedSize(horizontal: false, vertical: true)
-                if let local = model.own, let network = model.directory?.networkID,
-                   let actual = model.tier.flatMap(ReceiveMode.init(rawValue:)) {
+                if let local = model.own, !local.historyOnly, let network = model.directory?.networkID {
+                    let actual = model.tier.flatMap(ReceiveMode.init(rawValue:))
                     Menu {
-                        Picker("偏好接收模式", selection: Binding(get: { actual }, set: { mode in
-                            Task { await model.changeReceiveMode(mode, local: local, network: network) }
-                        })) {
-                            ForEach(ReceiveMode.allCases, id: \.self) { mode in Text(mode.title).tag(mode) }
+                        if let actual {
+                            Picker("偏好接收模式", selection: Binding(get: { actual }, set: { mode in
+                                Task { await model.changeReceiveMode(mode, local: local, network: network) }
+                            })) {
+                                ForEach(ReceiveMode.allCases, id: \.self) { mode in Text(mode.title).tag(mode) }
+                            }
+                            .pickerStyle(.inline).labelsHidden()
                         }
-                        .pickerStyle(.inline).labelsHidden()
                     } label: {
                         HStack(spacing: 5) {
                             Image(systemName: actual == .push ? "bolt.horizontal" : "arrow.down.circle")
                                 .frame(width: 14)
-                            Text(actual.title)
+                            Text(actual?.title ?? "接收模式")
                                 .contentTransition(reduceMotion ? .identity : .numericText())
                             Image(systemName: "chevron.down")
                                 .font(.system(size: 8, weight: .medium))
@@ -1414,9 +1506,9 @@ struct StatusView: View {
                     .fixedSize()
                     .padding(.bottom, 3)
                     .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: actual)
-                    .disabled(model.changingSession != nil || model.senderPresence != .online)
-                    .accessibilityLabel("偏好接收模式").accessibilityValue(actual.title)
-                    .help("切换当前本机会话的接收模式")
+                    .disabled(actual == nil || model.changingSession != nil || model.senderPresence != .online)
+                    .accessibilityLabel("偏好接收模式").accessibilityValue(actual?.title ?? "暂不可用")
+                    .help(actual == nil ? "接入后可查看和切换接收模式" : "切换当前本机会话的接收模式")
                 }
                 ForEach(model.directory?.machines ?? []) { device in
                     VStack(alignment: .leading, spacing: 7) {

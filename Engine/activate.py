@@ -8,6 +8,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import struct
 import tempfile
 import time
 
@@ -60,20 +61,31 @@ def main(binary):
     try:
         replace_plist(plistlib.dumps(job))
         bootstrap()
+        # A stock MCP may have started a standalone daemon while the service was unloaded.
+        cli_paths = {(home / folder / "reason-network").resolve() for folder in (".local/bin", ".reason/bin")}
+        handed_off = False
         for _ in range(40):
             try:
                 with socket.socket(socket.AF_UNIX) as sock:
                     sock.settimeout(2)
                     sock.connect(str(home / ".reason/network/network.sock"))
                     sock.sendall(b'{"op":"session_participation","id":1}\n')
-                    reply = json.loads(sock.makefile("rb").readline(1024 * 1024))
-                    if reply.get("ok") and reply["result"]["version"] == 1 and reply["result"].get("codex_queue_resume"):
-                        print("Session participation and Codex queue resume are available.")
-                        return
+                    with sock.makefile("rb") as reader:
+                        reply = json.loads(reader.readline(1024 * 1024))
+                        if reply.get("ok") and reply["result"]["version"] == 1 and reply["result"].get("connection_recovery"):
+                            print("Connection recovery is available.")
+                            return
+                        if not handed_off:
+                            # Darwin SOL_LOCAL/LOCAL_PEERPID. Check this socket's peer before shutdown.
+                            pid, = struct.unpack("i", sock.getsockopt(0, 2, struct.calcsize("i")))
+                            process = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "comm="], capture_output=True, text=True)
+                            if process.returncode == 0 and Path(process.stdout.strip()).resolve() in cli_paths:
+                                sock.sendall(b'{"op":"shutdown","id":2}\n')
+                                handed_off = json.loads(reader.readline(1024 * 1024)).get("ok") is True
             except (OSError, ValueError):
                 pass
             time.sleep(0.5)
-        raise RuntimeError("Daemon did not advertise Codex queue resume")
+        raise RuntimeError("Daemon did not advertise connection recovery")
     except BaseException:
         subprocess.run(["launchctl", "bootout", service], check=False)
         replace_plist(old)

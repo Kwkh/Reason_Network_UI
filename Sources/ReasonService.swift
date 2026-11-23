@@ -6,13 +6,30 @@ actor ReasonService {
     private var cache: SQLiteStore?
     private let mirror: TranscriptMirror
     private var migrated = false
+    private var lastCodexTitles: [String: String] = [:]
     init(home: URL = FileManager.default.homeDirectoryForCurrentUser) {
         self.home = home
         mirror = TranscriptMirror(root: home.appendingPathComponent(".codex/sessions"))
     }
     func snapshot(local: String, peer: String, readingFrom: Message.RowKey? = nil, readingNetwork: String? = nil) throws -> Snapshot {
-        let engine = try SQLiteStore(home.appendingPathComponent(".reason/network/network.db"), readOnly: true)
-        let expectedNetwork = try teamID(in: engine)
+        let engineURL = home.appendingPathComponent(".reason/network/network.db")
+        func openEngine() throws -> (SQLiteStore, String?) {
+            let engine = try SQLiteStore(engineURL, readOnly: true)
+            return (engine, try teamID(in: engine))
+        }
+        let engine: SQLiteStore
+        let expectedNetwork: String?
+        do {
+            (engine, expectedNetwork) = try openEngine()
+        } catch is SQLiteStore.OpenFailure {
+            // A read-only reader may arrive before the restarting daemon has opened its WAL.
+            // Let the CLI contact the service first, then reopen and bracket who with fresh team IDs.
+            _ = try directory()
+            do { (engine, expectedNetwork) = try openEngine() }
+            catch let error as SQLiteStore.OpenFailure {
+                throw NetworkError("暂时无法读取本机 Network 的聊天数据，稍后将自动重试。" + (error.errorDescription ?? ""))
+            }
+        }
         var directory = try directory()
         _ = try engine.rows("BEGIN")
         guard let network = try teamID(in: engine), directory.team != nil else {
@@ -23,20 +40,29 @@ actor ReasonService {
         let cache = try store()
         try selectNetwork(network, in: cache)
         let paused = try pausedKeys(in: engine)
-        let registrations = try engine.rows("SELECT name,key,doing,attached FROM sessions WHERE agent='codex' ORDER BY last_seen DESC")
-            .filter { !paused.contains($0["key"] ?? "") }
+        let codexRecords = try engine.rows("SELECT name,key,doing,attached FROM sessions WHERE agent='codex' ORDER BY last_seen DESC")
+        let registrations = codexRecords.filter { !paused.contains($0["key"] ?? "") }
         let catalog = PersonalSessionCatalog(home: home)
         // A missing or temporarily unavailable agent index must not interrupt messaging.
         let attached = registrations.filter { $0["attached"] == "1" }
-        let titles = (try? catalog.codexTitles(for: attached.compactMap { $0["key"] })) ?? [:]
+        if let titles = try? catalog.codexTitles(for: codexRecords.compactMap { $0["key"] }) {
+            lastCodexTitles = titles
+        }
+        var localTitlesByName: [String: String] = [:]
+        for row in codexRecords {
+            if let name = row["name"], localTitlesByName[name] == nil, let key = row["key"] {
+                localTitlesByName[name] = lastCodexTitles[key.lowercased()] ?? row["doing"]?.nonEmpty
+            }
+        }
         var locals = attached.compactMap { row -> LocalSession? in
             guard let name = row["name"], let key = row["key"] else { return nil }
             let index = directory.sessions.firstIndex {
                 $0.person == directory.person && $0.machine == directory.machine && $0.name == name && $0.agent == "codex"
             }
-            if let index, let title = titles[key] { directory.sessions[index].clientTitle = title }
+            let title = lastCodexTitles[key.lowercased()]
+            if let index, let title { directory.sessions[index].clientTitle = title }
             let published = index.map { directory.sessions[$0] }
-            return LocalSession(name: name, key: key, doing: titles[key] ?? published?.clientTitle ?? published?.doing ?? row["doing"])
+            return LocalSession(name: name, key: key, doing: title ?? published?.clientTitle ?? published?.doing ?? row["doing"])
         }
         try cache.recordInboxOwnership(network, engine: engine)
         let otherMail = Set(try cache.rows("SELECT id FROM network_inbox WHERE network<>?", [network]).compactMap { $0["id"] })
@@ -81,17 +107,23 @@ actor ReasonService {
         let knownNames = Set(locals.map(\.name) + pausedNames)
         for row in try cache.rows("SELECT DISTINCT local_session FROM network_events WHERE network=? ORDER BY local_session", [network]) {
             if let name = row["local_session"], !knownNames.contains(name) {
-                locals.append(LocalSession(name: name, key: "history:" + name, historyOnly: true))
+                locals.append(LocalSession(name: name, key: "history:" + name, doing: localTitlesByName[name], historyOnly: true))
             }
         }
         let conversations = try cache.rows("SELECT peer,MAX(at) AS recent FROM network_events WHERE network=? AND local_session=? GROUP BY peer ORDER BY recent DESC", [network, local]).compactMap { $0["peer"] }
+        let previousPeers = conversations.map { address in
+            let parts = address.split(separator: "/", maxSplits: 1).map(String.init)
+            let person = parts.first ?? "", name = parts.last ?? address
+            return NetworkSession(address: address, name: name, person: person, agent: "离线", status: "offline",
+                                  clientTitle: person == directory.person ? localTitlesByName[name] : nil)
+        }
         let page: MessagePage
         if readingNetwork == network, let start = readingFrom, start.local == local {
             page = try visibleHistory(network: network, local: local, peer: peer, startingAt: start)
         } else {
             page = try history(network: network, local: local, peer: peer)
         }
-        return Snapshot(directory: directory, localSessions: locals, conversations: conversations, messages: page.messages,
+        return Snapshot(directory: directory, localSessions: locals, conversations: previousPeers, messages: page.messages,
                         hasEarlier: page.hasEarlier, mirrorWarning: warning)
     }
 
@@ -193,14 +225,18 @@ actor ReasonService {
         guard try !pausedKeys(in: engine).contains(key) else { throw NetworkError("本机会话已退出 Network") }
         let directory = try directory()
         guard directory.liveLocalSession(named: local, agent: "codex") != nil else { throw LocalSenderOffline() }
-        guard directory.sessions.contains(where: { $0.person != directory.person && $0.address == to }) else { throw NetworkError("该队友会话已离线，请刷新后重新选择") }
+        guard let recipient = directory.sessions.first(where: {
+            $0.address == to && $0.available && directory.isRecipient($0, sendingAs: local)
+        }) else { throw NetworkError("收件会话暂不可用，请刷新后重新选择。") }
+        // Pin a local delivery to this Mac even if another device advertises the same address.
+        let destination = recipient.person == directory.person ? to + "@" + directory.machine : to
         guard try teamID(in: engine) == network else { throw NetworkError("当前 Network 已变化，请刷新后重试。") }
         var arguments = ["send", "--from", key]
         if notify { arguments.append("--notify") }
         for file in files { arguments += ["--file", file.path] }
         let result: String
         do {
-            result = try run(arguments + [to, "-"], input: content, timeout: 30)
+            result = try run(arguments + [destination, "-"], input: content, timeout: 30)
         } catch let error as NetworkError where error.message.hasPrefix("Error: this session isn't registered with Reason Network") {
             // The daemon lost the sender after the directory check and before dispatch.
             throw LocalSenderOffline()
@@ -223,7 +259,7 @@ actor ReasonService {
         let directory = try? directory()
         let participation = try? participationState()
         let discovered = try PersonalSessionCatalog(home: home).discover()
-        var sessions = Dictionary(discovered.sessions.map { ($0.id, $0) },
+        var sessions = Dictionary(discovered.sessions.map { ($0.agent == "codex" ? $0.id.lowercased() : $0.id, $0) },
                                   uniquingKeysWith: { $0.updated > $1.updated ? $0 : $1 })
         let enginePath = home.appendingPathComponent(".reason/network/network.db")
         let knownRecords: [[String: String]]
@@ -240,8 +276,11 @@ actor ReasonService {
                 $0.name == name && $0.agent == agent && $0.tier != "none"
             }
             let address = current?.id ?? directory.map { $0.person + "/" + name } ?? name
-            var item = sessions[key] ?? PersonalSession(id: key, agent: agent, title: row["doing"]?.nonEmpty ?? name,
+            let catalogKey = agent == "codex" ? key.lowercased() : key
+            var item = sessions[catalogKey] ?? PersonalSession(id: key, agent: agent, title: row["doing"]?.nonEmpty ?? name,
                                                          cwd: row["cwd"], updated: Date(timeIntervalSince1970: (Double(row["last_seen"] ?? "") ?? 0) / 1000))
+            item.id = key
+            if agent == "codex", item.nativeID != nil { item.nativeID = String(key.dropFirst("codex:".count)) }
             item.canManageParticipation = participation != nil
             if participation?.paused.contains(key) == true {
                 item.connection = .paused(address)
@@ -250,7 +289,7 @@ actor ReasonService {
             } else {
                 item.connection = .offline(address)
             }
-            sessions[key] = item
+            sessions[catalogKey] = item
         }
         return sessions.values.sorted { ($0.updated, $0.id) > ($1.updated, $1.id) }
     }
@@ -262,9 +301,10 @@ actor ReasonService {
             throw NetworkError("本机会话或 Network 已变化，请刷新后重新选择。")
         }
         if try directory().liveLocalSession(named: local.name, agent: "codex") != nil { return }
-        guard let session = try PersonalSessionCatalog(home: home).discover().sessions.first(where: { $0.id == local.key }) else {
+        guard var session = try PersonalSessionCatalog(home: home).discover().sessions.first(where: { $0.agent == "codex" && $0.id.lowercased() == local.key.lowercased() }) else {
             throw NetworkError("找不到这个本机 Codex 对话，请在 Codex 中打开后重试。")
         }
+        session.nativeID = String(local.key.dropFirst("codex:".count))
         _ = try registerPersonalSession(session)
     }
 
