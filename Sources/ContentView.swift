@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject private var model: NetworkModel
@@ -7,7 +8,17 @@ struct ContentView: View {
     @State private var composerHeight: CGFloat = 70
     @State private var editorHeight: CGFloat = 46
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
     @State private var composing = false
+    @State private var pickingFiles = false
+    @State private var pickerConversation = ""
+    @State private var preview: AttachmentPreview?
+    private struct AttachmentPreview: Identifiable {
+        let id = UUID()
+        let name: String
+        let text: String
+    }
+
 
     private var conversationFade: Animation? {
         reduceMotion ? nil : .easeInOut(duration: 0.20)
@@ -23,7 +34,34 @@ struct ContentView: View {
             splitView(narrowestDetail: narrowestDetail, sidebarLimit: max(185, sidebarLimit))
         }
         .frame(minWidth: 540, minHeight: 520)
+        .disabled(model.leavingNetwork)
+        .overlay {
+            if model.leavingNetwork {
+                ProgressView("正在退出 Network…").padding(18)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            }
+        }
         .task { await model.start() }
+        .fileImporter(isPresented: $pickingFiles, allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
+            switch result {
+            case .success(let urls): model.attach(urls, to: pickerConversation)
+            case .failure(let error):
+                if (error as NSError).code != NSUserCancelledError { model.notice = error.localizedDescription }
+            }
+        }
+        .sheet(item: $preview) { item in
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text(item.name).font(.headline).lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                    Button("完成") { preview = nil }.keyboardShortcut(.cancelAction)
+                }
+                ScrollView {
+                    Text(verbatim: item.text).font(.system(.body, design: .monospaced))
+                        .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }.padding(20).frame(minWidth: 440, minHeight: 300)
+        }
     }
 
     private func splitView(narrowestDetail: CGFloat, sidebarLimit: CGFloat) -> some View {
@@ -82,7 +120,7 @@ struct ContentView: View {
         .frame(maxWidth: maxWidth)
         .fixedSize(horizontal: true, vertical: true)
         .accessibilityElement(children: .combine)
-        .help([title, address].joined(separator: "\n"))
+        .help(peer?.titleHelp ?? address)
         .contentTransition(.opacity)
         .animation(conversationFade, value: model.selectedPeer)
     }
@@ -106,7 +144,15 @@ struct ContentView: View {
             ConversationHistory(messages: model.messages, sender: model.peer?.person ?? "",
                                 waiting: model.waitingForHistory && model.error == nil,
                                 hasPeer: !model.selectedPeer.isEmpty, failed: model.error != nil,
-                                sentCount: model.sentCount, overlayInset: composerHeight)
+                                sentCount: model.sentCount, overlayInset: composerHeight, hasEarlier: model.hasEarlier,
+                                earlier: model.loadEarlier, openAttachment: { file in
+                                    Task {
+                                        let text: String
+                                        do { text = try await model.readAttachment(file) }
+                                        catch { text = error.localizedDescription }
+                                        preview = AttachmentPreview(name: file.name, text: text)
+                                    }
+                                })
                 .id(model.conversationKey)
                 .transition(.opacity)
         }
@@ -132,30 +178,65 @@ struct ContentView: View {
                     .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)
                     .accessibilityAddTraits(.updatesFrequently)
             }
+            if !model.options.files.isEmpty {
+                ScrollView(.horizontal) {
+                    HStack(spacing: 8) {
+                        ForEach(model.options.files, id: \.self) { file in
+                            Button { model.options.files.removeAll { $0 == file } } label: {
+                                HStack(spacing: 5) {
+                                    Image(systemName: "paperclip")
+                                    Text(verbatim: file.lastPathComponent).lineLimit(1)
+                                    Image(systemName: "xmark").imageScale(.small)
+                                }
+                            }.buttonStyle(.bordered).controlSize(.small).help("移除 " + file.lastPathComponent)
+                        }
+                    }
+                }.scrollIndicators(.hidden)
+            }
             ZStack(alignment: .bottomTrailing) {
                 DraftField(text: Binding(get: { model.draft }, set: { model.draft = $0 }),
                            focused: $composing,
                            heightChanged: { editorHeight = $0 }, onSend: { Task { await model.send() } })
                     .id(model.conversationKey)
+                    .padding(.leading, 32)
                     .frame(height: editorHeight)
                     .frame(maxWidth: .infinity)
-                Button { Task { await model.send() } } label: {
-                    ZStack {
-                        Circle().fill(Color.primary.opacity(model.canSend ? 0.92 : 0.08))
-                        if model.sending {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Image(systemName: "arrow.up")
-                                .font(.system(size: 15, weight: .medium))
-                                .foregroundStyle(model.canSend ? Color(nsColor: .textBackgroundColor) : .secondary)
+                HStack {
+                    Menu {
+                        Button("添加文本附件…", systemImage: "paperclip") {
+                            pickerConversation = model.conversationKey
+                            pickingFiles = true
                         }
+                        Toggle("在对方电脑上弹窗提醒", isOn: $model.options.notify)
+                    } label: {
+                        Image(systemName: model.options.notify ? "bell.fill" : "plus")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(colorScheme == .dark ? Color(white: 0.92) : Color(white: 0.22))
+                            .frame(width: 28, height: 28)
+                            .contentShape(Rectangle())
                     }
-                    .frame(width: 28, height: 28)
+                    .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
+                    .disabled(model.selectedLocal.isEmpty || model.selectedPeer.isEmpty)
+                    .accessibilityLabel("附件与发送选项").help("附件与发送选项")
+                    Spacer()
+                    Button { Task { await model.send() } } label: {
+                        ZStack {
+                            Circle().fill(Color.primary.opacity(model.canSend ? 0.92 : 0.08))
+                            if model.sending {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Image(systemName: "arrow.up")
+                                    .font(.system(size: 15, weight: .medium))
+                                    .foregroundStyle(model.canSend ? Color(nsColor: .textBackgroundColor) : .secondary)
+                            }
+                        }
+                        .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.plain).disabled(!model.canSend)
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .help("发送消息（Enter），换行（Shift＋Enter）").accessibilityLabel(model.sending ? "发送中" : "发送消息")
                 }
-                .padding(.trailing, 12).padding(.bottom, 9)
-                .buttonStyle(.plain).disabled(!model.canSend)
-                .keyboardShortcut(.return, modifiers: .command)
-                .help("发送消息（Enter），换行（Shift＋Enter）").accessibilityLabel(model.sending ? "发送中" : "发送消息")
+                .padding(.horizontal, 12).padding(.bottom, 9)
             }
             .modifier(ComposerGlass(focused: composing))
             .animation(reduceMotion ? nil : .smooth(duration: 0.24), value: editorHeight)
@@ -458,7 +539,17 @@ private struct ConversationSidebar: View {
     @EnvironmentObject private var model: NetworkModel
 
     @State private var query = ""
-    @State private var showPersonal = false
+    @EnvironmentObject private var setup: SetupModel
+    private enum Page: Int, Identifiable {
+        case personal, overview
+        var id: Self { self }
+    }
+    @State private var page: Page?
+    @State private var settingsOpen = false
+    @State private var confirmingLeave = false
+    @State private var leaveTarget: Directory?
+    @State private var leaveFailure: String?
+
     @State private var collapsed: Set<[String]> = []
     @FocusState private var searchFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -486,7 +577,7 @@ private struct ConversationSidebar: View {
                 Menu {
                     Picker("本机会话", selection: $model.selectedLocal) {
                         ForEach(model.locals) { session in
-                            Text(session.title).tag(session.name)
+                            Text(session.title + (session.historyOnly ? " · 历史记录" : "")).tag(session.name)
                         }
                     }
                     .pickerStyle(.inline)
@@ -518,7 +609,7 @@ private struct ConversationSidebar: View {
                 }
                 .padding(.horizontal, 9).frame(height: 28)
                 .background(.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 7))
-                Button { showPersonal = true } label: {
+                Button { page = .personal } label: {
                     Label("我的会话", systemImage: "person.crop.rectangle.stack")
                         .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 6).contentShape(Rectangle())
                 }.buttonStyle(.plain).keyboardShortcut("5")
@@ -560,9 +651,74 @@ private struct ConversationSidebar: View {
                         .font(.callout).foregroundStyle(.secondary).padding(.top)
                 }
             }
+            HStack {
+                Button { settingsOpen.toggle() } label: {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 15))
+                        .frame(width: 30, height: 30)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .popover(isPresented: $settingsOpen, arrowEdge: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Button {
+                            settingsOpen = false
+                            page = .overview
+                        } label: {
+                            Label("概览", systemImage: "square.grid.2x2")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(6).contentShape(Rectangle())
+                        }
+                        Button {
+                            settingsOpen = false
+                            setup.presented = true
+                        } label: {
+                            Label("环境配置", systemImage: "slider.horizontal.3")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(6).contentShape(Rectangle())
+                        }
+                        Divider()
+                        Button(role: .destructive) {
+                            settingsOpen = false
+                            leaveTarget = model.directory
+                            confirmingLeave = true
+                        } label: {
+                            Label("退出当前 Network", systemImage: "rectangle.portrait.and.arrow.right")
+                                .foregroundStyle(.red)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(6).contentShape(Rectangle())
+                        }
+                        .disabled(model.directory?.networkID == nil || model.sending || model.changingSession != nil)
+                    }
+                    .buttonStyle(.plain).padding(8).frame(width: 180)
+                }
+                .accessibilityLabel("设置")
+                .help("设置")
+                Spacer()
+            }
+            .padding(.leading, 10)
+            .padding(.vertical, 5)
         }
-        .sheet(isPresented: $showPersonal) {
-            PersonalSessionsView().frame(minWidth: 540, idealWidth: 620, minHeight: 420, idealHeight: 520)
+        .alert("退出当前 Network？", isPresented: $confirmingLeave, presenting: leaveTarget) { target in
+            Button("取消", role: .cancel) {}
+            Button("退出 Network", role: .destructive) {
+                guard let id = target.networkID else { return }
+                Task {
+                    do { try await model.leaveNetwork(id) }
+                    catch { leaveFailure = SetupInput.redacted(error.localizedDescription) }
+                }
+            }
+        } message: { target in
+            Text("这台 Mac 上的所有会话都会与「" + (target.team ?? "当前 Network") + "」断开。本机聊天记录会保留，重新加入同一个 Network 后可以继续查看。")
+        }
+        .alert("无法退出 Network", isPresented: Binding(get: { leaveFailure != nil }, set: { if !$0 { leaveFailure = nil } })) {
+            Button("好", role: .cancel) {}
+        } message: { Text(leaveFailure ?? "") }
+        .sheet(item: $page) { destination in
+            switch destination {
+            case .overview: NetworkOverview()
+            case .personal: PersonalSessionsView().frame(minWidth: 540, idealWidth: 620, minHeight: 420, idealHeight: 520)
+            }
         }
     }
     private func peerButton(_ session: NetworkSession) -> some View {
@@ -581,7 +737,7 @@ private struct ConversationSidebar: View {
             .padding(.leading, 36).padding(.trailing, 5).padding(.vertical, 5)
             .background(.primary.opacity(selected ? 0.10 : 0), in: RoundedRectangle(cornerRadius: 7))
             .contentShape(Rectangle())
-        }.buttonStyle(.plain).help(session.address)
+        }.buttonStyle(.plain).help(session.titleHelp)
             .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
@@ -594,13 +750,17 @@ private struct ConversationHistory: View {
     let failed: Bool
     let sentCount: Int
     let overlayInset: CGFloat
+    let hasEarlier: Bool
+    let earlier: (Message) async throws -> MessagePage
+    let openAttachment: (MessageAttachment) -> Void
     @State private var pending = false
     @State private var latestRequest = 0
 
     var body: some View {
         ZStack(alignment: .top) {
             NativeTranscript(messages: messages, sender: sender, sentCount: sentCount,
-                             latestRequest: latestRequest, pendingChanged: { pending = $0 })
+                             latestRequest: latestRequest, pendingChanged: { pending = $0 },
+                             hasEarlier: hasEarlier, earlier: earlier, openAttachment: openAttachment)
                 .overlay(alignment: .bottom) {
                     if pending {
                         Button("查看最新消息", systemImage: "arrow.down") { latestRequest += 1 }
@@ -633,10 +793,16 @@ private final class TranscriptRecord {
         self.message = message
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineSpacing = 6
-        text = NSAttributedString(string: message.body.isEmpty ? " " : message.body, attributes: [
+        let body = NSMutableAttributedString(string: message.body.isEmpty ? " " : message.body, attributes: [
             .font: NSFont.systemFont(ofSize: 14, weight: .light),
             .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph
         ])
+        for (index, file) in message.attachments.enumerated() {
+            var style: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.secondaryLabelColor]
+            if file.directory != nil { style[.link] = URL(string: "reason-attachment:\(index)") }
+            body.append(NSAttributedString(string: "\n📎 " + file.name, attributes: style))
+        }
+        text = body
         naturalWidth = ceil(text.size().width)
         container.lineFragmentPadding = 0
         layout.addTextContainer(container)
@@ -646,7 +812,16 @@ private final class TranscriptRecord {
     var rowHeight: CGFloat { 19 + bodySize.height + 24 + (message.delivery.isEmpty ? 0 : 18) + 22 }
 }
 
-private final class TranscriptCell: NSTableCellView {
+private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
+    var openAttachment: ((MessageAttachment) -> Void)?
+    func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        if let record, let url = link as? URL, url.scheme == "reason-attachment",
+           let index = Int(url.absoluteString.dropFirst("reason-attachment:".count)),
+           record.message.attachments.indices.contains(index) {
+            openAttachment?(record.message.attachments[index])
+        }
+        return true
+    }
     // Match the height measurer and character-based scroll anchors. The default
     // TextKit 2 view otherwise switches engines when an anchor reads layoutManager.
     let text = TranscriptTextView(usingTextLayoutManager: false)
@@ -663,6 +838,7 @@ private final class TranscriptCell: NSTableCellView {
         super.init(frame: frameRect)
         bubble.wantsLayer = true
         bubble.layer?.cornerRadius = 13
+        text.delegate = self
         text.isEditable = false
         text.isSelectable = true
         text.drawsBackground = false
@@ -744,6 +920,9 @@ private struct NativeTranscript: NSViewRepresentable {
     let sentCount: Int
     let latestRequest: Int
     let pendingChanged: (Bool) -> Void
+    let hasEarlier: Bool
+    let earlier: (Message) async throws -> MessagePage
+    let openAttachment: (MessageAttachment) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
     func makeNSView(context: Context) -> NSScrollView { context.coordinator.scroll }
@@ -769,16 +948,52 @@ private struct NativeTranscript: NSViewRepresentable {
         private var resizeEnd: Task<Void, Never>?
         private var pendingChanged: ((Bool) -> Void)?
         private var publishedPending = false
+        private var latestHasEarlier = false
+        private var pageHasEarlier = false
+        private var loadingEarlier = false
+        private var earlier: ((Message) async throws -> MessagePage)?
+        private var openAttachment: ((MessageAttachment) -> Void)?
+        private let earlierButton = NSButton(title: "加载更早的消息", target: nil, action: nil)
+        private func updateEarlierButton() {
+            earlierButton.isHidden = !(reading.expanded ? pageHasEarlier : latestHasEarlier)
+            earlierButton.isEnabled = !loadingEarlier
+        }
+        @objc private func loadEarlier() {
+            guard let first = reading.messages.first, !loadingEarlier, let earlier else { return }
+            loadingEarlier = true
+            updateEarlierButton()
+            Task { [weak self] in
+                do {
+                    let page = try await earlier(first)
+                    guard let self else { return }
+                    if self.reading.messages.first?.rowKey == first.rowKey {
+                        let anchor = self.capture()
+                        self.reading.prepend(page, before: first.rowKey)
+                        self.pageHasEarlier = page.hasEarlier
+                        if page.messages.isEmpty { self.latestHasEarlier = false }
+                        self.applyMessages(anchor: anchor)
+                    }
+                } catch {
+                    if let window = self?.scroll.window { _ = await NSAlert(error: error).beginSheetModal(for: window) }
+                }
+                self?.loadingEarlier = false
+                self?.updateEarlierButton()
+            }
+        }
 
         private struct Anchor {
             var bottom: Bool
-            var id: String?
+            var id: Message.RowKey?
             var character: Int?
             var screenY: CGFloat = 0
         }
 
         override init() {
             super.init()
+            earlierButton.isBordered = false
+            earlierButton.font = .systemFont(ofSize: 12)
+            earlierButton.target = self
+            earlierButton.action = #selector(loadEarlier)
             table.addTableColumn(column)
             table.headerView = nil
             table.style = .plain
@@ -838,6 +1053,10 @@ private struct NativeTranscript: NSViewRepresentable {
         }
 
         func update(_ value: NativeTranscript) {
+            earlier = value.earlier
+            openAttachment = value.openAttachment
+            latestHasEarlier = value.hasEarlier
+            defer { updateEarlierButton() }
             pendingChanged = value.pendingChanged
             let forceLatest = sentCount.map { $0 != value.sentCount } == true ||
                 latestRequest.map { $0 != value.latestRequest } == true
@@ -869,6 +1088,7 @@ private struct NativeTranscript: NSViewRepresentable {
 
         private func showLatest() {
             reading.show(latest)
+            updateEarlierButton()
             applyMessages(anchor: Anchor(bottom: true))
             publishPending()
         }
@@ -878,9 +1098,9 @@ private struct NativeTranscript: NSViewRepresentable {
             guard !updating else { return }
             updating = true
             defer { updating = false }
-            let old = Dictionary(uniqueKeysWithValues: records.map { ($0.message.id, $0) })
+            let old = Dictionary(uniqueKeysWithValues: records.map { ($0.message.rowKey, $0) })
             records = reading.messages.map { message in
-                if let record = old[message.id], record.message == message { return record }
+                if let record = old[message.rowKey], record.message == message { return record }
                 return TranscriptRecord(message)
             }
             prepareSizes()
@@ -893,10 +1113,10 @@ private struct NativeTranscript: NSViewRepresentable {
         private func resize(to newWidth: CGFloat) {
             let newWidth = floor(newWidth)
             guard !updating, newWidth > 0, abs(width - newWidth) >= 1 else { return }
-            var selection: (id: String, range: NSRange)?
+            var selection: (id: Message.RowKey, range: NSRange)?
             if let text = table.window?.firstResponder as? TranscriptTextView,
                let record = record(at: table.row(for: text)) {
-                selection = (record.message.id, text.selectedRange())
+                selection = (record.message.rowKey, text.selectedRange())
             }
             let anchor = resizeAnchor ?? capture()
             resizeAnchor = anchor
@@ -918,7 +1138,7 @@ private struct NativeTranscript: NSViewRepresentable {
                 table.layoutSubtreeIfNeeded()
                 configureVisibleCells()
                 restore(anchor)
-                if let selection, let index = records.firstIndex(where: { $0.message.id == selection.id }),
+                if let selection, let index = records.firstIndex(where: { $0.message.rowKey == selection.id }),
                    let cell = table.view(atColumn: 0, row: index + 1, makeIfNecessary: true) as? TranscriptCell {
                     cell.text.setSelectedRange(selection.range)
                     table.window?.makeFirstResponder(cell.text)
@@ -966,7 +1186,7 @@ private struct NativeTranscript: NSViewRepresentable {
                 row = min(records.count, row + 1)
             }
             guard let record = record(at: row) else { return Anchor(bottom: false) }
-            var anchor = Anchor(bottom: false, id: record.message.id)
+            var anchor = Anchor(bottom: false, id: record.message.rowKey)
             anchor.screenY = table.rect(ofRow: row).minY - visible.minY
             if let cell = table.view(atColumn: 0, row: row, makeIfNecessary: false) as? TranscriptCell,
                let layout = cell.text.layoutManager, let container = cell.text.textContainer {
@@ -986,7 +1206,7 @@ private struct NativeTranscript: NSViewRepresentable {
             var origin = scroll.contentView.bounds.origin
             if anchor.bottom {
                 origin.y = max(0, table.bounds.height - scroll.contentSize.height)
-            } else if let index = records.firstIndex(where: { $0.message.id == anchor.id }) {
+            } else if let index = records.firstIndex(where: { $0.message.rowKey == anchor.id }) {
                 let row = index + 1
                 origin.y = table.rect(ofRow: row).minY - anchor.screenY
                 if let character = anchor.character,
@@ -1011,13 +1231,22 @@ private struct NativeTranscript: NSViewRepresentable {
 
         func numberOfRows(in tableView: NSTableView) -> Int { records.count + 2 }
         func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-            if row == 0 { return 24 }
+            if row == 0 { return 28 }
             return record(at: row)?.rowHeight ?? 70
         }
         func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+            if row == 0 {
+                let header = NSView()
+                header.addSubview(earlierButton)
+                earlierButton.translatesAutoresizingMaskIntoConstraints = false
+                NSLayoutConstraint.activate([earlierButton.centerXAnchor.constraint(equalTo: header.centerXAnchor),
+                                             earlierButton.centerYAnchor.constraint(equalTo: header.centerYAnchor)])
+                return header
+            }
             let identifier = NSUserInterfaceItemIdentifier("message-cell")
             let cell = tableView.makeView(withIdentifier: identifier, owner: self) as? TranscriptCell ?? TranscriptCell()
             cell.identifier = identifier
+            cell.openAttachment = openAttachment
             cell.configure(record(at: row), sender: sender, inset: inset)
             return cell
         }
@@ -1030,14 +1259,13 @@ struct StatusView: View {
     @State private var exitSupported = false
     @State private var exitStatus: String?
     @State private var diagnostics = false
-    @State private var copyingInvite = false
-    @State private var inviteFeedback: String?
+    @State private var viewportHeight: CGFloat = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var refreshing = false
     @State private var refreshResult: String?
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 11) {
                 HStack(spacing: 14) {
                     Text("本机会话").font(.system(size: 12))
                     VStack(alignment: .leading, spacing: 4) {
@@ -1055,7 +1283,7 @@ struct StatusView: View {
                         Text((model.directory?.person ?? "") + "/" + model.selectedLocal).font(.system(size: 11, design: .monospaced)).lineLimit(2)
                     }
                 }
-                .foregroundStyle(.primary).padding(13)
+                .foregroundStyle(.primary).padding(10)
                 .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
                 if let tier = model.tier {
                     Label(tier == "push" ? "即时推送" : tier == "turn" ? "回合接收" : "手动接收", systemImage: tier == "push" ? "bolt.horizontal" : "arrow.down.circle")
@@ -1104,23 +1332,7 @@ struct StatusView: View {
                 }
                 .font(.system(size: 12))
                 .foregroundStyle(.primary)
-                HStack {
-                    Button("复制邀请链接", systemImage: "link") {
-                        copyingInvite = true
-                        inviteFeedback = nil
-                        Task {
-                            defer { copyingInvite = false }
-                            do {
-                                let link = try await model.invitation()
-                                NSPasteboard.general.clearContents()
-                                inviteFeedback = NSPasteboard.general.setString(link, forType: .string) ? "已复制" : "复制失败"
-                            } catch { inviteFeedback = "获取失败，请检查连接" }
-                        }
-                    }.buttonStyle(.plain).disabled(copyingInvite)
-                    Spacer()
-                    Text(copyingInvite ? "获取中…" : inviteFeedback ?? "").foregroundStyle(.secondary)
-                        .accessibilityAddTraits(.updatesFrequently)
-                }.font(.system(size: 12))
+                CopyInvitationButton()
                 Button("环境配置", systemImage: "slider.horizontal.3") { setup.presented = true }
                     .buttonStyle(.plain).font(.system(size: 12))
                 VStack(alignment: .leading, spacing: 4) {
@@ -1133,26 +1345,49 @@ struct StatusView: View {
                         }
                     }
                     .buttonStyle(.plain)
-                    .disabled(!exitSupported || model.own == nil || model.changingSession != nil)
+                    .disabled(!exitSupported || model.own?.historyOnly != false || model.changingSession != nil)
                     if let exitStatus {
                         Text(exitStatus).font(.caption).foregroundStyle(.secondary)
                             .accessibilityAddTraits(.updatesFrequently)
                     }
                 }.font(.system(size: 12))
-                DisclosureGroup("诊断", isExpanded: $diagnostics) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        if model.diagnosing { ProgressView().controlSize(.small) }
-                        Text(model.doctor.nonEmpty ?? "尚未获取诊断").font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
-                        if let warning = model.mirrorWarning { Text(warning).font(.system(size: 11)).foregroundStyle(.secondary) }
-                        Button("重新检查", systemImage: "arrow.clockwise") { Task { await model.diagnose() } }.disabled(model.diagnosing)
-                    }.padding(.top, 10)
+                DisclosureGroup(isExpanded: $diagnostics) {
+                    if !model.doctor.isEmpty {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text(model.doctor).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                            if let warning = model.mirrorWarning { Text(warning).font(.system(size: 11)).foregroundStyle(.secondary) }
+                            Button("重新检查", systemImage: "arrow.clockwise") { Task { await model.diagnose() } }
+                                .disabled(model.diagnosing)
+                        }.padding(.top, 8)
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text("诊断")
+                        if diagnostics && model.diagnosing {
+                            ProgressView().controlSize(.mini)
+                                .accessibilityLabel("正在检查")
+                        }
+                    }
+                    .frame(minHeight: 16)
                 }
                 .font(.system(size: 12)).foregroundStyle(.secondary)
+                .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: diagnostics)
                 .onChange(of: diagnostics) { _, expanded in if expanded { Task { await model.diagnose() } } }
             }
-            .padding(22)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .onGeometryChange(for: CGFloat.self) { ceil($0.size.height) } action: { height in
+                let target = min(height, StatusViewport.maximumHeight)
+                guard target > 0, viewportHeight != target else { return }
+                withAnimation(viewportHeight > 0 && !reduceMotion ? .smooth(duration: 0.24) : nil) {
+                    viewportHeight = target
+                }
+            }
         }
-        .frame(width: 390, height: diagnostics ? 600 : min(580, 350 + CGFloat(model.directory?.machines.count ?? 0) * 65))
+        .scrollBounceBehavior(.basedOnSize)
+        .frame(width: 340)
+        .modifier(StatusViewport(height: viewportHeight))
+        .fixedSize(horizontal: false, vertical: true)
         .background(Color(nsColor: .windowBackgroundColor))
         .task {
             do {
@@ -1160,7 +1395,23 @@ struct StatusView: View {
                 if !exitSupported { exitStatus = "当前后台不支持单独退出会话" }
             } catch { exitStatus = "无法连接会话管理服务" }
         }
-        .animation(reduceMotion ? nil : .easeInOut(duration: 0.22), value: diagnostics)
+    }
+}
+
+// Feed the native popover the interpolated viewport size on each SwiftUI layout pass.
+private struct StatusViewport: AnimatableModifier {
+    static let maximumHeight: CGFloat = 480
+    var height: CGFloat
+    var animatableData: CGFloat {
+        get { height }
+        set { height = newValue }
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .frame(height: height > 0 ? height : nil, alignment: .top)
+            .frame(maxHeight: Self.maximumHeight, alignment: .top)
+            .transaction { $0.animation = nil }
     }
 }
 

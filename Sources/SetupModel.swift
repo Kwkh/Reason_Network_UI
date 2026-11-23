@@ -18,6 +18,15 @@ final class SetupModel: ObservableObject {
         if !snapshot.joined { return 1 }
         return 2
     }
+    func didLeave() {
+        snapshot.joined = false
+        snapshot.team = nil
+        snapshot.sessions = 0
+        snapshot.issue = nil
+        presented = false
+        invitation = ""
+        error = nil
+    }
     func check() async {
         guard !busy else { return }
         busy = true; activity = "正在检查…"

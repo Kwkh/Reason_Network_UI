@@ -136,21 +136,50 @@ struct PersonalSessionCatalog {
         return (sessions, hidden)
     }
 
-    private func codex(excluding hidden: inout Set<String>) throws -> [PersonalSession] {
+    private func codexDatabase() throws -> SQLiteStore? {
         let root = home.appendingPathComponent(".codex", isDirectory: true)
         let states = contents(root).compactMap { url -> (Int, URL)? in
             let name = url.deletingPathExtension().lastPathComponent
             guard url.pathExtension == "sqlite", name.hasPrefix("state_"), let version = Int(name.dropFirst(6)) else { return nil }
             return (version, url)
         }.sorted { $0.0 > $1.0 }
-        guard let (_, dbURL) = states.first else { return [] }
-        let db = try SQLiteStore(dbURL, readOnly: true)
+        guard let (_, dbURL) = states.first else { return nil }
+        return try SQLiteStore(dbURL, readOnly: true)
+    }
+
+    private func titleColumn(_ fields: Set<String>) -> String {
+        fields.contains("name") ? "COALESCE(NULLIF(name,''),title) AS title" : "title"
+    }
+
+    /// Read only the registered Codex threads during the periodic network refresh.
+    func codexTitles(for keys: [String]) throws -> [String: String] {
+        let ids = keys.compactMap { key -> String? in
+            guard key.hasPrefix("codex:") else { return nil }
+            return String(key.dropFirst(6))
+        }
+        guard !ids.isEmpty, let db = try codexDatabase() else { return [:] }
+        let fields = Set(try db.rows("PRAGMA table_info(threads)").compactMap { $0["name"] })
+        guard fields.contains("title") else { return [:] }
+        var titles = [String: String]()
+        for offset in stride(from: 0, to: ids.count, by: 500) {
+            let batch = Array(ids[offset..<min(offset + 500, ids.count)])
+            let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ",")
+            for row in try db.rows("SELECT id, \(titleColumn(fields)) FROM threads WHERE id IN (\(placeholders))", batch) {
+                if let id = row["id"], let title = row["title"]?.nonEmpty { titles["codex:" + id] = title }
+            }
+        }
+        return titles
+    }
+
+    private func codex(excluding hidden: inout Set<String>) throws -> [PersonalSession] {
+        let root = home.appendingPathComponent(".codex", isDirectory: true)
+        guard let db = try codexDatabase() else { return [] }
         let fields = Set(try db.rows("PRAGMA table_info(threads)").compactMap { $0["name"] })
         guard ["id", "title", "cwd", "rollout_path", "updated_at"].allSatisfy(fields.contains) else {
             throw NetworkError("当前 Codex 会话索引格式无法读取。")
         }
         let archived = fields.contains("archived") ? "archived" : "0 AS archived"
-        let title = fields.contains("name") ? "COALESCE(NULLIF(name,''),title) AS title" : "title"
+        let title = titleColumn(fields)
         let source = fields.contains("source") ? "source" : "NULL AS source"
         let kind = fields.contains("thread_source") ? "thread_source" : "NULL AS thread_source"
         let projects = try CodexProjects(root: root, db: db)
@@ -205,7 +234,11 @@ struct PersonalSessionCatalog {
                 guard url.pathExtension == "jsonl", UUID(uuidString: id) != nil else { return nil }
                 let records = metadataRecords(in: url)
                 let cwd = records.compactMap { $0["cwd"] as? String }.first
-                let title = records.reversed().compactMap { $0["customTitle"] as? String ?? $0["summary"] as? String ?? $0["slug"] as? String }.first
+                // A later message can repeat the generated slug after the user has renamed the chat.
+                func latest(_ field: String) -> String? {
+                    records.reversed().lazy.compactMap { ($0[field] as? String)?.nonEmpty }.first
+                }
+                let title = latest("customTitle") ?? latest("aiTitle") ?? latest("summary") ?? latest("slug")
                 return PersonalSession(id: "claude-code:" + id, agent: "claude-code", title: title?.nonEmpty ?? fallbackTitle(cwd, id),
                                        cwd: cwd, updated: modified(url), nativeID: id)
             }

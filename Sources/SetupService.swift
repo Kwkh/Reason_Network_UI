@@ -185,6 +185,7 @@ actor SetupService: SetupServicing {
         let before = await inspect()
         guard before.issue == nil else { throw NetworkError("尚无法确认此机器的 Network 状态，请先重新检查。") }
         guard !before.joined else { throw NetworkError("此机器已经加入 Network。请返回聊天，无需重复加入。") }
+        try SQLiteStore.prepareNetworkJoin(home: home)
         _ = try await SetupCommand.run(executable, ["join", ticket, "--as", person, "--no-setup", "--json"], home: home, timeout: 120).checked()
         let after = await inspect()
         guard after.joined else { throw NetworkError("尚未确认加入成功，请重新检查。邀请方需要保持在线。") }

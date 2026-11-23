@@ -22,6 +22,11 @@ struct AppRootView: View {
             await setup.check()
             entered = setup.snapshot.ready || (setup.snapshot.installed && setup.snapshot.background && setup.snapshot.wired && setup.snapshot.issue != nil)
         }
+        .onChange(of: network.departureCount) {
+            entered = false
+            setup.didLeave()
+            Task { await setup.check() }
+        }
         .sheet(isPresented: $setup.presented) {
             SetupView(model: setup) { setup.presented = false }
                 .frame(width: 540, height: 590)
@@ -159,8 +164,9 @@ struct SetupView: View {
                     }
                 }.buttonStyle(.plain)
             }
-            Button("进入聊天", action: completion).buttonStyle(.borderedProminent)
-                .controlSize(.large).tint(.primary).disabled(!model.snapshot.ready || model.busy)
+            Button("进入聊天", action: completion)
+                .buttonStyle(SetupActionStyle())
+                .disabled(!model.snapshot.ready || model.busy)
         }
     }
     private func checkRow(_ title: String, complete: Bool) -> some View {
@@ -174,7 +180,27 @@ struct SetupView: View {
     }
     private func action(_ title: String, operation: @escaping () async -> Void) -> some View {
         Button(title) { Task { await operation() } }
-            .buttonStyle(.borderedProminent).controlSize(.large).tint(.primary)
+            .buttonStyle(SetupActionStyle())
             .disabled(model.busy)
+    }
+}
+
+private struct SetupActionStyle: ButtonStyle {
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.isEnabled) private var enabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        let dark = scheme == .dark
+        let ink: Color = dark ? .black : .white
+        let fill: Color = dark ? .white : .black
+        configuration.label
+            .font(.body.weight(.medium))
+            .padding(.horizontal, 15)
+            .frame(minHeight: 28)
+            .foregroundStyle(enabled ? ink : Color.secondary)
+            .background {
+                Capsule().fill(enabled ? fill.opacity(configuration.isPressed ? 0.78 : 0.94) : Color.primary.opacity(0.09))
+            }
+            .contentShape(Capsule())
     }
 }
