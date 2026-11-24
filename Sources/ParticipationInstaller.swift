@@ -117,7 +117,7 @@ struct ParticipationInstaller: Sendable {
         let socket = SessionSocket(socketURL: NetworkPaths.socket(in: root))
         if !isPrimary {
             guard let env = updated["EnvironmentVariables"] as? [String: String], env["REASON_NETWORK_HOME"] == root.path,
-                  env["REASON_NETWORK_LOCAL_PARTICIPATION"] == "1" else { throw NetworkError("无法识别工作区服务 " + name) }
+                  env["REASON_NETWORK_LOCAL_PARTICIPATION"] == "1" else { throw NetworkError(localizing: { L10n.text("无法识别工作区服务 ") + name }) }
         }
         if (updated["ProgramArguments"] as? [String])?.first == daemon.path && (!isPrimary || configured && probe(home)) { return }
         updated["ProgramArguments"] = [daemon.path, "daemon", "--service"]
@@ -152,7 +152,7 @@ struct ParticipationInstaller: Sendable {
                 try original.write(to: file, options: .atomic)
                 if loaded { try await bootstrap(file) }
             } catch {
-                throw NetworkError("后台切换失败，恢复服务时遇到错误。原配置备份位于 " + backup.path)
+                throw NetworkError(localizing: { L10n.text("后台切换失败，恢复服务时遇到错误。原配置备份位于 ") + backup.path })
             }
             throw failure
         }

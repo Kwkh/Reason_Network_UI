@@ -6,7 +6,7 @@ final class SetupModel: ObservableObject {
     @Published private(set) var checked = false
     @Published private(set) var busy = false
     @Published private(set) var activity = "正在检查…"
-    @Published private(set) var error: String?
+    @Published private(set) var error: InterfaceMessage?
     @Published var presented = false
     @Published var invitation = ""
     @Published var name = NSUserName()
@@ -46,7 +46,7 @@ final class SetupModel: ObservableObject {
     func join() async {
         // Validate before starting any process. Never persist invite credentials.
         do { _ = try SetupInput.invitation(invitation); _ = try SetupInput.name(name) }
-        catch { self.error = error.localizedDescription; return }
+        catch { self.error = InterfaceMessage { error.localizedDescription }; return }
         let invite = invitation, person = name
         await perform("正在加入 Network…") {
             try await self.service.join(invitation: invite, name: person)
@@ -58,7 +58,7 @@ final class SetupModel: ObservableObject {
         busy = true; activity = label; error = nil
         defer { busy = false }
         do { try await operation() }
-        catch { self.error = SetupInput.redacted(error.localizedDescription) }
+        catch { self.error = InterfaceMessage { SetupInput.redacted(error.localizedDescription) } }
         // Always check after failure too: joining may have succeeded before a timeout.
         snapshot = await service.inspect()
         checked = true

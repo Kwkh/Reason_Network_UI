@@ -48,26 +48,44 @@ struct SetupView: View {
     @State private var help = false
     @State private var creating = false
     @State private var joining = false
-    @State private var joinError: String?
+    @State private var joinError: InterfaceMessage?
     @EnvironmentObject private var workspaces: WorkspaceController
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 28) {
                 VStack(alignment: .leading, spacing: 12) {
-                    Image(systemName: "bubble.left.and.text.bubble.right")
-                        .font(.system(size: 32, weight: .light)).accessibilityHidden(true)
+                    HStack {
+                        Image(systemName: "bubble.left.and.text.bubble.right")
+                            .font(.system(size: 32, weight: .light)).accessibilityHidden(true)
+                        Spacer()
+                        Menu {
+                            Picker(L10n.text("语言"), selection: Binding(
+                                get: { L10n.shared.preference }, set: { L10n.shared.preference = $0 }
+                            )) {
+                                ForEach(AppLanguage.allCases, id: \.self) { language in
+                                    Text(language.title).tag(language)
+                                }
+                            }
+                            .pickerStyle(.inline).labelsHidden()
+                        } label: {
+                            Label(L10n.shared.preference.title, systemImage: "globe")
+                        }
+                        .menuStyle(.borderlessButton).fixedSize()
+                        .accessibilityLabel(L10n.text("语言"))
+                        .accessibilityValue(L10n.shared.preference.title)
+                    }
                     Text("Reason Network").font(.system(size: 27, weight: .semibold))
-                    Text(model.snapshot.ready ? "已经准备就绪" : "连接你的协作会话")
+                    Text(model.snapshot.ready ? L10n.text("已经准备就绪") : L10n.text("连接你的协作会话"))
                         .font(.system(size: 14)).foregroundStyle(.secondary)
                         .contentTransition(.numericText())
                 }
                 HStack(spacing: 18) {
-                    stage("环境", number: 0)
+                    stage(L10n.text("环境"), number: 0)
                     Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(.tertiary)
                     stage("Network", number: 1)
                     Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(.tertiary)
-                    stage("会话", number: 2)
+                    stage(L10n.text("会话"), number: 2)
                 }
                 .font(.system(size: 12))
                 VStack(alignment: .leading, spacing: 18) {
@@ -79,17 +97,17 @@ struct SetupView: View {
                 if model.busy {
                     HStack(spacing: 10) {
                         ProgressView().controlSize(.small)
-                        Text(model.activity).font(.system(size: 12)).foregroundStyle(.secondary)
+                        Text(L10n.text(model.activity)).font(.system(size: 12)).foregroundStyle(.secondary)
                             .contentTransition(.numericText())
                     }.accessibilityElement(children: .combine)
                 }
                 if let error = model.error {
-                    Label(error, systemImage: "exclamationmark.circle")
+                    Label(error.text, systemImage: "exclamationmark.circle")
                         .font(.system(size: 12)).foregroundStyle(.red).textSelection(.enabled)
                 }
                 if let issue = model.snapshot.issue {
                     DisclosureGroup("连接详情", isExpanded: $details) {
-                        Text(issue).font(.system(size: 11, design: .monospaced))
+                        Text(issue.text).font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(.secondary).textSelection(.enabled).padding(.top, 8)
                     }.font(.system(size: 12))
                 }
@@ -128,18 +146,18 @@ struct SetupView: View {
     }
     private var dependencies: some View {
         VStack(alignment: .leading, spacing: 18) {
-            checkRow("Reason 命令行工具", complete: model.snapshot.installed)
-            checkRow("逐会话管理后台", complete: model.snapshot.background && model.snapshot.participation)
-            checkRow("Codex 接入", complete: model.snapshot.wired)
+            checkRow(L10n.text("Reason 命令行工具"), complete: model.snapshot.installed)
+            checkRow(L10n.text("逐会话管理后台"), complete: model.snapshot.background && model.snapshot.participation)
+            checkRow(L10n.text("Codex 接入"), complete: model.snapshot.wired)
             if !model.snapshot.codex {
                 Text("请先安装并打开 Codex，再回来继续配置。")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
                 Link("获取 Codex", destination: URL(string: "https://chatgpt.com/download/")!)
             }
             if model.snapshot.installed {
-                action("配置后台与会话") { await model.configure() }
+                action(L10n.text("配置后台与会话")) { await model.configure() }
             } else {
-                action("安装并配置") { await model.install() }
+                action(L10n.text("安装并配置")) { await model.install() }
             }
             Text("安装 App 内置的兼容后台，并为已安装的代理配置接入。")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
@@ -151,11 +169,11 @@ struct SetupView: View {
                 .lineLimit(1...3).networkFormField()
                 .accessibilityLabel("Network 邀请链接或一次性代码")
             NetworkPersonField(person: $model.name)
-            if model.snapshot.needsBackendUpdate { action("更新兼容后台") { await model.configure() } }
+            if model.snapshot.needsBackendUpdate { action(L10n.text("更新兼容后台")) { await model.configure() } }
             Button("新建 Network") { creating = true }
                 .sheet(isPresented: $creating) { WorkspaceForm(action: .create, person: model.name, onComplete: completion) }
-            if let joinError { Text(joinError).font(.callout).foregroundStyle(.red) }
-            action(joining ? "正在加入…" : "加入 Network") {
+            if let joinError { Text(joinError.text).font(.callout).foregroundStyle(.red) }
+            action(joining ? L10n.text("正在加入…") : L10n.text("加入 Network")) {
                 joining = true
                 defer { joining = false }
                 do {
@@ -163,7 +181,7 @@ struct SetupView: View {
                     model.invitation = ""
                     await model.check()
                     completion()
-                } catch { joinError = error.localizedDescription }
+                } catch { joinError = InterfaceMessage { error.localizedDescription } }
             }
                 .disabled(model.invitation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.snapshot.issue != nil)
         }.disabled(model.busy || joining)
@@ -172,11 +190,10 @@ struct SetupView: View {
         let active = workspaces.current.directory
         let team = active?.team ?? model.snapshot.team
         let sessions = active.map { d in d.sessions.filter { $0.person == d.person && $0.machine == d.machine && $0.available }.count } ?? model.snapshot.sessions
-        return
-        VStack(alignment: .leading, spacing: 18) {
-            Label(team ?? "Network 已连接", systemImage: "checkmark.circle")
+        return VStack(alignment: .leading, spacing: 18) {
+            Label(team ?? L10n.text("Network 已连接"), systemImage: "checkmark.circle")
                 .font(.system(size: 15, weight: .medium))
-            Text(sessions > 0 ? "本机会话已在线。" : "在「我的会话」里选择要接入这个 Network 的本机对话。")
+            Text(sessions > 0 ? L10n.text("本机会话已在线。") : L10n.text("在「我的会话」里选择要接入这个 Network 的本机对话。"))
                 .font(.system(size: 13)).foregroundStyle(.secondary)
             if sessions == 0 {
                 Button("打开 Codex", systemImage: "arrow.up.forward.app") {
@@ -188,7 +205,7 @@ struct SetupView: View {
                 }.buttonStyle(.plain)
             }
             if model.snapshot.needsBackendUpdate {
-                action("更新兼容后台") { await model.configure() }
+                action(L10n.text("更新兼容后台")) { await model.configure() }
             }
             Button("进入聊天", action: completion)
                 .buttonStyle(SetupActionStyle())
@@ -201,7 +218,7 @@ struct SetupView: View {
             Spacer()
             Image(systemName: complete ? "checkmark" : "minus")
                 .font(.system(size: 12, weight: .medium)).foregroundStyle(complete ? .primary : .tertiary)
-                .accessibilityLabel(complete ? "已配置" : "待配置")
+                .accessibilityLabel(complete ? L10n.text("已配置") : L10n.text("待配置"))
         }
     }
     private func action(_ title: String, operation: @escaping () async -> Void) -> some View {

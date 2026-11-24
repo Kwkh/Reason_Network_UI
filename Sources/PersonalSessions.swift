@@ -11,18 +11,27 @@ struct PersonalSession: Identifiable {
 
         var label: String {
             switch self {
-            case .notJoined: "未加入"
-            case .online: "已加入 · 在线"
-            case .offline: "离线 · 保留地址"
-            case .disconnected: "已断开"
-            case .paused: "已退出"
+            case .notJoined: L10n.text("未加入")
+            case .online: L10n.text("已加入 · 在线")
+            case .offline: L10n.text("离线 · 保留地址")
+            case .disconnected: L10n.text("已断开")
+            case .paused: L10n.text("已退出")
             }
         }
     }
 
     var id: String
     let agent: String
-    let title: String
+    let nativeTitle: String?
+    var title: String {
+        if let nativeTitle { return nativeTitle }
+        if agent == "codex" { return L10n.text("未命名对话") }
+        let suffix = id.split(separator: ":", maxSplits: 1).last.map(String.init) ?? id
+        if agent == "dsh" { return L10n.text("会话 ") + suffix }
+        let shortID = String(suffix.prefix(8))
+        if let cwd { return URL(fileURLWithPath: cwd).lastPathComponent + " · " + shortID }
+        return L10n.text("会话 ") + shortID
+    }
     let cwd: String?
     let updated: Date
     var project: SessionProject?
@@ -37,6 +46,7 @@ struct PersonalSession: Identifiable {
     var restriction: LocalThreadRestriction?
     var canManageParticipation = false
     var connection: Connection = .notJoined
+    var agentGroupID: String { NetworkSession.agentGroupID(agent) }
     var agentName: String { NetworkSession.agentDisplayName(agent) }
     var supportsImmediateJoin: Bool {
         (nativeID != nil && cwd?.hasPrefix("/") == true)
@@ -55,7 +65,7 @@ struct PersonalSession: Identifiable {
         }
     }
     func matches(_ query: String) -> Bool {
-        let metadata = [title, id, agentName, displayProject.name, cwd ?? ""].joined(separator: " ")
+        let metadata = [title, id, agentName, displayProject.displayName, cwd ?? ""].joined(separator: " ")
         return query.split(whereSeparator: \.isWhitespace).allSatisfy {
             metadata.localizedCaseInsensitiveContains(String($0))
         }
@@ -67,6 +77,7 @@ struct SessionProject: Hashable {
     let id: String
     let name: String
     var position: Int = .max
+    var displayName: String { id.isEmpty ? L10n.text(name) : name }
     static let unassigned = Self(id: "", name: "未指定项目")
 }
 
@@ -234,7 +245,7 @@ struct PersonalSessionCatalog {
             hidden.remove("codex:" + id.lowercased())
             let group = projects.group(thread: id, projectID: row["project_id"], cwd: row["cwd"])
             let timestamp = row["updated_at_ms"].flatMap(Double.init).map { $0 / 1000 } ?? Double(row["updated_at"] ?? "") ?? 0
-            return PersonalSession(id: "codex:" + id, agent: "codex", title: row["title"]?.nonEmpty ?? "未命名对话",
+            return PersonalSession(id: "codex:" + id, agent: "codex", nativeTitle: row["title"]?.nonEmpty,
                                    cwd: row["cwd"], updated: Date(timeIntervalSince1970: timestamp),
                                    project: group, pinned: row["is_pinned"] == "1", transcript: codexTranscript(row["rollout_path"], under: root),
                                    nativeID: id)
@@ -276,7 +287,7 @@ struct PersonalSessionCatalog {
                     records.reversed().lazy.compactMap { ($0[field] as? String)?.nonEmpty }.first
                 }
                 let title = latest("customTitle") ?? latest("aiTitle") ?? latest("summary") ?? latest("slug")
-                return PersonalSession(id: "claude-code:" + id, agent: "claude-code", title: title?.nonEmpty ?? fallbackTitle(cwd, id),
+                return PersonalSession(id: "claude-code:" + id, agent: "claude-code", nativeTitle: title?.nonEmpty,
                                        cwd: cwd, updated: modified(url), nativeID: id)
             }
         }
@@ -293,7 +304,7 @@ struct PersonalSessionCatalog {
         let deepseek = contents(dsh).compactMap { url -> PersonalSession? in
             let id = url.lastPathComponent
             guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return nil }
-            return PersonalSession(id: "dsh:" + id, agent: "dsh", title: "会话 " + id, cwd: nil, updated: modified(url))
+            return PersonalSession(id: "dsh:" + id, agent: "dsh", nativeTitle: nil, cwd: nil, updated: modified(url))
         }
         let geminiChats = contents(gemini).flatMap { project in
             contents(project.appendingPathComponent("chats", isDirectory: true)).compactMap { url -> PersonalSession? in
@@ -302,7 +313,7 @@ struct PersonalSessionCatalog {
                 let paths = pathsBySlug[project.lastPathComponent] ?? []
                 let cwd = paths.count == 1 ? paths.first : nil
                 return PersonalSession(id: "gemini:" + id, agent: "gemini",
-                                       title: (metadata["title"] as? String)?.nonEmpty ?? fallbackTitle(cwd, id),
+                                       nativeTitle: (metadata["title"] as? String)?.nonEmpty,
                                        cwd: cwd, updated: modified(url), nativeID: UUID(uuidString: id) == nil ? nil : id)
             }
         }
@@ -310,7 +321,7 @@ struct PersonalSessionCatalog {
             contents(project.appendingPathComponent("agent-transcripts", isDirectory: true)).compactMap { url -> PersonalSession? in
                 let id = url.deletingPathExtension().lastPathComponent
                 guard UUID(uuidString: id) != nil else { return nil }
-                return PersonalSession(id: "cursor:" + id, agent: "cursor", title: fallbackTitle(nil, id), cwd: nil, updated: modified(url))
+                return PersonalSession(id: "cursor:" + id, agent: "cursor", nativeTitle: nil, cwd: nil, updated: modified(url))
             }
         }
         return deepseek + geminiChats + cursorChats
@@ -343,10 +354,6 @@ struct PersonalSessionCatalog {
         (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
     }
 
-    private func fallbackTitle(_ cwd: String?, _ id: String) -> String {
-        let project = cwd.map { URL(fileURLWithPath: $0).lastPathComponent }.flatMap(\.nonEmpty)
-        return (project.map { $0 + " · " } ?? "会话 ") + String(id.prefix(8))
-    }
 }
 
 struct SessionSocket {
@@ -412,7 +419,13 @@ struct SessionSocket {
                 guard let reply = try JSONSerialization.jsonObject(with: line) as? [String: Any],
                       reply["id"] as? Int == 1 else { continue }
                 guard reply["ok"] as? Bool == true else {
-                    throw NetworkError(reply["error"] as? String ?? "操作失败")
+                    let message = reply["error"] as? String ?? "操作失败"
+                    let prefix = "无法启动 Codex 检查推送通道："
+                    if message.hasPrefix(prefix) {
+                        let detail = String(message.dropFirst(prefix.count))
+                        throw NetworkError(localizing: { L10n.format("无法启动 Codex 检查推送通道：%@", detail) })
+                    }
+                    throw NetworkError(message)
                 }
                 return try JSONSerialization.data(withJSONObject: reply["result"] ?? NSNull(), options: .fragmentsAllowed)
             }

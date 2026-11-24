@@ -1,6 +1,8 @@
 import Foundation
 
 enum LocalThreadRestriction: String {
+    var title: String { L10n.text(rawValue) }
+
     case archived = "已归档"
     case missing = "本机未找到"
     case unverified = "待核实"
@@ -25,25 +27,28 @@ struct NetworkSession: Decodable, Identifiable, Equatable {
     var offline: Bool { restriction != nil || status == "offline" }
     var available: Bool { !offline && tier != "none" }
     var statusText: String {
-        if let restriction { return restriction.rawValue }
-        if offline { return "离线" }
-        if tier == "none" { return "未接入" }
-        return ["busy": "工作中", "idle": "空闲", "live": "在线"][status ?? ""] ?? "状态未知"
+        if let restriction { return restriction.title }
+        if offline { return L10n.text("离线") }
+        if tier == "none" { return L10n.text("未接入") }
+        return ["busy": L10n.text("工作中"), "idle": L10n.text("空闲"), "live": L10n.text("在线")][status ?? ""] ?? L10n.text("状态未知")
     }
     var id: String { address }
     var title: String { clientTitle?.nonEmpty ?? doing?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? name }
     var titleHelp: String {
         if let clientTitle = clientTitle?.nonEmpty { return clientTitle + "\n" + address }
         if let description = doing?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
-            return "Network 会话描述：" + description + "\n" + address
+            return L10n.text("Network 会话描述：") + description + "\n" + address
         }
-        return "Network 会话地址：" + address
+        return L10n.text("Network 会话地址：") + address
     }
+    static func agentGroupID(_ agent: String?) -> String { agent == "deepseek" ? "dsh" : agent ?? "" }
+
     static func agentDisplayName(_ agent: String?) -> String {
+        if agent == "离线" || agent == "历史记录" { return L10n.text(agent ?? "") }
         let names = ["codex": "Codex", "claude-code": "Claude Code", "cursor": "Cursor",
-                     "gemini": "Gemini CLI", "cli": "终端与控制台", "reason": "Reason",
+                     "gemini": "Gemini CLI", "cli": L10n.text("终端与控制台"), "reason": "Reason",
                      "dsh": "DeepSeek Harness", "deepseek": "DeepSeek Harness", "copilot": "Copilot CLI"]
-        return agent.map { names[$0] ?? $0 } ?? "其他会话"
+        return agent?.nonEmpty.map { names[$0] ?? $0 } ?? L10n.text("其他会话")
     }
     enum CodingKeys: String, CodingKey { case address, name, person, machine, agent, repo, branch, doing, tier, status, cwd, target; case clientTitle = "title" }
 }
@@ -58,10 +63,10 @@ struct Device: Decodable, Identifiable, Equatable {
     let rttMs: Double?
     var id: String { endpoint }
     var state: String {
-        guard online else { return "离线" }
-        let route = link == "direct" ? "直连" : link == "relay" ? "中继" : nil
-        guard let route, !isMe else { return "在线" }
-        return "在线 · " + route + (rttMs.map { " \(Int($0)) ms" } ?? "")
+        guard online else { return L10n.text("离线") }
+        let route = link == "direct" ? L10n.text("直连") : link == "relay" ? L10n.text("中继") : nil
+        guard let route, !isMe else { return L10n.text("在线") }
+        return L10n.text("在线 · ") + route + (rttMs.map { " \(Int($0)) ms" } ?? "")
     }
 }
 struct Directory: Decodable, Equatable {
@@ -89,9 +94,9 @@ enum ReceiveMode: String, CaseIterable, Decodable {
 
     var title: String {
         switch self {
-        case .push: "即时推送"
-        case .turn: "回合接收"
-        case .pull: "手动接收"
+        case .push: L10n.text("即时推送")
+        case .turn: L10n.text("回合接收")
+        case .pull: L10n.text("手动接收")
         }
     }
 }
@@ -165,20 +170,20 @@ struct Message: Identifiable, Equatable {
     var outgoing: Bool { direction == "out" }
     var delivery: String {
         switch receiptStage {
-        case "queued": return "已排队"
-        case "accepted": return "对方设备已接收"
-        case "handed_to_agent": return "已交给对方会话"
-        case "replied": return "已回复"
-        case "held": return "待批准"
-        case "rejected": return "已拒收"
-        case "expired": return "已过期"
+        case "queued": return L10n.text("已排队")
+        case "accepted": return L10n.text("对方设备已接收")
+        case "handed_to_agent": return L10n.text("已交给对方会话")
+        case "replied": return L10n.text("已回复")
+        case "held": return L10n.text("待批准")
+        case "rejected": return L10n.text("已拒收")
+        case "expired": return L10n.text("已过期")
         default: break
         }
-        if result.hasPrefix("refused:") || result.hasPrefix("rejected:") { return "已拒收" }
-        if result.hasPrefix("held:") { return "待批准" }
-        if result.contains("queued") { return "已排队" }
-        if result.contains("delivered") { return "已投递" }
-        return result.isEmpty ? "" : "已发送"
+        if result.hasPrefix("refused:") || result.hasPrefix("rejected:") { return L10n.text("已拒收") }
+        if result.hasPrefix("held:") { return L10n.text("待批准") }
+        if result.contains("queued") { return L10n.text("已排队") }
+        if result.contains("delivered") { return L10n.text("已投递") }
+        return result.isEmpty ? "" : L10n.text("已发送")
     }
 }
 enum TranscriptBottomProximity {
@@ -250,16 +255,18 @@ struct Snapshot {
     let conversations: [NetworkSession]
     let messages: [Message]
     let hasEarlier: Bool
-    let mirrorWarning: String?
+    let mirrorWarning: InterfaceMessage?
 }
 struct LocalSenderOffline: LocalizedError {
-    var errorDescription: String? { "本机会话已离线，消息未发送。" }
+    var errorDescription: String? { L10n.text("本机会话已离线，消息未发送。") }
 }
 
 struct NetworkError: LocalizedError {
-    let message: String
-    var errorDescription: String? { message }
-    init(_ message: String) { self.message = message }
+    private let detail: InterfaceMessage
+    var message: String { detail.chinese }
+    var errorDescription: String? { detail.text }
+    init(_ message: String) { detail = InterfaceMessage { L10n.text(message) } }
+    init(localizing render: () -> String) { detail = InterfaceMessage(render) }
 }
 extension String {
     var nonEmpty: String? { isEmpty ? nil : self }

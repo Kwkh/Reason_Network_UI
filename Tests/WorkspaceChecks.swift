@@ -76,6 +76,33 @@ struct WorkspaceChecks {
         let history = model.messages
         let joined = Set(["codex:" + threadID, "codex:" + betaID])
         precondition(Set(model.connectionTargets(disconnect: true).map(\.key)) == joined)
+        await model.changeAllReceiveModes(.push, network: second.id)
+        precondition(model.tier == "pull")
+        await model.changeAllReceiveModes(.push, network: first.id)
+        precondition(model.receiveModeError == nil && model.notice.text.contains("2/2"))
+        precondition(model.onlineReceiveTargets.allSatisfy {
+            model.directory?.liveLocalSession(named: $0.name, agent: "codex")?.tier == "push"
+        })
+        hub.select(second)
+        await hub.current.refresh()
+        precondition(hub.current.tier == "pull")
+        hub.select(first)
+        await model.changeAllReceiveModes(.pull, network: first.id)
+        precondition(model.tier == "pull" && model.notice.text.contains("2/2"))
+        // One target goes offline after discovery. The other must still switch.
+        let socket = SessionSocket(socketURL: NetworkPaths.socket(in: first.root))
+        _ = try socket.request(["op":"set_session_participation", "key":"codex:" + betaID, "paused":true])
+        await model.changeAllReceiveModes(.push, network: first.id)
+        precondition(model.tier == "push" && model.receiveModeError?.text.contains("Beta") == true && model.notice.text.contains("1/2"))
+        await model.changeAllReceiveModes(.pull, network: first.id)
+        precondition(model.tier == "pull" && model.notice.text.contains("1/1") && model.onlineReceiveTargets.map(\.key) == [sender.key])
+        _ = try socket.request(["op":"set_session_participation", "key":"codex:" + betaID, "paused":false])
+        let hook: [String: Any] = ["op":"hook","agent":"codex","event":"stop","session_id":betaID,
+                                   "name":"beta","cwd":home.path,"mail":false]
+        _ = try socket.request(["op":"workspace_dispatch","network":first.id,"request":hook])
+        await model.refresh()
+        precondition(model.draft == first.name && model.messages == history)
+        print("PASS: bulk receive modes confirm effective tiers, report partial failures and skip offline sessions and other networks")
         await model.changeAllConnections(network: second.id, disconnect: true)
         precondition(model.senderPresence == .online)
         await model.changeAllConnections(network: first.id, disconnect: true)
@@ -90,7 +117,7 @@ struct WorkspaceChecks {
         _ = try index.rows("UPDATE threads SET cwd=? WHERE id=?", [home.appendingPathComponent("missing-project").path,betaID])
         await model.changeAllConnections(network: first.id, disconnect: false)
         precondition(model.senderPresence == .online && model.connectionTargets(disconnect: false).map(\.key) == ["codex:" + betaID])
-        precondition(model.connectionReport?.contains("1/2") == true && model.connectionReport?.contains("Beta") == true)
+        precondition(model.connectionReport?.text.contains("1/2") == true && model.connectionReport?.text.contains("Beta") == true)
         _ = try index.rows("UPDATE threads SET cwd=? WHERE id=?", [home.path,betaID])
         await model.changeAllConnections(network: first.id, disconnect: false)
         precondition(model.connectionReport == nil && Set(model.connectionTargets(disconnect: true).map(\.key)) == joined)

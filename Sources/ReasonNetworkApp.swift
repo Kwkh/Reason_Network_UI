@@ -33,6 +33,10 @@ struct ReasonNetworkApp: App {
     var body: some Scene {
         Window("Reason Network", id: "main") {
             AppRootView().environmentObject(workspaces).environmentObject(workspaces.current)
+                .environment(\.locale, L10n.shared.locale)
+                .onReceive(NotificationCenter.default.publisher(for: NSLocale.currentLocaleDidChangeNotification)) { _ in
+                    L10n.shared.refreshSystemLanguage()
+                }
                 .preferredColorScheme(appearance.scheme)
         }
         .defaultSize(width: 940, height: 780)
@@ -42,14 +46,17 @@ struct ReasonNetworkApp: App {
             CommandMenu("Connect") {
                 ConnectionMenuItems(model: workspaces.current)
             }
+            CommandMenu("Receive") {
+                ReceiveMenuItems(model: workspaces.current)
+            }
             CommandGroup(replacing: .newItem) { }
             CommandGroup(after: .toolbar) {
-                Picker("外观", selection: $appearance) {
+                Picker(L10n.text("外观"), selection: $appearance) {
                     ForEach(DisplayAppearance.allCases, id: \.self) { option in
-                        Text(option.rawValue).tag(option)
+                        Text(L10n.text(option.rawValue)).tag(option)
                     }
                 }.pickerStyle(.menu)
-                Button("刷新 Network") { Task { await workspaces.current.refresh() } }.keyboardShortcut("r")
+                Button(L10n.text("刷新 Network")) { Task { await workspaces.current.refresh() } }.keyboardShortcut("r")
             }
         }
     }
@@ -60,15 +67,34 @@ private struct ConnectionMenuItems: View {
 
     var body: some View {
         let network = model.directory?.networkID
-        Button("全部接入", systemImage: "personalhotspot") {
+        Button(L10n.text("全部接入"), systemImage: "personalhotspot") {
             if let network { Task { await model.changeAllConnections(network: network, disconnect: false) } }
         }
         .keyboardShortcut("1", modifiers: [.command, .option])
         .disabled(network == nil || model.connectionTargets(disconnect: false).isEmpty)
-        Button("全部断开", systemImage: "personalhotspot.slash") {
+        Button(L10n.text("全部断开"), systemImage: "personalhotspot.slash") {
             if let network { Task { await model.changeAllConnections(network: network, disconnect: true) } }
         }
         .keyboardShortcut("0", modifiers: [.command, .option])
         .disabled(network == nil || model.connectionTargets(disconnect: true).isEmpty)
+    }
+}
+
+private struct ReceiveMenuItems: View {
+    @ObservedObject var model: NetworkModel
+
+    var body: some View {
+        let network = model.directory?.networkID
+        Group {
+            Button(L10n.text("全部设为手动接收"), systemImage: "arrow.down.circle") {
+                if let network { Task { await model.changeAllReceiveModes(.pull, network: network) } }
+            }
+            .keyboardShortcut("2", modifiers: [.command, .option])
+            Button(L10n.text("全部设为即时推送"), systemImage: "bolt.horizontal.circle") {
+                if let network { Task { await model.changeAllReceiveModes(.push, network: network) } }
+            }
+            .keyboardShortcut("3", modifiers: [.command, .option])
+        }
+        .disabled(network == nil || model.onlineReceiveTargets.isEmpty)
     }
 }

@@ -109,7 +109,7 @@ struct CoreChecks {
         try expect(!FileManager.default.fileExists(atPath: home.appendingPathComponent("sent.json").path), "offline sender never dispatched")
         guard let offlineLocal = model.own, let network = model.directory?.networkID else { throw NetworkError("Missing offline fixture") }
         await model.changeSenderConnection(offlineLocal, network: network, disconnect: false)
-        try expect(!model.notice.isEmpty && model.senderOffline && model.options == original, "unavailable native thread leaves draft intact")
+        try expect(!model.notice.text.isEmpty && model.senderOffline && model.options == original, "unavailable native thread leaves draft intact")
         try FileManager.default.removeItem(at: marker)
         await model.refresh()
         try expect(model.canSend && model.options == original, "confirmed return enables sending with the original draft")
@@ -167,6 +167,9 @@ struct CoreChecks {
     }
 
     static func main() async throws {
+        try expect(AppLanguage.systemLanguage(for: ["fr", "zh-Hant-TW", "en"]) == .chinese, "use the available Chinese localization for a Chinese preference")
+        try expect(AppLanguage.systemLanguage(for: ["en-GB", "zh-CN"]) == .english, "respect system language order")
+        try expect(AppLanguage.systemLanguage(for: ["de-DE"]) == .english, "unsupported languages fall back to English")
         try checkReadingWindow()
         let fm = FileManager.default
         let home = fm.temporaryDirectory.appendingPathComponent("reason-native-checks-" + UUID().uuidString)

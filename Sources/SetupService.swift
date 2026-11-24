@@ -61,7 +61,7 @@ struct SetupSnapshot: Equatable {
     var joined = false
     var sessions = 0
     var team: String?
-    var issue: String?
+    var issue: InterfaceMessage?
     var ready: Bool { installed && background && participation && wired && joined }
 }
 
@@ -92,7 +92,7 @@ enum SetupInput {
     }
     static func redacted(_ value: String) -> String {
         String(value.replacingOccurrences(of: #"(?:https://reasonmachines\.com/network/join/?)?#?rn1-[A-Za-z0-9_-]+"#,
-                                         with: "[邀请已隐藏]", options: .regularExpression).prefix(2400))
+                                         with: L10n.text("[邀请已隐藏]"), options: .regularExpression).prefix(2400))
     }
 }
 
@@ -181,7 +181,7 @@ actor SetupService: SetupServicing {
             result.joined = directory.team?.isEmpty == false
             result.team = directory.team
             result.sessions = directory.sessions.filter { $0.person == directory.person && $0.agent == "codex" && $0.tier != "none" }.count
-        } catch { result.issue = SetupInput.redacted(error.localizedDescription) }
+        } catch { result.issue = InterfaceMessage { SetupInput.redacted(error.localizedDescription) } }
         if installer.configured {
             result.needsBackendUpdate = installer.needsPathMigration
             result.participation = installer.probe(home)

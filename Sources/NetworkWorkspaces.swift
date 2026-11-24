@@ -113,8 +113,8 @@ struct WorkspaceStore: Sendable {
         catch {
             if membership(at: root) == nil {
                 // Only tear down a rejected join. A socket timeout may still complete in the daemon.
-                if !error.localizedDescription.contains("及时响应") { try? await stopSecondaryService(at: root) }
-                throw NetworkError(SetupInput.redacted(error.localizedDescription))
+                if (error as? NetworkError)?.message != "本机服务没有及时响应，请稍后重试。" { try? await stopSecondaryService(at: root) }
+                throw NetworkError(localizing: { SetupInput.redacted(error.localizedDescription) })
             }
         }
         guard let result = membership(at: root), expected == nil || result.id == expected else {

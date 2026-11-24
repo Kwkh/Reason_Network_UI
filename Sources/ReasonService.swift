@@ -34,7 +34,7 @@ actor ReasonService {
             _ = try directory()
             do { (engine, expectedNetwork) = try openEngine() }
             catch let error as SQLiteStore.OpenFailure {
-                throw NetworkError("暂时无法读取本机 Network 的聊天数据，稍后将自动重试。" + (error.errorDescription ?? ""))
+                throw NetworkError(localizing: { L10n.text("暂时无法读取本机 Network 的聊天数据，稍后将自动重试。") + (error.errorDescription ?? "") })
             }
         }
         var directory = try directory()
@@ -100,7 +100,7 @@ actor ReasonService {
         }
         try cache.recordInboxOwnership(network, engine: engine)
         let otherMail = Set(try cache.rows("SELECT id FROM network_inbox WHERE network<>?", [network]).compactMap { $0["id"] })
-        var warning: String?
+        var warning: InterfaceMessage?
         let hasFiles = try engine.rows("PRAGMA table_info(messages)").contains { $0["name"] == "files" }
         let fileColumn = hasFiles ? ",files" : ""
         // A registered mailbox can receive mail just before detaching, between UI polls.
@@ -124,7 +124,7 @@ actor ReasonService {
                         }
                     }
                 }
-            } catch { warning = "部分历史记录暂未同步：" + error.localizedDescription }
+            } catch { warning = InterfaceMessage { L10n.text("部分历史记录暂未同步：") + error.localizedDescription } }
         }
         try reconcileSent(engine: engine, cache: cache, network: network, person: directory.person, otherMail: otherMail, hasInboxFiles: hasFiles)
         let pausedNames = Set(codexRecords.filter { paused.contains($0["key"] ?? "") }.compactMap { $0["name"] })
@@ -315,12 +315,12 @@ actor ReasonService {
         let info = PersonalSessionCatalog(home: home).registeredThreads(keys)
         for key in keys {
             if let restriction = info[key.lowercased()]?.restriction {
-                throw NetworkError("本机 Codex 对话" + restriction.rawValue + "，当前仅可查看历史记录。")
+                throw NetworkError(localizing: { L10n.format("本机 Codex 对话%@，当前仅可查看历史记录。", restriction.title) })
             }
         }
     }
 
-    func send(network: String, local: String, to: String, body: String, files: [URL] = [], notify: Bool = false) throws -> String {
+    func send(network: String, local: String, to: String, body: String, files: [URL] = [], notify: Bool = false) throws -> InterfaceMessage {
         let typed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         let content = typed.isEmpty && !files.isEmpty ? "附件" : typed
         guard !content.isEmpty, content.count <= 10_000 else { throw NetworkError("请输入 1–10000 字的消息") }
@@ -368,9 +368,8 @@ actor ReasonService {
             // Sending has already succeeded: never turn a cache failure into an invitation to resend.
             return "已发送；本地记录保存失败，请勿重复发送。"
         }
-        let status = event.delivery
-        if notify && result.contains("not popped up:") { return status + " · 对方设备未弹窗" }
-        return status
+        let missedNotification = notify && result.contains("not popped up:")
+        return InterfaceMessage { event.delivery + (missedNotification ? L10n.text(" · 对方设备未弹窗") : "") }
     }
     private var console: SessionSocket { SessionSocket(socketURL: NetworkPaths.socket(in: networkRoot)) }
     func personalSessions() throws -> [PersonalSession] {
@@ -398,7 +397,7 @@ actor ReasonService {
             }
             let address = current?.id ?? directory.map { $0.person + "/" + name } ?? name
             let catalogKey = agent == "codex" ? key.lowercased() : key
-            var item = sessions[catalogKey] ?? PersonalSession(id: key, agent: agent, title: row["doing"]?.nonEmpty ?? name,
+            var item = sessions[catalogKey] ?? PersonalSession(id: key, agent: agent, nativeTitle: row["doing"]?.nonEmpty ?? name,
                                                          cwd: row["cwd"], updated: Date(timeIntervalSince1970: (Double(row["last_seen"] ?? "") ?? 0) / 1000))
             item.restriction = info[key.lowercased()]?.restriction
             if item.restriction == .archived || item.restriction == .missing { continue }
@@ -595,10 +594,10 @@ actor ReasonService {
         }
         return link
     }
-    func diagnose(localKey: String?) throws -> String {
+    func diagnose(localKey: String?) throws -> InterfaceMessage {
         let detail = try run(["doctor"])
-        guard let localKey, let state = try? participationState(), state.resumePending?.contains(localKey) == true else { return detail }
-        return "最近一次推送已进入 Codex 队列，但未能唤醒此会话。请在 Codex 打开该对话，无需重发。\n\n" + detail
+        guard let localKey, let state = try? participationState(), state.resumePending?.contains(localKey) == true else { return InterfaceMessage { detail } }
+        return InterfaceMessage { L10n.text("最近一次推送已进入 Codex 队列，但未能唤醒此会话。请在 Codex 打开该对话，无需重发。\n\n") + detail }
     }
     private func directory() throws -> Directory {
         let output = try run(["who", "--json"])

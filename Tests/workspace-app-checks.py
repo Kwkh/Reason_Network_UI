@@ -22,6 +22,10 @@ with tempfile.TemporaryDirectory(prefix="rn-app-", dir="/tmp") as temp:
     (agents/"com.reasonmachines.network.plist").write_bytes(plistlib.dumps({"ProgramArguments":[str(binary),"daemon","--service"]}))
     env = dict(HOME=temp, PATH="/usr/bin:/bin", REASON_NETWORK_HOME=str(root), REASON_NETWORK_LOCAL_PARTICIPATION="1",
                REASON_NETWORK_NO_SERVICE="1", REASON_NETWORK_NO_TRAY="1")
+    codex = home/"codex-probe"
+    codex.write_text("#!/bin/sh\ntest \"$1 $2\" = 'queue --help' || exit 1\necho 'queue --thread --message --resume'\n")
+    codex.chmod(0o700)
+    env["REASON_NETWORK_CODEX_BIN"] = str(codex)
     processes = []
     def start():
         proc = subprocess.Popen([binary,"daemon"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)

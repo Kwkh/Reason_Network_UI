@@ -6,7 +6,7 @@ final class SQLiteStore {
     struct OpenFailure: LocalizedError {
         let url: URL
         let code: Int32
-        var errorDescription: String? { "暂时无法打开数据库（" + url.lastPathComponent + "，SQLite " + String(code) + "）。" }
+        var errorDescription: String? { L10n.format("暂时无法打开数据库（%@，SQLite %lld）。", url.lastPathComponent, Int(code)) }
     }
     private let url: URL
     private var db: OpaquePointer?

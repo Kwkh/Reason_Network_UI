@@ -53,24 +53,24 @@ final class NetworkModel: ObservableObject {
     private var refreshing = false
     private var refreshWaiters: [CheckedContinuation<Void, Never>] = []
     private var noticeExpiry: Task<Void, Never>?
-    @Published var notice = "" {
+    @Published var notice: InterfaceMessage = "" {
         didSet {
             noticeExpiry?.cancel()
             noticeExpiry = nil
         }
     }
-    @Published var error: String?
-    @Published var mirrorWarning: String?
-    @Published var doctor = ""
+    @Published var error: InterfaceMessage?
+    @Published var mirrorWarning: InterfaceMessage?
+    @Published var doctor: InterfaceMessage = ""
     @Published var diagnosing = false
     private let service: ReasonService
     @Published private(set) var mySessions: [PersonalSession] = []
     @Published private(set) var loadingMySessions = false
     @Published private(set) var changingSession: String?
-    @Published private(set) var mySessionsNotice: String?
-    @Published private(set) var mySessionsError: String?
+    @Published private(set) var mySessionsNotice: InterfaceMessage?
+    @Published private(set) var mySessionsError: InterfaceMessage?
     @Published private(set) var changingAllConnections = false
-    @Published var connectionReport: String?
+    @Published var connectionReport: InterfaceMessage?
     private var requestAgain = false
     private var messageCache: [String: [Message]] = [:]
     private let preferenceScope: String
@@ -133,28 +133,56 @@ final class NetworkModel: ObservableObject {
     }
     var online: Bool { directory != nil && error == nil }
     var tier: String? { guard online else { return nil }; return directory?.liveLocalSession(named: selectedLocal, agent: "codex")?.tier }
-    @Published var receiveModeError: String?
+    @Published var receiveModeError: InterfaceMessage?
 
     func changeReceiveMode(_ mode: ReceiveMode, local: LocalSession, network: String) async {
-        guard own?.key == local.key, directory?.networkID == network, changingSession == nil,
-              !leavingNetwork, senderPresence == .online else { return }
-        changingSession = local.key
+        guard own?.key == local.key, presence(for: local) == .online else { return }
+        await setReceiveMode(mode, for: [local], network: network, batch: false)
+    }
+
+    var onlineReceiveTargets: [LocalSession] {
+        eligibleLocalSessions(with: .online)
+    }
+
+    func changeAllReceiveModes(_ mode: ReceiveMode, network: String) async {
+        guard mode == .pull || mode == .push else { return }
+        await setReceiveMode(mode, for: onlineReceiveTargets, network: network, batch: true)
+    }
+
+    private func setReceiveMode(_ mode: ReceiveMode, for targets: [LocalSession], network: String, batch: Bool) async {
+        guard !targets.isEmpty, directory?.networkID == network, changingSession == nil, !leavingNetwork else { return }
         defer { changingSession = nil }
-        do {
-            let confirmed = try await service.setReceiveMode(mode, local: local, network: network)
-            await refresh()
-            guard own?.key == local.key, directory?.networkID == network else { return }
-            guard let actual = tier.flatMap(ReceiveMode.init(rawValue:)) else {
-                throw NetworkError("暂时无法获得该会话的最新状态。")
+        var effective: [String: ReceiveMode] = [:]
+        var errors: [String: InterfaceMessage] = [:]
+        for local in targets {
+            guard directory?.networkID == network else { return }
+            changingSession = local.key
+            do {
+                effective[local.key] = try await service.setReceiveMode(mode, local: local, network: network)
+            } catch {
+                errors[local.key] = InterfaceMessage { error.localizedDescription }
             }
-            if confirmed != mode || actual != mode {
-                throw NetworkError("后台当前生效的是「" + actual.title + "」，所选通道暂不可用。")
+        }
+        await refresh()
+        guard directory?.networkID == network else { return }
+        let failures = targets.compactMap { local -> InterfaceMessage? in
+            let current = directory?.liveLocalSession(named: local.name, agent: "codex")?.tier.flatMap(ReceiveMode.init(rawValue:))
+            let reason: InterfaceMessage
+            if let error = errors[local.key] { reason = error }
+            else if let current, self.error == nil {
+                if current == mode && effective[local.key] == mode { return nil }
+                reason = InterfaceMessage { L10n.format("后台当前生效的是「%@」。", current.title) }
+            } else {
+                reason = "暂时无法获得该会话的最新状态。"
             }
-        } catch {
-            if own?.key == local.key && directory?.networkID == network {
-                receiveModeError = "「" + local.title + "」无法确认切换到「" + mode.title + "」。" + error.localizedDescription
-            }
-            await refresh()
+            return InterfaceMessage { local.title + " (" + local.name + ") · " + reason.text }
+        }
+        if batch {
+            let summary = InterfaceMessage { L10n.format("%lld/%lld 个本机会话已设为%@", targets.count - failures.count, targets.count, mode.title) }
+            showTemporaryNotice(summary)
+            receiveModeError = failures.isEmpty ? nil : InterfaceMessage { ([summary] + failures).map(\.text).joined(separator: "\n") }
+        } else if own?.key == targets.first?.key {
+            receiveModeError = failures.first
         }
     }
 
@@ -223,7 +251,7 @@ final class NetworkModel: ObservableObject {
             } catch {
                 guard !leavingNetwork, departure == departureCount else { return }
                 guard generation == selectionGeneration, floor == readingFrom else { requestAgain = true; continue }
-                self.error = error.localizedDescription
+                self.error = InterfaceMessage { error.localizedDescription }
             }
         } while requestAgain && !Task.isCancelled
     }
@@ -241,13 +269,17 @@ final class NetworkModel: ObservableObject {
             if key == conversationKey { notice = "本次消息未发送。" }
             await refresh()
         } catch {
-            if key == conversationKey { notice = error.localizedDescription + "；请确认投递状态后再重试。" }
+            if key == conversationKey { notice = InterfaceMessage { error.localizedDescription + L10n.text("；请确认投递状态后再重试。") } }
         }
         sending = false
     }
     func connectionTargets(disconnect: Bool) -> [LocalSession] {
+        eligibleLocalSessions(with: disconnect ? .online : .offline)
+    }
+
+    private func eligibleLocalSessions(with status: SenderPresence) -> [LocalSession] {
         guard online, !sending, !leavingNetwork, changingSession == nil, !changingAllConnections else { return [] }
-        return locals.filter { $0.hasRegistration && presence(for: $0) == (disconnect ? .online : .offline) }
+        return locals.filter { $0.hasRegistration && presence(for: $0) == status }
     }
 
     func changeAllConnections(network: String, disconnect: Bool) async {
@@ -266,8 +298,7 @@ final class NetworkModel: ObservableObject {
     private func changeConnections(_ targets: [LocalSession], network: String, disconnect: Bool, batch: Bool) async {
         guard directory?.networkID == network, changingSession == nil, !sending, !leavingNetwork else { return }
         let key = conversationKey
-        let verb = disconnect ? "断开" : "接入"
-        var errors: [String: String] = [:]
+        var errors: [String: InterfaceMessage] = [:]
         defer { changingSession = nil; reconnectingKey = nil; disconnectingKey = nil }
         for local in targets {
             changingSession = local.key
@@ -280,32 +311,36 @@ final class NetworkModel: ObservableObject {
                     try await service.reconnectLocal(local, network: network)
                 }
             } catch {
-                errors[local.key] = error.localizedDescription
+                errors[local.key] = InterfaceMessage { error.localizedDescription }
             }
         }
         await refresh()
         guard directory?.networkID == network else { return }
         reconnectingKey = nil
-        let failures = targets.compactMap { local -> String? in
+        let failures = targets.compactMap { local -> InterfaceMessage? in
             let current = locals.first { $0.key == local.key }
             if let current, presence(for: current) == (disconnect ? .offline : .online), errors[local.key] == nil { return nil }
             let reason = errors[local.key] ?? "后台尚未确认会话状态，请稍后刷新。"
-            return batch ? "\(local.title)（\(local.name)） · \(reason)" : reason
+            return batch ? InterfaceMessage { local.title + " (" + local.name + ") · " + reason.text } : reason
         }
         if batch {
-            let summary = "已\(verb) \(targets.count - failures.count)/\(targets.count) 个本机会话"
-            notice = summary
-            noticeExpiry = Task { [weak self] in
-                do { try await Task.sleep(for: .seconds(3)) }
-                catch { return }
-                guard !Task.isCancelled else { return }
-                self?.notice = ""
-            }
-            connectionReport = failures.isEmpty ? nil : ([summary] + failures).joined(separator: "\n")
+            let summary = InterfaceMessage { L10n.format(disconnect ? "已断开 %lld/%lld 个本机会话" : "已接入 %lld/%lld 个本机会话", targets.count - failures.count, targets.count) }
+            showTemporaryNotice(summary)
+            connectionReport = failures.isEmpty ? nil : InterfaceMessage { ([summary] + failures).map(\.text).joined(separator: "\n") }
         } else if key == conversationKey {
             notice = failures.first ?? ""
         }
     }
+    private func showTemporaryNotice(_ summary: InterfaceMessage) {
+        notice = summary
+        noticeExpiry = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(3)) }
+            catch { return }
+            guard !Task.isCancelled else { return }
+            self?.notice = ""
+        }
+    }
+
     func refreshMySessions() async {
         guard !loadingMySessions else { return }
         loadingMySessions = true
@@ -314,7 +349,7 @@ final class NetworkModel: ObservableObject {
             mySessions = try await service.personalSessions()
             mySessionsError = nil
         } catch {
-            mySessionsError = error.localizedDescription
+            mySessionsError = InterfaceMessage { error.localizedDescription }
         }
     }
     func joinMySession(_ session: PersonalSession) async {
@@ -335,18 +370,18 @@ final class NetworkModel: ObservableObject {
             if joining {
                 let address = try await service.joinPersonalSession(session.id)
                 if case .paused = session.connection, !session.supportsImmediateJoin {
-                    mySessionsNotice = "已允许 \(address) 重新接入"
+                    mySessionsNotice = InterfaceMessage { L10n.format("已允许 %@ 重新接入", address) }
                 } else {
-                    mySessionsNotice = "已加入 \(address)"
+                    mySessionsNotice = InterfaceMessage { L10n.format("已加入 %@", address) }
                 }
             } else {
                 let address = try await service.leavePersonalSession(session.id)
-                mySessionsNotice = "\(address) 已退出 Reason Network"
+                mySessionsNotice = InterfaceMessage { L10n.format("%@ 已退出 Reason Network", address) }
             }
             await refreshMySessions()
             await refresh()
         } catch {
-            mySessionsError = error.localizedDescription
+            mySessionsError = InterfaceMessage { error.localizedDescription }
         }
     }
     func leaveNetwork(_ id: String) async throws {
@@ -389,7 +424,10 @@ final class NetworkModel: ObservableObject {
     func diagnose() async {
         guard !diagnosing else { return }; diagnosing = true
         defer { diagnosing = false }
-        do { doctor = try await service.diagnose(localKey: own?.key).nonEmpty ?? "本次检查未返回诊断信息。" }
-        catch { doctor = error.localizedDescription }
+        do {
+            let report = try await service.diagnose(localKey: own?.key)
+            doctor = report.text.isEmpty ? "本次检查未返回诊断信息。" : report
+        }
+        catch { doctor = InterfaceMessage { error.localizedDescription } }
     }
 }

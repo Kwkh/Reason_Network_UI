@@ -17,7 +17,7 @@ struct ContentView: View {
     private struct AttachmentPreview: Identifiable {
         let id = UUID()
         let name: String
-        let text: String
+        let text: InterfaceMessage
     }
 
 
@@ -46,16 +46,16 @@ struct ContentView: View {
         .alert("接收模式未切换或未确认", isPresented: Binding(get: { model.receiveModeError != nil },
                                                   set: { if !$0 { model.receiveModeError = nil } })) {
             Button("好", role: .cancel) {}
-        } message: { Text(model.receiveModeError ?? "") }
+        } message: { Text(model.receiveModeError?.text ?? "") }
         .alert("批量连接结果", isPresented: Binding(get: { model.connectionReport != nil },
                                               set: { if !$0 { model.connectionReport = nil } })) {
             Button("好", role: .cancel) {}
-        } message: { Text(model.connectionReport ?? "") }
+        } message: { Text(model.connectionReport?.text ?? "") }
         .fileImporter(isPresented: $pickingFiles, allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
             switch result {
             case .success(let urls): model.attach(urls, to: pickerConversation)
             case .failure(let error):
-                if (error as NSError).code != NSUserCancelledError { model.notice = error.localizedDescription }
+                if (error as NSError).code != NSUserCancelledError { model.notice = InterfaceMessage { error.localizedDescription } }
             }
         }
         .sheet(item: $preview) { item in
@@ -66,7 +66,7 @@ struct ContentView: View {
                     Button("完成") { preview = nil }.keyboardShortcut(.cancelAction)
                 }
                 ScrollView {
-                    Text(verbatim: item.text).font(.system(.body, design: .monospaced))
+                    Text(verbatim: item.text.text).font(.system(.body, design: .monospaced))
                         .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                 }
             }.padding(20).frame(minWidth: 440, minHeight: 300)
@@ -111,7 +111,7 @@ struct ContentView: View {
 
     private func conversationTitle(maxWidth: CGFloat) -> some View {
         let peer = model.peer
-        let title = peer?.title ?? "选择会话"
+        let title = peer?.title ?? L10n.text("选择会话")
         let address = peer?.address ?? "Reason Network"
         let singleLineTitle = title.components(separatedBy: .newlines)
             .filter { !$0.isEmpty }.joined(separator: " ")
@@ -126,7 +126,7 @@ struct ContentView: View {
                     .font(.system(size: 10, design: .monospaced))
                     .truncationMode(.middle)
                 if let peer {
-                    let status = model.online ? peer.statusText : "状态未知"
+                    let status = model.online ? peer.statusText : L10n.text("状态未知")
                     Text(status)
                         .font(.system(size: 10))
                         .layoutPriority(1)
@@ -147,29 +147,39 @@ struct ContentView: View {
 
     private var statusButton: some View {
         let indicator = model.senderPresence
-        return Button { showStatus.toggle() } label: {
-            HStack(spacing: 7) {
-                Image(systemName: indicator.symbol)
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundStyle(indicator.color)
-                    .frame(width: 8)
-                    .contentTransition(.opacity)
-                Text(indicator.shortLabel)
-                    .font(.system(size: 12, weight: .medium))
-                    .lineLimit(1)
-                    .contentTransition(reduceMotion ? .identity : .numericText())
+        // Reserve the longest label's toolbar slot so AppKit doesn't move the button during a transition.
+        return statusLabel(.missing)
+            .hidden()
+            .accessibilityHidden(true)
+            .overlay(alignment: .trailing) {
+                Button { showStatus.toggle() } label: {
+                    statusLabel(indicator)
+                        .background(Capsule().stroke(Color.primary.opacity(0.16), lineWidth: 1))
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("本机会话状态")
+                .accessibilityValue(L10n.text(indicator.rawValue))
+                .help(L10n.text("当前本机会话 · ") + L10n.text(indicator.rawValue) + L10n.text("。点击查看设备状态。"))
+                .popover(isPresented: $showStatus, arrowEdge: .bottom) { StatusView().environmentObject(model) }
             }
-            .padding(.horizontal, 6).padding(.vertical, 7)
-            .frame(minWidth: 64)
-            .background(Capsule().stroke(Color.primary.opacity(0.16), lineWidth: 1))
-            .contentShape(Capsule())
             .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: indicator)
+    }
+
+    private func statusLabel(_ indicator: SenderPresence) -> some View {
+        HStack(spacing: 7) {
+            Image(systemName: indicator.symbol)
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundStyle(indicator.color)
+                .frame(width: 8)
+                .contentTransition(.opacity)
+            Text(indicator.shortLabel)
+                .font(.system(size: 12, weight: .medium))
+                .lineLimit(1)
+                .contentTransition(reduceMotion ? .identity : .numericText())
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("本机会话状态")
-        .accessibilityValue(indicator.rawValue)
-        .help("当前本机会话 · " + indicator.rawValue + "。点击查看设备状态。")
-        .popover(isPresented: $showStatus, arrowEdge: .bottom) { StatusView().environmentObject(model) }
+        .fixedSize()
+        .padding(.horizontal, 12).padding(.vertical, 7)
     }
     private var history: some View {
         ZStack {
@@ -179,9 +189,11 @@ struct ContentView: View {
                                 sentCount: model.sentCount, overlayInset: composerHeight, hasEarlier: model.hasEarlier,
                                 earlier: model.loadEarlier, openAttachment: { file in
                                     Task {
-                                        let text: String
-                                        do { text = try await model.readAttachment(file) }
-                                        catch { text = error.localizedDescription }
+                                        let text: InterfaceMessage
+                                        do {
+                                            let contents = try await model.readAttachment(file)
+                                            text = InterfaceMessage { contents }
+                                        } catch { text = InterfaceMessage { error.localizedDescription } }
                                         preview = AttachmentPreview(name: file.name, text: text)
                                     }
                                 })
@@ -193,7 +205,7 @@ struct ContentView: View {
             if let error = model.error {
                 HStack(spacing: 10) {
                     Image(systemName: "exclamationmark.circle")
-                    Text(error).textSelection(.enabled).lineLimit(3)
+                    Text(error.text).textSelection(.enabled).lineLimit(3)
                     Spacer()
                     Button("重试") { Task { await model.refresh() } }
                 }
@@ -204,11 +216,11 @@ struct ContentView: View {
         }
     }
     private var composer: some View {
-        let readOnlyReason = model.own?.restriction.map { "本机会话" + $0.rawValue }
-            ?? model.peer?.restriction.map { "收件会话" + $0.rawValue }
+        let readOnlyReason = model.own?.restriction.map { L10n.format("本机会话%@", $0.title) }
+            ?? model.peer?.restriction.map { L10n.format("收件会话%@", $0.title) }
         let showsSenderHint = readOnlyReason != nil || model.senderOffline
         return VStack(alignment: .leading, spacing: 0) {
-            ComposerNotice(text: model.notice)
+            ComposerNotice(text: model.notice.text)
             if !model.options.files.isEmpty {
                 ScrollView(.horizontal) {
                     HStack(spacing: 8) {
@@ -219,7 +231,7 @@ struct ContentView: View {
                                     Text(verbatim: file.lastPathComponent).lineLimit(1)
                                     Image(systemName: "xmark").imageScale(.small)
                                 }
-                            }.buttonStyle(.bordered).controlSize(.small).help("移除 " + file.lastPathComponent)
+                            }.buttonStyle(.bordered).controlSize(.small).help(L10n.text("移除 ") + file.lastPathComponent)
                         }
                     }
                 }.scrollIndicators(.hidden)
@@ -227,7 +239,7 @@ struct ContentView: View {
             }
             VStack(alignment: .leading, spacing: 0) {
                 Button { showStatus = true } label: {
-                    Label(readOnlyReason.map { $0 + " · 仅可查看记录" } ?? "本机会话离线 · 查看接入选项",
+                    Label(readOnlyReason.map { $0 + L10n.text(" · 仅可查看记录") } ?? L10n.text("本机会话离线 · 查看接入选项"),
                           systemImage: "network.slash")
                 }
                 .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
@@ -281,7 +293,7 @@ struct ContentView: View {
                         }
                         .buttonStyle(.plain).disabled(!model.canSend)
                         .keyboardShortcut(.return, modifiers: .command)
-                        .help("发送消息（Enter），换行（Shift＋Enter）").accessibilityLabel(model.sending ? "发送中" : "发送消息")
+                        .help("发送消息（Enter），换行（Shift＋Enter）").accessibilityLabel(model.sending ? L10n.text("发送中") : L10n.text("发送消息"))
                     }
                     .padding(.horizontal, 12).padding(.bottom, 9)
                 }
@@ -457,7 +469,7 @@ private final class DraftEditor: NSTextView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         guard string.isEmpty else { return }
-        NSAttributedString(string: "输入消息…", attributes: [
+        NSAttributedString(string: L10n.text("输入消息…"), attributes: [
             .font: font ?? NSFont.systemFont(ofSize: 14),
             .foregroundColor: NSColor(name: nil) { appearance in
                 appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
@@ -468,12 +480,14 @@ private final class DraftEditor: NSTextView {
 }
 
 private struct DraftField: NSViewRepresentable {
+    @Environment(\.locale) private var locale
     @Binding var text: String
     @Binding var focused: Bool
     let heightChanged: (CGFloat) -> Void
     let onSend: () -> Void
 
     final class Coordinator: NSObject, NSTextViewDelegate {
+        var editorLocale: Locale?
         var parent: DraftField
         var requestedHeight: CGFloat?
         init(_ parent: DraftField) { self.parent = parent }
@@ -540,7 +554,6 @@ private struct DraftField: NSViewRepresentable {
         editor.defaultParagraphStyle = paragraph
         editor.typingAttributes = [.font: editor.font!, .foregroundColor: NSColor.labelColor,
                                    .paragraphStyle: paragraph]
-        editor.setAccessibilityLabel("消息内容")
         editor.delegate = context.coordinator
         scroll.documentView = editor
         scroll.contentView.postsBoundsChangedNotifications = true
@@ -551,6 +564,11 @@ private struct DraftField: NSViewRepresentable {
         let scroll = host.scroll
         context.coordinator.parent = self
         guard let editor = scroll.documentView as? DraftEditor else { return }
+        if context.coordinator.editorLocale != locale {
+            context.coordinator.editorLocale = locale
+            editor.setAccessibilityLabel(L10n.text("消息内容"))
+            editor.needsDisplay = true
+        }
         if editor.string != text, !editor.hasMarkedText() {
             let selection = editor.selectedRange()
             editor.string = text
@@ -611,7 +629,7 @@ private struct GroupHeading: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(title)
-        .accessibilityValue(expanded ? "已展开" : "已收起")
+        .accessibilityValue(expanded ? L10n.text("已展开") : L10n.text("已收起"))
     }
 }
 
@@ -639,7 +657,7 @@ private extension SenderPresence {
     var menuImage: Image {
         let size = NSImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
         let palette = NSImage.SymbolConfiguration(paletteColors: [NSColor(color)])
-        guard let symbolImage = NSImage(systemSymbolName: symbol, accessibilityDescription: rawValue)?
+        guard let symbolImage = NSImage(systemSymbolName: symbol, accessibilityDescription: L10n.text(rawValue))?
             .withSymbolConfiguration(size.applying(palette)) else { return Image(systemName: symbol) }
         // The native menu scales its image slot. Center the smaller glyph on a full-size canvas.
         let menuIcon = NSImage(size: NSSize(width: 16, height: 16), flipped: false) { bounds in
@@ -655,10 +673,10 @@ private extension SenderPresence {
 
     var shortLabel: String {
         switch self {
-        case .reconnecting: "接入中"
-        case .unknown: "未知"
-        case .history: "历史"
-        default: rawValue
+        case .reconnecting: L10n.text(SenderPresence.offline.rawValue)
+        case .unknown: L10n.text("未知")
+        case .history: L10n.text("历史")
+        default: L10n.text(rawValue)
         }
     }
 }
@@ -672,10 +690,10 @@ private struct LocalSessionChoices: View {
             Toggle(isOn: Binding(get: { model.selectedLocal == session.name },
                                  set: { _ in model.selectedLocal = session.name })) {
                 Label {
-                    Text(session.title + (session.restriction.map { " · " + $0.rawValue } ?? ""))
+                    Text(session.title + (session.restriction.map { " · " + $0.title } ?? ""))
                 } icon: { presence.menuImage }
             }
-            .accessibilityLabel(session.title + "，" + presence.rawValue)
+            .accessibilityLabel(L10n.format("%@，%@", session.title, L10n.text(presence.rawValue)))
             .help(session.name)
         }
     }
@@ -718,7 +736,7 @@ private struct ConversationSidebar: View {
     @State private var settingsOpen = false
     @State private var confirmingLeave = false
     @State private var leaveTarget: Directory?
-    @State private var leaveFailure: String?
+    @State private var leaveFailure: InterfaceMessage?
 
     @State private var toggledGroups: Set<[String]> = []
     @FocusState private var searchFocused: Bool
@@ -727,7 +745,7 @@ private struct ConversationSidebar: View {
 
     private var senderMenu: some View {
         let indicator = model.senderPresence
-        let title = model.own?.title ?? model.selectedLocal.nonEmpty ?? "选择本机会话"
+        let title = model.own?.title ?? model.selectedLocal.nonEmpty ?? L10n.text("选择本机会话")
         return HStack(spacing: 6) {
             Image(systemName: indicator.symbol)
                 .font(.system(size: 8, weight: .semibold))
@@ -735,7 +753,7 @@ private struct ConversationSidebar: View {
                 .frame(width: 10, height: 12)
                 .contentTransition(.opacity)
                 .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: indicator)
-                .help("本机会话 · " + indicator.rawValue)
+                .help(L10n.text("本机会话 · ") + L10n.text(indicator.rawValue))
                 .accessibilityHidden(true)
             Menu {
                 LocalSessionChoices()
@@ -750,8 +768,8 @@ private struct ConversationSidebar: View {
             .menuStyle(.borderlessButton)
             .menuIndicator(.visible)
             .accessibilityLabel("选择本机会话")
-            .accessibilityValue(title + "，" + indicator.rawValue)
-            .help(title + "\n" + model.selectedLocal + " · " + indicator.rawValue)
+            .accessibilityValue(L10n.format("%@，%@", title, L10n.text(indicator.rawValue)))
+            .help(title + "\n" + model.selectedLocal + " · " + L10n.text(indicator.rawValue))
         }
     }
 
@@ -792,7 +810,7 @@ private struct ConversationSidebar: View {
             rows.append(.person(person))
             guard expansion([person]).wrappedValue else { continue }
             let agents = Dictionary(grouping: groups[person] ?? []) {
-                $0.restriction != nil ? "历史记录" : $0.offline ? "离线" : NetworkSession.agentDisplayName($0.agent)
+                $0.restriction != nil ? "历史记录" : $0.offline ? "离线" : NetworkSession.agentGroupID($0.agent)
             }
             for name in agents.keys.sorted() {
                 rows.append(.agent(person: person, name: name))
@@ -839,13 +857,13 @@ private struct ConversationSidebar: View {
                         switch row {
                         case .person(let person):
                             let people = expansion([person])
-                            GroupHeading(title: person == model.directory?.person ? person + " · 我" : person,
+                            GroupHeading(title: person == model.directory?.person ? person + L10n.text(" · 我") : person,
                                          icon: "person", expanded: people.wrappedValue) {
                                 people.wrappedValue.toggle()
                             }
                         case .agent(let person, let name):
                             let branch = expansion([person, name])
-                            GroupHeading(title: name, icon: "terminal", expanded: branch.wrappedValue) {
+                            GroupHeading(title: NetworkSession.agentDisplayName(name), icon: "terminal", expanded: branch.wrappedValue) {
                                 branch.wrappedValue.toggle()
                             }
                             .padding(.leading, 13)
@@ -862,7 +880,7 @@ private struct ConversationSidebar: View {
             .accessibilityLabel("会话联系人")
             .overlay(alignment: .top) {
                 if rows.isEmpty && model.directory != nil {
-                    Text(terms.isEmpty ? "暂无可查看的会话" : "没有匹配的会话")
+                    Text(terms.isEmpty ? L10n.text("暂无可查看的会话") : L10n.text("没有匹配的会话"))
                         .font(.callout).foregroundStyle(.secondary).padding(.top)
                 }
             }
@@ -920,15 +938,15 @@ private struct ConversationSidebar: View {
                 guard let id = target.networkID else { return }
                 Task {
                     do { try await model.leaveNetwork(id) }
-                    catch { leaveFailure = SetupInput.redacted(error.localizedDescription) }
+                    catch { leaveFailure = InterfaceMessage { SetupInput.redacted(error.localizedDescription) } }
                 }
             }
         } message: { target in
-            Text("这台 Mac 上的所有会话都会与「" + (target.team ?? "当前 Network") + "」断开。本机聊天记录会保留，重新加入同一个 Network 后可以继续查看。")
+            Text(L10n.format("这台 Mac 上的所有会话都会与「%@」断开。本机聊天记录会保留，重新加入同一个 Network 后可以继续查看。", target.team ?? L10n.text("当前 Network")))
         }
         .alert("无法退出 Network", isPresented: Binding(get: { leaveFailure != nil }, set: { if !$0 { leaveFailure = nil } })) {
             Button("好", role: .cancel) {}
-        } message: { Text(leaveFailure ?? "") }
+        } message: { Text(leaveFailure?.text ?? "") }
         .sheet(item: $page) { destination in
             switch destination {
             case .overview: NetworkOverview()
@@ -988,7 +1006,7 @@ private struct ConversationHistory: View {
             if messages.isEmpty && !failed {
                 Group {
                     if waiting { ProgressView().controlSize(.small).accessibilityLabel("载入会话") }
-                    else { Text(hasPeer ? "还没有消息" : "选择一个会话").font(.system(size: 14)).foregroundStyle(.secondary) }
+                    else { Text(hasPeer ? L10n.text("还没有消息") : L10n.text("选择一个会话")).font(.system(size: 14)).foregroundStyle(.secondary) }
                 }.padding(.top, 94)
             }
         }
@@ -1071,6 +1089,7 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
     private let bubble = NSView()
     private var record: TranscriptRecord?
     private var inset: CGFloat = 12
+    private var displayLocale: Locale?
     private var sender = ""
 
     override var isFlipped: Bool { true }
@@ -1102,7 +1121,8 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
 
     func configure(_ record: TranscriptRecord?, sender: String, inset: CGFloat) {
         let changed = self.record?.message != record?.message
-        let headerChanged = changed || self.sender != sender
+        let headerChanged = changed || self.sender != sender || displayLocale != L10n.shared.locale
+        displayLocale = L10n.shared.locale
         self.sender = sender
         self.record = record
         self.inset = inset
@@ -1111,8 +1131,8 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
         if changed { text.textStorage?.setAttributedString(record.text) }
         if headerChanged {
             let message = record.message
-            header.stringValue = (message.outgoing ? "我" : sender) + " · " +
-                Date(timeIntervalSince1970: message.at).formatted(date: .omitted, time: .shortened)
+            header.stringValue = (message.outgoing ? L10n.text("我") : sender) + " · " +
+                Date(timeIntervalSince1970: message.at).formatted(Date.FormatStyle(date: .omitted, time: .shortened).locale(L10n.shared.locale))
             delivery.stringValue = message.delivery
             header.alignment = message.outgoing ? .right : .left
             delivery.alignment = header.alignment
@@ -1160,6 +1180,7 @@ private final class TranscriptScrollView: NSScrollView {
 }
 
 private struct NativeTranscript: NSViewRepresentable {
+    @Environment(\.locale) private var locale
     let messages: [Message]
     let sender: String
     let sentCount: Int
@@ -1180,6 +1201,7 @@ private struct NativeTranscript: NSViewRepresentable {
         private var reading = ConversationReadingWindow()
         private var latest: [Message] = []
         private var records: [TranscriptRecord] = []
+        private var locale: Locale?
         private var sender = ""
         private var width: CGFloat = 0
         private var inset: CGFloat = 12
@@ -1196,7 +1218,7 @@ private struct NativeTranscript: NSViewRepresentable {
         private var loadingEarlier = false
         private var earlier: ((Message) async throws -> MessagePage)?
         private var openAttachment: ((MessageAttachment) -> Void)?
-        private let earlierButton = NSButton(title: "加载更早的消息", target: nil, action: nil)
+        private let earlierButton = NSButton(title: L10n.text("加载更早的消息"), target: nil, action: nil)
         private func updateEarlierButton() {
             earlierButton.isHidden = !(reading.expanded ? pageHasEarlier : latestHasEarlier)
             earlierButton.isEnabled = !loadingEarlier
@@ -1252,7 +1274,7 @@ private struct NativeTranscript: NSViewRepresentable {
             table.backgroundColor = .clear
             table.dataSource = self
             table.delegate = self
-            table.setAccessibilityLabel("聊天消息")
+            table.setAccessibilityLabel(L10n.text("聊天消息"))
             scroll.borderType = .noBorder
             scroll.drawsBackground = false
             scroll.hasVerticalScroller = true
@@ -1293,7 +1315,13 @@ private struct NativeTranscript: NSViewRepresentable {
                 latestRequest.map { $0 != value.latestRequest } == true
             sentCount = value.sentCount
             latestRequest = value.latestRequest
-            let senderChanged = sender != value.sender
+            let languageChanged = locale != value.locale
+            if languageChanged {
+                locale = value.locale
+                earlierButton.title = L10n.text("加载更早的消息")
+                table.setAccessibilityLabel(L10n.text("聊天消息"))
+            }
+            let senderChanged = sender != value.sender || languageChanged
             sender = value.sender
             latest = value.messages
             if forceLatest { showLatest(); return }
@@ -1495,7 +1523,7 @@ private struct ReceiveModeMenu: View {
                 .frame(width: 14)
                 .contentTransition(reduceMotion ? .identity : .symbolEffect(.replace))
                 .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: actual)
-            Text(actual?.title ?? "接收模式")
+            Text(actual?.title ?? L10n.text("接收模式"))
                 .contentTransition(reduceMotion ? .identity : .numericText(value: Double(
                     actual.flatMap { ReceiveMode.allCases.firstIndex(of: $0) } ?? -1
                 )))
@@ -1530,8 +1558,8 @@ private struct ReceiveModeMenu: View {
                 .allowsHitTesting(false).accessibilityHidden(true)
         }
         .padding(.bottom, 3)
-        .accessibilityLabel("偏好接收模式").accessibilityValue(actual?.title ?? "暂不可用")
-        .help(actual == nil ? "接入后可查看和切换接收模式" : "切换当前本机会话的接收模式")
+        .accessibilityLabel("偏好接收模式").accessibilityValue(actual?.title ?? L10n.text("暂不可用"))
+        .help(actual == nil ? L10n.text("接入后可查看和切换接收模式") : L10n.text("切换当前本机会话的接收模式"))
     }
 }
 
@@ -1549,12 +1577,12 @@ struct StatusView: View {
     @EnvironmentObject private var setup: SetupModel
     @EnvironmentObject private var model: NetworkModel
     @State private var exitSupported = false
-    @State private var exitStatus: String?
+    @State private var exitStatus: InterfaceMessage?
     @State private var diagnostics = false
     @State private var viewportHeight: CGFloat = 0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var refreshing = false
-    @State private var refreshResult: String?
+    @State private var refreshResult: InterfaceMessage?
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 11) {
@@ -1566,7 +1594,7 @@ struct StatusView: View {
                                 LocalSessionChoices()
                                 if model.locals.isEmpty { Text("暂无已连接的本机会话") }
                             } label: {
-                                Text(model.own?.title ?? model.selectedLocal.nonEmpty ?? "选择本机会话").font(.system(size: 13, weight: .semibold))
+                                Text(model.own?.title ?? model.selectedLocal.nonEmpty ?? L10n.text("选择本机会话")).font(.system(size: 13, weight: .semibold))
                             }
                             .menuStyle(.borderlessButton).accessibilityLabel("选择本机会话")
                             Text((model.directory?.person ?? "") + "/" + model.selectedLocal).font(.system(size: 11, design: .monospaced)).lineLimit(2)
@@ -1579,12 +1607,12 @@ struct StatusView: View {
                         .frame(minWidth: 48, maxWidth: .infinity)
                         .overlay {
                             if let restriction = model.own?.restriction {
-                                Text(restriction.rawValue).font(.system(size: 10)).foregroundStyle(.secondary)
+                                Text(restriction.title).font(.system(size: 10)).foregroundStyle(.secondary)
                             } else if let local = model.own, let network = model.directory?.networkID,
                                       model.senderOffline || model.reconnectingSender || model.disconnectingSender || model.tier != nil {
                                 let disconnect = model.disconnectingSender || (!model.senderOffline && !model.reconnectingSender)
-                                let title = disconnect ? (model.disconnectingSender ? "断开中…" : "断开")
-                                                       : (model.reconnectingSender ? "接入中…" : "重新接入")
+                                let title = disconnect ? (model.disconnectingSender ? L10n.text("断开中…") : L10n.text("断开"))
+                                                       : (model.reconnectingSender ? L10n.text("接入中…") : L10n.text("重新接入"))
                                 let transitionValue: Double = (model.disconnectingSender || model.reconnectingSender) ? 1 : (disconnect ? 2 : 0)
                                 Button {
                                     Task { await model.changeSenderConnection(local, network: network, disconnect: disconnect) }
@@ -1592,13 +1620,13 @@ struct StatusView: View {
                                     Text(title)
                                         .font(.system(size: 11, weight: .medium)).lineLimit(1)
                                         .contentTransition(reduceMotion ? .identity : .numericText(value: transitionValue))
-                                        .frame(width: 48)
+                                        .frame(minWidth: 48)
                                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
                                         .contentShape(Rectangle())
                                 }
                                 .buttonStyle(StatusActionStyle(color: disconnect ? .disabledControlTextColor : .secondaryLabelColor))
                                 .disabled((disconnect && !exitSupported) || model.changingSession != nil || model.sending || model.leavingNetwork)
-                                .help(disconnect ? "断开当前本机会话并保留聊天" : "重新接入当前本机会话")
+                                .help(disconnect ? L10n.text("断开当前本机会话并保留聊天") : L10n.text("重新接入当前本机会话"))
                                 .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: title)
                                 .transition(.opacity)
                             }
@@ -1615,10 +1643,10 @@ struct StatusView: View {
                 ForEach(model.directory?.machines ?? []) { device in
                     VStack(alignment: .leading, spacing: 7) {
                         HStack {
-                            Text(device.person + (device.isMe ? " · 本机" : "")).font(.system(size: 12, weight: .medium))
+                            Text(device.person + (device.isMe ? L10n.text(" · 本机") : "")).font(.system(size: 12, weight: .medium))
                             Spacer()
                             Circle().fill(model.online ? (device.online ? Color.primary : Color(nsColor: .systemRed)) : Color.secondary).frame(width: 5, height: 5)
-                            Text(model.online ? device.state : "状态未知").font(.system(size: 11)).monospacedDigit()
+                            Text(model.online ? device.state : L10n.text("状态未知")).font(.system(size: 11)).monospacedDigit()
                         }
                         Text(device.machine).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     }
@@ -1641,14 +1669,14 @@ struct StatusView: View {
                                 else { Image(systemName: "arrow.clockwise") }
                             }
                             .frame(width: 14, height: 14)
-                            Text(refreshing ? "刷新中…" : "刷新对话")
+                            Text(refreshing ? L10n.text("刷新中…") : L10n.text("刷新对话"))
                         }
                     }
                     .buttonStyle(.plain)
                     .disabled(refreshing)
                     .help("刷新会话列表、当前对话消息和设备状态")
                     Spacer()
-                    Text(refreshResult ?? "")
+                    Text(refreshResult?.text ?? "")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                         .accessibilityAddTraits(.updatesFrequently)
@@ -1660,29 +1688,29 @@ struct StatusView: View {
                     .buttonStyle(.plain).font(.system(size: 12))
                 VStack(alignment: .leading, spacing: 4) {
                     let exitAvailable = model.own != nil && (model.own?.hasRegistration == false || exitSupported) && !model.sending && !model.leavingNetwork
-                    Button(model.own?.hasRegistration == false ? "从列表移除" : "退出当前会话", systemImage: "rectangle.portrait.and.arrow.right") {
+                    Button(model.own?.hasRegistration == false ? L10n.text("从列表移除") : L10n.text("退出当前会话"), systemImage: "rectangle.portrait.and.arrow.right") {
                         guard let local = model.own else { return }
-                        exitStatus = "正在退出 " + local.name + "…"
+                        exitStatus = InterfaceMessage { L10n.text("正在退出 ") + local.name + "…" }
                         Task {
                             do {
                                 let address = try await model.exitLocal(local)
-                                exitStatus = (local.hasRegistration ? "已退出 " : "已从列表移除 ") + address
+                                exitStatus = InterfaceMessage { (local.hasRegistration ? L10n.text("已退出 ") : L10n.text("已从列表移除 ")) + address }
                             }
-                            catch { exitStatus = error.localizedDescription }
+                            catch { exitStatus = InterfaceMessage { error.localizedDescription } }
                         }
                     }
                     .buttonStyle(StatusActionStyle(color: exitAvailable ? .labelColor : .disabledControlTextColor))
                     .disabled(!exitAvailable || model.changingSession != nil)
                     if let exitStatus {
-                        Text(exitStatus).font(.caption).foregroundStyle(.secondary)
+                        Text(exitStatus.text).font(.caption).foregroundStyle(.secondary)
                             .accessibilityAddTraits(.updatesFrequently)
                     }
                 }.font(.system(size: 12))
                 DisclosureGroup(isExpanded: $diagnostics) {
-                    if !model.doctor.isEmpty {
+                    if !model.doctor.text.isEmpty {
                         VStack(alignment: .leading, spacing: 10) {
-                            Text(model.doctor).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
-                            if let warning = model.mirrorWarning { Text(warning).font(.system(size: 11)).foregroundStyle(.secondary) }
+                            Text(model.doctor.text).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                            if let warning = model.mirrorWarning { Text(warning.text).font(.system(size: 11)).foregroundStyle(.secondary) }
                             Button("重新检查", systemImage: "arrow.clockwise") { Task { await model.diagnose() } }
                                 .disabled(model.diagnosing)
                         }.padding(.top, 8)
@@ -1760,10 +1788,10 @@ private struct PersonalSessionsView: View {
     }
 
     private var agents: [String] {
-        Set(model.mySessions.map(\.agentName)).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        Set(model.mySessions.map(\.agentGroupID)).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
     }
     private var matches: [PersonalSession] {
-        model.mySessions.filter { (selectedAgent.isEmpty || $0.agentName == selectedAgent) && $0.matches(query) }
+        model.mySessions.filter { (selectedAgent.isEmpty || $0.agentGroupID == selectedAgent) && $0.matches(query) }
     }
 
     var body: some View {
@@ -1782,10 +1810,10 @@ private struct PersonalSessionsView: View {
                 Menu {
                     Picker("工具", selection: $selectedAgent) {
                         Text("全部工具").tag("")
-                        ForEach(agents, id: \.self) { Text($0).tag($0) }
+                        ForEach(agents, id: \.self) { Text(NetworkSession.agentDisplayName($0)).tag($0) }
                     }.pickerStyle(.inline).labelsHidden()
                 } label: {
-                    Text(selectedAgent.nonEmpty ?? "全部工具").lineLimit(1)
+                    Text(selectedAgent.nonEmpty.map(NetworkSession.agentDisplayName) ?? L10n.text("全部工具")).lineLimit(1)
                 }.menuStyle(.borderlessButton).fixedSize().accessibilityLabel("选择工具")
                 Button { Task { await model.refreshMySessions() } } label: {
                     Image(systemName: "arrow.clockwise")
@@ -1795,31 +1823,31 @@ private struct PersonalSessionsView: View {
             .padding(.horizontal, 22).padding(.top, 16)
 
             if let status = model.mySessionsError ?? model.mySessionsNotice {
-                Text(status).font(.system(size: 12)).textSelection(.enabled).padding(.horizontal, 22)
+                Text(status.text).font(.system(size: 12)).textSelection(.enabled).padding(.horizontal, 22)
             }
             if matches.isEmpty {
                 Group {
                     if model.loadingMySessions { ProgressView().controlSize(.small) }
-                    else { Text(query.isEmpty ? "暂无本机会话" : "没有找到匹配的会话").font(.system(size: 12)).foregroundStyle(.secondary) }
+                    else { Text(query.isEmpty ? L10n.text("暂无本机会话") : L10n.text("没有找到匹配的会话")).font(.system(size: 12)).foregroundStyle(.secondary) }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 7) {
-                        let byAgent = Dictionary(grouping: matches, by: \.agentName)
+                        let byAgent = Dictionary(grouping: matches, by: \.agentGroupID)
                         ForEach(byAgent.keys.sorted(), id: \.self) { agent in
-                            heading(agent, icon: "terminal", key: [agent])
+                            heading(NetworkSession.agentDisplayName(agent), icon: "terminal", key: [agent])
                             if !collapsed.contains([agent]) {
                                 let projects = Dictionary(grouping: byAgent[agent] ?? [], by: \.displayProject)
                                 let recent = projects.mapValues { $0.first?.updated ?? .distantPast }
                                 let ordered = projects.keys.sorted {
-                                    if agent == NetworkSession.agentDisplayName("codex"), recent[$0] != recent[$1] {
+                                    if agent == "codex", recent[$0] != recent[$1] {
                                         return (recent[$0] ?? .distantPast) > (recent[$1] ?? .distantPast)
                                     }
                                     return ($0.position, $0.name, $0.id) < ($1.position, $1.name, $1.id)
                                 }
                                 ForEach(ordered, id: \.id) { project in
-                                    heading(project.name, icon: "folder", key: [agent, project.id])
+                                    heading(project.displayName, icon: "folder", key: [agent, project.id])
                                         .padding(.leading, 15)
                                     if !collapsed.contains([agent, project.id]) {
                                         let sessions = (projects[project] ?? []).sorted {
@@ -1847,21 +1875,21 @@ private struct PersonalSessionsView: View {
                 Text(session.title).font(.system(size: 13, weight: .medium)).lineLimit(1).help(session.title)
             }
             Spacer(minLength: 0)
-            Text(session.restriction?.rawValue ?? session.connection.label).font(.system(size: 11)).foregroundStyle(.secondary)
+            Text(session.restriction?.title ?? session.connection.label).font(.system(size: 11)).foregroundStyle(.secondary)
             if model.changingSession == session.id {
                 ProgressView().controlSize(.small).frame(width: 56)
             } else if session.canLeave {
                 Button("退出") { Task { await model.leaveMySession(session) } }
                     .disabled(model.changingSession != nil)
                     .help("停止该会话接入 Reason Network，直到你重新加入。")
-                    .accessibilityLabel("退出 \(session.title)")
+                    .accessibilityLabel(L10n.format("退出 %@", session.title))
             } else if session.canJoin {
                 Button(joinTitle(session)) {
                     Task { await model.joinMySession(session) }
                 }
                 .disabled(model.changingSession != nil)
                 .help("将这个会话加入当前 Reason Network")
-                .accessibilityLabel("加入 \(session.title)")
+                .accessibilityLabel(L10n.format("加入 %@", session.title))
             } else if session.connection == .notJoined {
                 Text("在原工具打开").font(.system(size: 11)).foregroundStyle(.secondary)
             } else if case .online = session.connection, session.restriction == nil {
@@ -1873,9 +1901,9 @@ private struct PersonalSessionsView: View {
 
     private func joinTitle(_ session: PersonalSession) -> String {
         switch session.connection {
-        case .notJoined: "加入"
-        case .paused where !session.supportsImmediateJoin: "允许接入"
-        default: "重新接入"
+        case .notJoined: L10n.text("加入")
+        case .paused where !session.supportsImmediateJoin: L10n.text("允许接入")
+        default: L10n.text("重新接入")
         }
     }
 }

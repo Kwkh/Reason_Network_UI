@@ -7,7 +7,7 @@ struct CopyInvitationButton: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var copyingInvite = false
     @State private var copiedAt: ContinuousClock.Instant?
-    @State private var copyError: String?
+    @State private var copyError: InterfaceMessage?
 
     var body: some View {
         let copied = copiedAt != nil
@@ -38,7 +38,7 @@ struct CopyInvitationButton: View {
                 Label {
                     ZStack(alignment: .leading) {
                         Text("复制邀请链接").hidden().accessibilityHidden(true)
-                        Text(copied ? "已复制" : "复制邀请链接")
+                        Text(copied ? L10n.text("已复制") : L10n.text("复制邀请链接"))
                             .contentTransition(reduceMotion ? .identity : .numericText(value: copied ? 1 : 0))
                             .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: copied)
                     }
@@ -48,10 +48,10 @@ struct CopyInvitationButton: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityValue(copyingInvite ? "获取中…" : "")
+            .accessibilityValue(copyingInvite ? L10n.text("获取中…") : "")
             Spacer()
             if let copyError {
-                Text(copyError).foregroundStyle(.secondary).accessibilityAddTraits(.updatesFrequently)
+                Text(copyError.text).foregroundStyle(.secondary).accessibilityAddTraits(.updatesFrequently)
             }
         }
         .font(.system(size: 12))
@@ -106,7 +106,7 @@ private struct WorkspaceOverviewPage: View {
                 Button("新建 Network", systemImage: "plus") { adding = .create }
                 Button("加入 Network", systemImage: "link") { adding = .join }
             } label: {
-                Text(workspaces.selection?.name ?? model.directory?.team ?? "选择 Network")
+                Text(workspaces.selection?.name ?? model.directory?.team ?? L10n.text("选择 Network"))
                     .font(.title.weight(.semibold)).lineLimit(1).truncationMode(.tail)
             }
             .menuStyle(.borderlessButton).fixedSize(horizontal: true, vertical: false)
@@ -117,7 +117,7 @@ private struct WorkspaceOverviewPage: View {
                 ContentUnavailableView {
                     Label("无法载入网络概览", systemImage: "network.slash")
                 } description: {
-                    Text(error)
+                    Text(error.text)
                 } actions: {
                     Button("重试") { Task { await model.refresh() } }
                 }
@@ -126,14 +126,14 @@ private struct WorkspaceOverviewPage: View {
                     VStack(alignment: .leading, spacing: 22) {
                         VStack(alignment: .leading, spacing: 6) {
                             let verified = directory.machines.first(where: \.isMe)?.verified
-                            Label(directory.person + (verified.map { $0 ? " · 账号已验证" : " · 账号未验证" } ?? ""),
+                            Label(directory.person + (verified.map { $0 ? L10n.text(" · 账号已验证") : L10n.text(" · 账号未验证") } ?? ""),
                                   systemImage: verified == true ? "checkmark.seal" : "person.crop.circle")
                                 .foregroundStyle(.secondary)
                         }
                         CopyInvitationButton().id(ObjectIdentifier(model)).disabled(directory.team?.nonEmpty == nil)
                         HStack(spacing: 40) {
-                            metric("在线会话", directory.sessions.filter(\.available).count)
-                            metric("在线设备", directory.machines.filter(\.online).count)
+                            metric(L10n.text("在线会话"), directory.sessions.filter(\.available).count)
+                            metric(L10n.text("在线设备"), directory.machines.filter(\.online).count)
                         }
                         Divider()
                         sessionList(directory)
@@ -147,7 +147,7 @@ private struct WorkspaceOverviewPage: View {
                                         .foregroundStyle(.secondary).frame(width: 24)
                                     VStack(alignment: .leading, spacing: 3) {
                                         Text(device.machine).lineLimit(1).help(device.machine)
-                                        Text(device.person + (device.isMe ? " · 本机" : ""))
+                                        Text(device.person + (device.isMe ? L10n.text(" · 本机") : ""))
                                             .font(.caption).foregroundStyle(.secondary)
                                     }
                                     Spacer()
@@ -184,13 +184,13 @@ private struct WorkspaceOverviewPage: View {
         let addressCounts = Dictionary(grouping: directory.sessions, by: \.address).mapValues(\.count)
         return VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text(includeOffline ? "全部会话" : "在线会话").font(.headline)
+                Text(includeOffline ? L10n.text("全部会话") : L10n.text("在线会话")).font(.headline)
                 Spacer()
-                Button(includeOffline ? "只看在线" : "查看全部") { includeOffline.toggle() }
+                Button(includeOffline ? L10n.text("只看在线") : L10n.text("查看全部")) { includeOffline.toggle() }
                     .buttonStyle(.link)
             }
             if sessions.isEmpty {
-                Text(includeOffline ? "暂无已知会话" : "暂无在线会话").foregroundStyle(.secondary)
+                Text(includeOffline ? L10n.text("暂无已知会话") : L10n.text("暂无在线会话")).foregroundStyle(.secondary)
             }
             ForEach(groups.keys.sorted(), id: \.self) { agent in
                 Text(agent).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
@@ -206,7 +206,7 @@ private struct WorkspaceOverviewPage: View {
                         Spacer()
                         Text(session.statusText).font(.caption).foregroundStyle(.secondary)
                         if session.person != directory.person && model.own != nil && (addressCounts[session.address] ?? 0) <= 1 {
-                            Button(session.available ? "发消息" : "查看对话") {
+                            Button(session.available ? L10n.text("发消息") : L10n.text("查看对话")) {
                                 model.selectedPeer = session.address
                                 dismiss()
                             }
@@ -221,7 +221,7 @@ private struct WorkspaceOverviewPage: View {
 enum WorkspaceAction: String, Identifiable {
     case create, join
     var id: Self { self }
-    var title: String { self == .create ? "新建 Network" : "加入 Network" }
+    var title: String { self == .create ? L10n.text("新建 Network") : L10n.text("加入 Network") }
 }
 
 struct WorkspaceForm: View {
@@ -231,7 +231,7 @@ struct WorkspaceForm: View {
     @State var person: String
     @State private var value = ""
     @State private var busy = false
-    @State private var error: String?
+    @State private var error: InterfaceMessage?
     var onComplete: () -> Void = {}
 
     var body: some View {
@@ -242,7 +242,7 @@ struct WorkspaceForm: View {
                 else { SecureField("完整邀请链接", text: $value) }
             }.networkFormField()
             NetworkPersonField(person: $person)
-            if let error { Text(error).foregroundStyle(.red).font(.callout).textSelection(.enabled) }
+            if let error { Text(error.text).foregroundStyle(.red).font(.callout).textSelection(.enabled) }
             HStack {
                 if busy { ProgressView().controlSize(.small) }
                 Spacer()
@@ -256,7 +256,7 @@ struct WorkspaceForm: View {
                             try await workspaces.add(name: value, invitation: action == .join ? value : nil, person: person)
                             dismiss()
                             onComplete()
-                        } catch { self.error = error.localizedDescription }
+                        } catch { self.error = InterfaceMessage { error.localizedDescription } }
                     }
                 }.buttonStyle(SetupActionStyle()).keyboardShortcut(.defaultAction)
                     .disabled(value.isEmpty || person.isEmpty)
