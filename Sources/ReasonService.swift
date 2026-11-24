@@ -484,12 +484,13 @@ actor ReasonService {
     }
     func removeLocal(_ local: LocalSession, network: String, keepListed: Bool = false) throws {
         let engine = try SQLiteStore(networkRoot.appendingPathComponent("network.db"), readOnly: true)
-        let keys = try engine.rows("SELECT key FROM sessions WHERE agent='codex' AND name=?", [local.name]).compactMap { $0["key"] }
+        let registrations = try engine.rows("SELECT key,attached FROM sessions WHERE agent='codex' AND name=?", [local.name])
         guard try teamID(in: engine) == network, expectedTeam == nil || expectedTeam == network else { throw NetworkError("当前 Network 已变化，请刷新。") }
         if local.hasRegistration {
-            guard keys.contains(local.key) else { throw NetworkError("会话注册已变化，请刷新后重试。") }
+            guard let registration = registrations.first(where: { $0["key"] == local.key }) else { throw NetworkError("会话注册已变化，请刷新后重试。") }
             if keepListed {
-                guard !local.historyOnly, try !pausedKeys(in: engine).contains(local.key) else {
+                try verifyLocalThreads([local.key])
+                guard registration["attached"] == "1", !local.historyOnly, try !pausedKeys(in: engine).contains(local.key) else {
                     throw NetworkError("本机会话状态已变化，请刷新后重试。")
                 }
                 // Persist the display intent first. The daemon remains authoritative about being paused.
@@ -498,7 +499,7 @@ actor ReasonService {
             try setParticipation(local.key, paused: true)
             if !keepListed { try forgetDisconnect(local.key, network: network) }
         } else {
-            guard !keepListed, local.historyOnly, keys.isEmpty else { throw NetworkError("该会话已重新注册，请刷新后重试。") }
+            guard !keepListed, local.historyOnly, registrations.isEmpty else { throw NetworkError("该会话已重新注册，请刷新后重试。") }
             _ = try store().rows("INSERT OR IGNORE INTO hidden_local_history(network,name) VALUES(?,?)", [network, local.name])
         }
     }

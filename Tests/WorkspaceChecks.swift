@@ -27,11 +27,16 @@ struct WorkspaceChecks {
     @MainActor
     static func verify(_ hub: WorkspaceController, first: NetworkWorkspace, second: NetworkWorkspace, home: URL) async throws {
         let threadID = UUID().uuidString.lowercased()
+        let betaID = UUID().uuidString.lowercased()
+        let neverJoined = UUID().uuidString.lowercased()
         let codex = home.appendingPathComponent(".codex")
         try FileManager.default.createDirectory(at: codex, withIntermediateDirectories: true)
         let index = try SQLiteStore(codex.appendingPathComponent("state_5.sqlite"), readOnly: false)
         _ = try index.rows("CREATE TABLE threads(id TEXT PRIMARY KEY,title TEXT,cwd TEXT,rollout_path TEXT,updated_at INTEGER,archived INTEGER)")
         _ = try index.rows("INSERT INTO threads VALUES(?,?,?,NULL,1,0)", [threadID,"Alpha",home.path])
+        for (id, title) in [(betaID, "Beta"), (neverJoined, "New thread")] {
+            _ = try index.rows("INSERT INTO threads VALUES(?,?,?,NULL,1,0)", [id,title,home.path])
+        }
         for item in [second, first] {
             hub.select(item)
             await hub.current.refresh()
@@ -44,7 +49,7 @@ struct WorkspaceChecks {
             precondition(hub.items.count == 2 && hub.selection?.id == item.id)
             let socket = SessionSocket(socketURL: NetworkPaths.socket(in: item.root))
             for name in ["alpha","beta"] {
-                let id = name == "alpha" ? threadID : name
+                let id = name == "alpha" ? threadID : betaID
                 let key = "codex:" + id
                 _ = try socket.request(["op":"set_session_participation","key":key,"paused":false])
                 let hook: [String: Any] = ["op":"hook","agent":"codex","event":"stop","session_id":id,
@@ -69,6 +74,27 @@ struct WorkspaceChecks {
         let sender = try require(model.own)
         precondition(model.senderPresence == .online && sender.key == "codex:" + threadID)
         let history = model.messages
+        let joined = Set(["codex:" + threadID, "codex:" + betaID])
+        precondition(Set(model.connectionTargets(disconnect: true).map(\.key)) == joined)
+        await model.changeAllConnections(network: second.id, disconnect: true)
+        precondition(model.senderPresence == .online)
+        await model.changeAllConnections(network: first.id, disconnect: true)
+        precondition(Set(model.connectionTargets(disconnect: false).map(\.key)) == joined)
+        precondition(model.connectionReport == nil && model.connectionTargets(disconnect: true).isEmpty)
+        precondition(model.selectedLocal == "alpha" && model.selectedPeer == "qa/beta" && model.messages == history && model.draft == first.name)
+        hub.select(second)
+        await hub.current.refresh()
+        precondition(Set(hub.current.connectionTargets(disconnect: true).map(\.key)) == joined)
+        hub.select(first)
+        // A missing project should fail only its own reconnect, and remain retryable.
+        _ = try index.rows("UPDATE threads SET cwd=? WHERE id=?", [home.appendingPathComponent("missing-project").path,betaID])
+        await model.changeAllConnections(network: first.id, disconnect: false)
+        precondition(model.senderPresence == .online && model.connectionTargets(disconnect: false).map(\.key) == ["codex:" + betaID])
+        precondition(model.connectionReport?.contains("1/2") == true && model.connectionReport?.contains("Beta") == true)
+        _ = try index.rows("UPDATE threads SET cwd=? WHERE id=?", [home.path,betaID])
+        await model.changeAllConnections(network: first.id, disconnect: false)
+        precondition(model.connectionReport == nil && Set(model.connectionTargets(disconnect: true).map(\.key)) == joined)
+
         await model.changeSenderConnection(sender, network: first.id, disconnect: true)
         precondition(model.senderPresence == .offline && model.own?.key == sender.key && !model.canSend)
         precondition(model.messages == history && model.draft == first.name && model.selectedPeer == "qa/beta")
@@ -88,6 +114,11 @@ struct WorkspaceChecks {
         await model.changeSenderConnection(sender, network: first.id, disconnect: true)
         _ = try await model.exitLocal(sender)
         precondition(!model.locals.contains { $0.key == sender.key })
+        await model.changeAllConnections(network: first.id, disconnect: true)
+        await model.changeAllConnections(network: first.id, disconnect: false)
+        precondition(model.connectionTargets(disconnect: true).map(\.key) == ["codex:" + betaID])
+        precondition(!model.locals.contains { $0.key == "codex:" + neverJoined || $0.key == sender.key })
+        print("PASS: bulk connections target joined sessions in one workspace, preserve drafts and history, report partial failures, retry only offline sessions and exclude never-joined and exited threads")
         print("PASS: disconnect preserves selection, address, history and draft, survives reload, scopes the pause and resumes; exit hides it")
         hub.select(second)
         precondition(hub.current.draft == second.name)

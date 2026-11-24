@@ -39,6 +39,9 @@ struct ReasonNetworkApp: App {
         .windowToolbarStyle(.unified(showsTitle: false))
         .commands {
             SidebarCommands()
+            CommandMenu("Connect") {
+                ConnectionMenuItems(model: workspaces.current)
+            }
             CommandGroup(replacing: .newItem) { }
             CommandGroup(after: .toolbar) {
                 Picker("外观", selection: $appearance) {
@@ -49,5 +52,23 @@ struct ReasonNetworkApp: App {
                 Button("刷新 Network") { Task { await workspaces.current.refresh() } }.keyboardShortcut("r")
             }
         }
+    }
+}
+
+private struct ConnectionMenuItems: View {
+    @ObservedObject var model: NetworkModel
+
+    var body: some View {
+        let network = model.directory?.networkID
+        Button("全部接入", systemImage: "personalhotspot") {
+            if let network { Task { await model.changeAllConnections(network: network, disconnect: false) } }
+        }
+        .keyboardShortcut("1", modifiers: [.command, .option])
+        .disabled(network == nil || model.connectionTargets(disconnect: false).isEmpty)
+        Button("全部断开", systemImage: "personalhotspot.slash") {
+            if let network { Task { await model.changeAllConnections(network: network, disconnect: true) } }
+        }
+        .keyboardShortcut("0", modifiers: [.command, .option])
+        .disabled(network == nil || model.connectionTargets(disconnect: true).isEmpty)
     }
 }

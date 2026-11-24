@@ -52,7 +52,13 @@ final class NetworkModel: ObservableObject {
     @Published private(set) var sentCount = 0
     private var refreshing = false
     private var refreshWaiters: [CheckedContinuation<Void, Never>] = []
-    @Published var notice = ""
+    private var noticeExpiry: Task<Void, Never>?
+    @Published var notice = "" {
+        didSet {
+            noticeExpiry?.cancel()
+            noticeExpiry = nil
+        }
+    }
     @Published var error: String?
     @Published var mirrorWarning: String?
     @Published var doctor = ""
@@ -63,6 +69,8 @@ final class NetworkModel: ObservableObject {
     @Published private(set) var changingSession: String?
     @Published private(set) var mySessionsNotice: String?
     @Published private(set) var mySessionsError: String?
+    @Published private(set) var changingAllConnections = false
+    @Published var connectionReport: String?
     private var requestAgain = false
     private var messageCache: [String: [Message]] = [:]
     private let preferenceScope: String
@@ -121,7 +129,7 @@ final class NetworkModel: ObservableObject {
     @Published private var disconnectingKey: String?
     var disconnectingSender: Bool { own != nil && disconnectingKey == own?.key }
     var canSend: Bool {
-        !leavingNetwork && !sending && online && !senderOffline && !reconnectingSender && !disconnectingSender && own?.historyOnly == false && peer?.available == true && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !options.files.isEmpty)
+        !leavingNetwork && !sending && !changingAllConnections && online && !senderOffline && !reconnectingSender && !disconnectingSender && own?.historyOnly == false && peer?.available == true && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !options.files.isEmpty)
     }
     var online: Bool { directory != nil && error == nil }
     var tier: String? { guard online else { return nil }; return directory?.liveLocalSession(named: selectedLocal, agent: "codex")?.tier }
@@ -237,31 +245,65 @@ final class NetworkModel: ObservableObject {
         }
         sending = false
     }
+    func connectionTargets(disconnect: Bool) -> [LocalSession] {
+        guard online, !sending, !leavingNetwork, changingSession == nil, !changingAllConnections else { return [] }
+        return locals.filter { $0.hasRegistration && presence(for: $0) == (disconnect ? .online : .offline) }
+    }
+
+    func changeAllConnections(network: String, disconnect: Bool) async {
+        let targets = connectionTargets(disconnect: disconnect)
+        guard !targets.isEmpty, directory?.networkID == network else { return }
+        changingAllConnections = true
+        defer { changingAllConnections = false }
+        await changeConnections(targets, network: network, disconnect: disconnect, batch: true)
+    }
+
     func changeSenderConnection(_ local: LocalSession, network: String, disconnect: Bool) async {
-        guard own?.key == local.key, directory?.networkID == network,
-              senderPresence == (disconnect ? .online : .offline),
-              changingSession == nil, !sending, !leavingNetwork else { return }
-        changingSession = local.key
-        if disconnect { disconnectingKey = local.key } else { reconnectingKey = local.key }
+        guard own?.key == local.key, connectionTargets(disconnect: disconnect).contains(where: { $0.key == local.key }) else { return }
+        await changeConnections([local], network: network, disconnect: disconnect, batch: false)
+    }
+
+    private func changeConnections(_ targets: [LocalSession], network: String, disconnect: Bool, batch: Bool) async {
+        guard directory?.networkID == network, changingSession == nil, !sending, !leavingNetwork else { return }
         let key = conversationKey
-        defer { changingSession = nil; disconnectingKey = nil; reconnectingKey = nil }
-        do {
-            if disconnect {
-                try await service.removeLocal(local, network: network, keepListed: true)
-            } else {
-                try await service.reconnectLocal(local, network: network)
-            }
-            await refresh()
-            if key == conversationKey {
-                if !online || senderOffline != disconnect {
-                    notice = "后台尚未确认会话状态，请稍后刷新。"
+        let verb = disconnect ? "断开" : "接入"
+        var errors: [String: String] = [:]
+        defer { changingSession = nil; reconnectingKey = nil; disconnectingKey = nil }
+        for local in targets {
+            changingSession = local.key
+            disconnectingKey = disconnect ? local.key : nil
+            reconnectingKey = disconnect ? nil : local.key
+            do {
+                if disconnect {
+                    try await service.removeLocal(local, network: network, keepListed: true)
                 } else {
-                    notice = ""
+                    try await service.reconnectLocal(local, network: network)
                 }
+            } catch {
+                errors[local.key] = error.localizedDescription
             }
-        } catch {
-            if key == conversationKey { notice = error.localizedDescription }
-            await refresh()
+        }
+        await refresh()
+        guard directory?.networkID == network else { return }
+        reconnectingKey = nil
+        let failures = targets.compactMap { local -> String? in
+            let current = locals.first { $0.key == local.key }
+            if let current, presence(for: current) == (disconnect ? .offline : .online), errors[local.key] == nil { return nil }
+            let reason = errors[local.key] ?? "后台尚未确认会话状态，请稍后刷新。"
+            return batch ? "\(local.title)（\(local.name)） · \(reason)" : reason
+        }
+        if batch {
+            let summary = "已\(verb) \(targets.count - failures.count)/\(targets.count) 个本机会话"
+            notice = summary
+            noticeExpiry = Task { [weak self] in
+                do { try await Task.sleep(for: .seconds(3)) }
+                catch { return }
+                guard !Task.isCancelled else { return }
+                self?.notice = ""
+            }
+            connectionReport = failures.isEmpty ? nil : ([summary] + failures).joined(separator: "\n")
+        } else if key == conversationKey {
+            notice = failures.first ?? ""
         }
     }
     func refreshMySessions() async {

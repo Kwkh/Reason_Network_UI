@@ -4,28 +4,63 @@ import SwiftUI
 struct CopyInvitationButton: View {
     @EnvironmentObject private var workspaces: WorkspaceController
     @EnvironmentObject private var model: NetworkModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var copyingInvite = false
-    @State private var inviteFeedback: String?
+    @State private var copiedAt: ContinuousClock.Instant?
+    @State private var copyError: String?
 
     var body: some View {
+        let copied = copiedAt != nil
         HStack {
-            Button("复制邀请链接", systemImage: "link") {
+            Button {
+                guard !copyingInvite else { return }
                 copyingInvite = true
-                inviteFeedback = nil
+                copyError = nil
                 Task {
                     defer { copyingInvite = false }
                     do {
                         let link = try await model.invitation()
                         guard model === workspaces.current else { return }
                         NSPasteboard.general.clearContents()
-                        inviteFeedback = NSPasteboard.general.setString(link, forType: .string) ? "已复制" : "复制失败"
-                    } catch { inviteFeedback = "获取失败，请检查连接" }
+                        if NSPasteboard.general.setString(link, forType: .string) {
+                            copiedAt = .now
+                        } else {
+                            copiedAt = nil
+                            copyError = "复制失败"
+                        }
+                    } catch {
+                        guard model === workspaces.current else { return }
+                        copiedAt = nil
+                        copyError = "获取失败，请检查连接"
+                    }
                 }
-            }.buttonStyle(.plain).disabled(copyingInvite)
+            } label: {
+                Label {
+                    ZStack(alignment: .leading) {
+                        Text("复制邀请链接").hidden().accessibilityHidden(true)
+                        Text(copied ? "已复制" : "复制邀请链接")
+                            .contentTransition(reduceMotion ? .identity : .numericText(value: copied ? 1 : 0))
+                            .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: copied)
+                    }
+                } icon: {
+                    Image(systemName: "link")
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(copyingInvite ? "获取中…" : "")
             Spacer()
-            Text(copyingInvite ? "获取中…" : inviteFeedback ?? "").foregroundStyle(.secondary)
-                .accessibilityAddTraits(.updatesFrequently)
-        }.font(.system(size: 12))
+            if let copyError {
+                Text(copyError).foregroundStyle(.secondary).accessibilityAddTraits(.updatesFrequently)
+            }
+        }
+        .font(.system(size: 12))
+        .task(id: copiedAt) {
+            guard let copiedAt else { return }
+            do { try await Task.sleep(until: copiedAt.advanced(by: .seconds(2)), clock: .continuous) }
+            catch { return }
+            if self.copiedAt == copiedAt { self.copiedAt = nil }
+        }
     }
 }
 

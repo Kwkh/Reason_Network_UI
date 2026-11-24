@@ -47,6 +47,10 @@ struct ContentView: View {
                                                   set: { if !$0 { model.receiveModeError = nil } })) {
             Button("好", role: .cancel) {}
         } message: { Text(model.receiveModeError ?? "") }
+        .alert("批量连接结果", isPresented: Binding(get: { model.connectionReport != nil },
+                                              set: { if !$0 { model.connectionReport = nil } })) {
+            Button("好", role: .cancel) {}
+        } message: { Text(model.connectionReport ?? "") }
         .fileImporter(isPresented: $pickingFiles, allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
             switch result {
             case .success(let urls): model.attach(urls, to: pickerConversation)
@@ -202,13 +206,9 @@ struct ContentView: View {
     private var composer: some View {
         let readOnlyReason = model.own?.restriction.map { "本机会话" + $0.rawValue }
             ?? model.peer?.restriction.map { "收件会话" + $0.rawValue }
-        let showsSenderHint = readOnlyReason != nil || model.senderOffline || model.reconnectingSender
-        return VStack(alignment: .leading, spacing: 4) {
-            if !model.notice.isEmpty {
-                Text(model.notice)
-                    .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)
-                    .accessibilityAddTraits(.updatesFrequently)
-            }
+        let showsSenderHint = readOnlyReason != nil || model.senderOffline
+        return VStack(alignment: .leading, spacing: 0) {
+            ComposerNotice(text: model.notice)
             if !model.options.files.isEmpty {
                 ScrollView(.horizontal) {
                     HStack(spacing: 8) {
@@ -223,13 +223,12 @@ struct ContentView: View {
                         }
                     }
                 }.scrollIndicators(.hidden)
+                .padding(.bottom, 4)
             }
             VStack(alignment: .leading, spacing: 0) {
                 Button { showStatus = true } label: {
-                    Label(readOnlyReason.map { $0 + " · 仅可查看记录" } ?? (model.reconnectingSender ? "正在重新接入本机会话…" : "本机会话离线 · 查看接入选项"),
+                    Label(readOnlyReason.map { $0 + " · 仅可查看记录" } ?? "本机会话离线 · 查看接入选项",
                           systemImage: "network.slash")
-                        .contentTransition(reduceMotion ? .identity : .numericText())
-                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: model.reconnectingSender)
                 }
                 .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
                 .padding(.horizontal, 18).padding(.top, 10)
@@ -291,6 +290,25 @@ struct ContentView: View {
             .animation(reduceMotion ? nil : .smooth(duration: 0.24), value: editorHeight)
         }
         .padding(.horizontal, 16).padding(.top, 8).padding(.bottom, 16)
+    }
+}
+
+private struct ComposerNotice: View {
+    let text: String
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if !text.isEmpty {
+                Text(text)
+                    .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)
+                    .contentTransition(reduceMotion ? .identity : .numericText())
+                    .accessibilityAddTraits(.updatesFrequently)
+                    .padding(.bottom, 4)
+                    .transition(.opacity.combined(with: .offset(y: 4)))
+            }
+        }
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.22), value: text)
     }
 }
 
