@@ -118,8 +118,10 @@ final class NetworkModel: ObservableObject {
     }
     var reconnectingSender: Bool { own != nil && reconnectingKey == own?.key }
     @Published private(set) var reconnectingKey: String?
+    @Published private var disconnectingKey: String?
+    var disconnectingSender: Bool { own != nil && disconnectingKey == own?.key }
     var canSend: Bool {
-        !leavingNetwork && !sending && online && !senderOffline && !reconnectingSender && own?.historyOnly == false && peer?.available == true && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !options.files.isEmpty)
+        !leavingNetwork && !sending && online && !senderOffline && !reconnectingSender && !disconnectingSender && own?.historyOnly == false && peer?.available == true && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !options.files.isEmpty)
     }
     var online: Bool { directory != nil && error == nil }
     var tier: String? { guard online else { return nil }; return directory?.liveLocalSession(named: selectedLocal, agent: "codex")?.tier }
@@ -235,18 +237,27 @@ final class NetworkModel: ObservableObject {
         }
         sending = false
     }
-    func reconnectSender() async {
-        guard senderOffline, let local = own, let network = directory?.networkID,
+    func changeSenderConnection(_ local: LocalSession, network: String, disconnect: Bool) async {
+        guard own?.key == local.key, directory?.networkID == network,
+              senderPresence == (disconnect ? .online : .offline),
               changingSession == nil, !sending, !leavingNetwork else { return }
         changingSession = local.key
-        reconnectingKey = local.key
+        if disconnect { disconnectingKey = local.key } else { reconnectingKey = local.key }
         let key = conversationKey
-        defer { changingSession = nil; reconnectingKey = nil }
+        defer { changingSession = nil; disconnectingKey = nil; reconnectingKey = nil }
         do {
-            try await service.reconnectLocal(local, network: network)
+            if disconnect {
+                try await service.removeLocal(local, network: network, keepListed: true)
+            } else {
+                try await service.reconnectLocal(local, network: network)
+            }
             await refresh()
             if key == conversationKey {
-                notice = senderOffline ? "后台尚未确认接入，请稍后重试。" : ""
+                if !online || senderOffline != disconnect {
+                    notice = "后台尚未确认会话状态，请稍后刷新。"
+                } else {
+                    notice = ""
+                }
             }
         } catch {
             if key == conversationKey { notice = error.localizedDescription }

@@ -977,7 +977,30 @@ private struct ConversationHistory: View {
     }
 }
 
-private final class TranscriptTextView: NSTextView {}
+private final class TranscriptTextView: NSTextView {
+    private var resizing = false
+
+    override func setFrameSize(_ newSize: NSSize) {
+        let wasResizing = resizing
+        resizing = true
+        defer { resizing = wasResizing }
+        super.setFrameSize(newSize)
+    }
+
+    override func viewDidEndLiveResize() {
+        let wasResizing = resizing
+        resizing = true
+        defer { resizing = wasResizing }
+        super.viewDidEndLiveResize()
+    }
+
+    override func scrollToVisible(_ rect: NSRect) -> Bool {
+        // TextKit tries to reveal the insertion point after resizing even in
+        // read-only bubbles. The transcript already restored the reader's line.
+        guard !resizing else { return false }
+        return super.scrollToVisible(rect)
+    }
+}
 
 private final class TranscriptRecord {
     let message: Message
@@ -1108,7 +1131,11 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
 
 private final class TranscriptScrollView: NSScrollView {
     var widthChanged: ((CGFloat) -> Void)?
+    private(set) var isTiling = false
+
     override func tile() {
+        isTiling = true
+        defer { isTiling = false }
         super.tile()
         widthChanged?(contentSize.width)
     }
@@ -1142,10 +1169,8 @@ private struct NativeTranscript: NSViewRepresentable {
         private var sentCount: Int?
         private var latestRequest: Int?
         private var boundsObserver: NSObjectProtocol?
-        private var scrollObserver: NSObjectProtocol?
-        private var inputMonitor: Any?
-        private var resizeAnchor: Anchor?
-        private var resizeEnd: Task<Void, Never>?
+        // Keep the same character across separate sidebar animations until the reader scrolls.
+        private var readingAnchor: Anchor?
         private var pendingChanged: ((Bool) -> Void)?
         private var publishedPending = false
         private var latestHasEarlier = false
@@ -1167,7 +1192,7 @@ private struct NativeTranscript: NSViewRepresentable {
                     let page = try await earlier(first)
                     guard let self else { return }
                     if self.reading.messages.first?.rowKey == first.rowKey {
-                        let anchor = self.capture()
+                        let anchor = self.readingAnchor ?? self.capture()
                         self.reading.prepend(page, before: first.rowKey)
                         self.pageHasEarlier = page.hasEarlier
                         if page.messages.isEmpty { self.latestHasEarlier = false }
@@ -1184,7 +1209,7 @@ private struct NativeTranscript: NSViewRepresentable {
         }
 
         private struct Anchor {
-            var bottom: Bool
+            let proximity: TranscriptBottomProximity
             var id: Message.RowKey?
             var character: Int?
             var screenY: CGFloat = 0
@@ -1217,36 +1242,18 @@ private struct NativeTranscript: NSViewRepresentable {
             scroll.documentView = table
             scroll.widthChanged = { [weak self] width in self?.resize(to: width) }
             scroll.contentView.postsBoundsChangedNotifications = true
-            scrollObserver = NotificationCenter.default.addObserver(
-                forName: NSScrollView.willStartLiveScrollNotification, object: scroll, queue: .main
-            ) { [weak self] _ in MainActor.assumeIsolated { self?.endResize() } }
-            inputMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .leftMouseDown]) { [weak self] event in
-                if let self, event.window === self.scroll.window,
-                   self.scroll.bounds.contains(self.scroll.convert(event.locationInWindow, from: nil)) {
-                    self.endResize()
-                }
-                return event
-            }
             boundsObserver = NotificationCenter.default.addObserver(
                 forName: NSView.boundsDidChangeNotification, object: scroll.contentView, queue: .main
             ) { [weak self] _ in
                 MainActor.assumeIsolated {
-                    guard let self, !self.updating else { return }
+                    guard let self, !self.updating, !self.scroll.isTiling else { return }
+                    self.readingAnchor = nil
                     if self.reading.hasPendingUpdate && self.bottomProximity == .pinned { self.showLatest() }
                 }
             }
         }
 
-        private func endResize() {
-            resizeEnd?.cancel()
-            resizeEnd = nil
-            resizeAnchor = nil
-        }
-
         deinit {
-            resizeEnd?.cancel()
-            if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) }
-            if let inputMonitor { NSEvent.removeMonitor(inputMonitor) }
             if let boundsObserver { NotificationCenter.default.removeObserver(boundsObserver) }
         }
 
@@ -1272,10 +1279,10 @@ private struct NativeTranscript: NSViewRepresentable {
             sender = value.sender
             latest = value.messages
             if forceLatest { showLatest(); return }
-            let anchor = capture()
-            let pin = reading.receive(latest, proximity: bottomProximity)
+            let anchor = readingAnchor ?? capture()
+            let pin = reading.receive(latest, proximity: anchor.proximity)
             if records.map(\.message) != reading.messages {
-                applyMessages(anchor: pin ? Anchor(bottom: true) : anchor)
+                applyMessages(anchor: pin ? Anchor(proximity: .pinned) : anchor)
             } else if senderChanged {
                 configureVisibleCells()
             }
@@ -1295,12 +1302,11 @@ private struct NativeTranscript: NSViewRepresentable {
         private func showLatest() {
             reading.show(latest)
             updateEarlierButton()
-            applyMessages(anchor: Anchor(bottom: true))
+            applyMessages(anchor: Anchor(proximity: .pinned))
             publishPending()
         }
 
         private func applyMessages(anchor: Anchor) {
-            endResize()
             guard !updating else { return }
             updating = true
             defer { updating = false }
@@ -1324,13 +1330,7 @@ private struct NativeTranscript: NSViewRepresentable {
                let record = record(at: table.row(for: text)) {
                 selection = (record.message.rowKey, text.selectedRange())
             }
-            let anchor = resizeAnchor ?? capture()
-            resizeAnchor = anchor
-            resizeEnd?.cancel()
-            resizeEnd = Task { @MainActor [weak self] in
-                do { try await Task.sleep(for: .milliseconds(180)) } catch { return }
-                self?.resizeAnchor = nil
-            }
+            let anchor = readingAnchor ?? capture()
             updating = true
             defer { updating = false }
             width = newWidth
@@ -1384,15 +1384,16 @@ private struct NativeTranscript: NSViewRepresentable {
         }
 
         private func capture() -> Anchor {
-            if records.isEmpty || bottomProximity == .pinned { return Anchor(bottom: true) }
+            let proximity = bottomProximity
+            if records.isEmpty || proximity == .pinned { return Anchor(proximity: .pinned) }
             let visible = scroll.documentVisibleRect
             var row = min(records.count, max(1, table.row(at: CGPoint(x: 1, y: visible.minY + 40))))
             if let cell = table.view(atColumn: 0, row: row, makeIfNecessary: false) as? TranscriptCell,
                cell.text.convert(cell.text.bounds, to: table).maxY < visible.minY + 40 {
                 row = min(records.count, row + 1)
             }
-            guard let record = record(at: row) else { return Anchor(bottom: false) }
-            var anchor = Anchor(bottom: false, id: record.message.rowKey)
+            guard let record = record(at: row) else { return Anchor(proximity: proximity) }
+            var anchor = Anchor(proximity: proximity, id: record.message.rowKey)
             anchor.screenY = table.rect(ofRow: row).minY - visible.minY
             if let cell = table.view(atColumn: 0, row: row, makeIfNecessary: false) as? TranscriptCell,
                let layout = cell.text.layoutManager, let container = cell.text.textContainer {
@@ -1410,7 +1411,7 @@ private struct NativeTranscript: NSViewRepresentable {
 
         private func restore(_ anchor: Anchor) {
             var origin = scroll.contentView.bounds.origin
-            if anchor.bottom {
+            if anchor.proximity == .pinned {
                 origin.y = max(0, table.bounds.height - scroll.contentSize.height)
             } else if let index = records.firstIndex(where: { $0.message.rowKey == anchor.id }) {
                 let row = index + 1
@@ -1428,7 +1429,11 @@ private struct NativeTranscript: NSViewRepresentable {
                         origin.y = cell.text.convert(CGPoint(x: 0, y: lineY), to: table).y - anchor.screenY
                     }
                 }
-            } else { return }
+            } else {
+                readingAnchor = nil
+                return
+            }
+            readingAnchor = anchor
             var bounds = scroll.contentView.bounds
             bounds.origin = origin
             scroll.contentView.scroll(to: scroll.contentView.constrainBoundsRect(bounds).origin)
@@ -1512,11 +1517,11 @@ private struct ReceiveModeMenu: View {
     }
 }
 
-private struct ExitSessionButtonStyle: ButtonStyle {
-    let available: Bool
+private struct StatusActionStyle: ButtonStyle {
+    let color: NSColor
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .foregroundStyle(Color(nsColor: available ? .labelColor : .disabledControlTextColor))
+            .foregroundStyle(Color(nsColor: color))
             .opacity(configuration.isPressed ? 0.7 : 1)
             .contentShape(Rectangle())
     }
@@ -1557,26 +1562,29 @@ struct StatusView: View {
                         .overlay {
                             if let restriction = model.own?.restriction {
                                 Text(restriction.rawValue).font(.system(size: 10)).foregroundStyle(.secondary)
-                            } else if model.senderOffline || model.reconnectingSender || model.tier != nil {
+                            } else if let local = model.own, let network = model.directory?.networkID,
+                                      model.senderOffline || model.reconnectingSender || model.disconnectingSender || model.tier != nil {
+                                let disconnect = model.disconnectingSender || (!model.senderOffline && !model.reconnectingSender)
+                                let title = disconnect ? (model.disconnectingSender ? "断开中…" : "断开")
+                                                       : (model.reconnectingSender ? "接入中…" : "重新接入")
+                                let transitionValue: Double = (model.disconnectingSender || model.reconnectingSender) ? 1 : (disconnect ? 2 : 0)
                                 Button {
-                                    Task { await model.reconnectSender() }
+                                    Task { await model.changeSenderConnection(local, network: network, disconnect: disconnect) }
                                 } label: {
-                                    Text(model.reconnectingSender ? "接入中…" : model.senderOffline ? "重新接入" : "已接入")
+                                    Text(title)
                                         .font(.system(size: 11, weight: .medium)).lineLimit(1)
-                                        .contentTransition(reduceMotion ? .identity : .numericText())
-                                        .foregroundStyle(.secondary)
+                                        .contentTransition(reduceMotion ? .identity : .numericText(value: transitionValue))
                                         .frame(width: 48)
                                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
                                         .contentShape(Rectangle())
                                 }
-                                .buttonStyle(.plain)
-                                .disabled(!model.senderOffline || model.changingSession != nil || model.sending || model.leavingNetwork)
-                                .help(model.senderOffline ? "重新接入当前本机会话" : "本机会话接入状态")
+                                .buttonStyle(StatusActionStyle(color: disconnect ? .disabledControlTextColor : .secondaryLabelColor))
+                                .disabled((disconnect && !exitSupported) || model.changingSession != nil || model.sending || model.leavingNetwork)
+                                .help(disconnect ? "断开当前本机会话并保留聊天" : "重新接入当前本机会话")
+                                .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: title)
                                 .transition(.opacity)
                             }
                         }
-                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: model.senderOffline || model.reconnectingSender)
-                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: model.reconnectingSender)
                 }
                 .fixedSize(horizontal: false, vertical: true)
                 if let local = model.own, !local.historyOnly, let network = model.directory?.networkID {
@@ -1645,7 +1653,7 @@ struct StatusView: View {
                             catch { exitStatus = error.localizedDescription }
                         }
                     }
-                    .buttonStyle(ExitSessionButtonStyle(available: exitAvailable))
+                    .buttonStyle(StatusActionStyle(color: exitAvailable ? .labelColor : .disabledControlTextColor))
                     .disabled(!exitAvailable || model.changingSession != nil)
                     if let exitStatus {
                         Text(exitStatus).font(.caption).foregroundStyle(.secondary)

@@ -6,6 +6,7 @@ struct PersonalSession: Identifiable {
         case notJoined
         case online(String)
         case offline(String)
+        case disconnected(String)
         case paused(String)
 
         var label: String {
@@ -13,6 +14,7 @@ struct PersonalSession: Identifiable {
             case .notJoined: "未加入"
             case .online: "已加入 · 在线"
             case .offline: "离线 · 保留地址"
+            case .disconnected: "已断开"
             case .paused: "已退出"
             }
         }
@@ -48,7 +50,7 @@ struct PersonalSession: Identifiable {
     var canLeave: Bool {
         guard canManageParticipation else { return false }
         switch connection {
-        case .online, .offline: return true
+        case .online, .offline, .disconnected: return true
         case .notJoined, .paused: return false
         }
     }

@@ -53,7 +53,7 @@ BEE832DE65DB5CA7507F7EF9 = { isa = PBXFrameworksBuildPhase; buildActionMask = 21
  GENERATE_INFOPLIST_FILE = YES; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
  INFOPLIST_KEY_CFBundleDisplayName = "Reason Network"; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
  INFOPLIST_KEY_NSHumanReadableCopyright = "Reason Network local companion";
- CURRENT_PROJECT_VERSION = 15; MARKETING_VERSION = 1.1.6;
+ CURRENT_PROJECT_VERSION = 16; MARKETING_VERSION = 1.1.7;
  CODE_SIGN_STYLE = Manual; CODE_SIGN_IDENTITY = "-"; ENABLE_APP_SANDBOX = NO;
  ENABLE_HARDENED_RUNTIME = YES; OTHER_LDFLAGS = "$(inherited) -lsqlite3";
  SWIFT_OPTIMIZATION_LEVEL = "-Onone";
@@ -66,7 +66,7 @@ E6DE6C99132752C914FEF632 = { isa = XCBuildConfiguration; name = Release; buildSe
  GENERATE_INFOPLIST_FILE = YES; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
  INFOPLIST_KEY_CFBundleDisplayName = "Reason Network"; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
  INFOPLIST_KEY_NSHumanReadableCopyright = "Reason Network local companion";
- CURRENT_PROJECT_VERSION = 15; MARKETING_VERSION = 1.1.6;
+ CURRENT_PROJECT_VERSION = 16; MARKETING_VERSION = 1.1.7;
  CODE_SIGN_STYLE = Manual; CODE_SIGN_IDENTITY = "-"; ENABLE_APP_SANDBOX = NO;
  ENABLE_HARDENED_RUNTIME = YES; OTHER_LDFLAGS = "$(inherited) -lsqlite3";
  SWIFT_OPTIMIZATION_LEVEL = "-O";

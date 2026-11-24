@@ -107,7 +107,8 @@ struct CoreChecks {
             throw NetworkError("offline send accepted")
         } catch is LocalSenderOffline {}
         try expect(!FileManager.default.fileExists(atPath: home.appendingPathComponent("sent.json").path), "offline sender never dispatched")
-        await model.reconnectSender()
+        guard let offlineLocal = model.own, let network = model.directory?.networkID else { throw NetworkError("Missing offline fixture") }
+        await model.changeSenderConnection(offlineLocal, network: network, disconnect: false)
         try expect(!model.notice.isEmpty && model.senderOffline && model.options == original, "unavailable native thread leaves draft intact")
         try FileManager.default.removeItem(at: marker)
         await model.refresh()

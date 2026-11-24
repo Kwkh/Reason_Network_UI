@@ -48,6 +48,8 @@ actor ReasonService {
         try selectNetwork(network, in: cache)
         let paused = try pausedKeys(in: engine)
         let codexRecords = try engine.rows("SELECT name,key,doing,attached FROM sessions WHERE agent='codex' ORDER BY last_seen DESC")
+        let retained = try disconnectedKeys(network)
+        for key in retained.subtracting(paused) { try forgetDisconnect(key, network: network) }
         let registrations = codexRecords.filter { !paused.contains($0["key"] ?? "") }
         let catalog = PersonalSessionCatalog(home: home)
         let attached = registrations.filter { $0["attached"] == "1" }
@@ -79,7 +81,11 @@ actor ReasonService {
             }
         }
         let labels = try cache.sessionLabels(network: network, sessions: &directory.sessions)
-        var locals = attached.compactMap { row -> LocalSession? in
+        let disconnected = codexRecords.filter { row in
+            guard let key = row["key"] else { return false }
+            return paused.contains(key) && retained.contains(key)
+        }
+        var locals = (attached + disconnected).compactMap { row -> LocalSession? in
             guard let name = row["name"], let key = row["key"] else { return nil }
             let index = directory.sessions.firstIndex {
                 $0.person == directory.person && $0.machine == directory.machine && $0.name == name && $0.agent == "codex"
@@ -124,9 +130,10 @@ actor ReasonService {
         let pausedNames = Set(codexRecords.filter { paused.contains($0["key"] ?? "") }.compactMap { $0["name"] })
         let registeredNames = Set(codexRecords.compactMap { $0["name"] })
         let hiddenHistory = Set(try cache.rows("SELECT name FROM hidden_local_history WHERE network=?", [network]).compactMap { $0["name"] })
-        let hiddenNames = pausedNames.union(hiddenHistory.subtracting(registeredNames))
+        let disconnectedNames = Set(disconnected.compactMap { $0["name"] })
+        let hiddenNames = pausedNames.subtracting(disconnectedNames).union(hiddenHistory.subtracting(registeredNames))
         directory.sessions.removeAll {
-            $0.person == directory.person && $0.machine == directory.machine && $0.agent == "codex" && hiddenNames.contains($0.name)
+            $0.person == directory.person && $0.machine == directory.machine && $0.agent == "codex" && (hiddenNames.contains($0.name) || disconnectedNames.contains($0.name))
         }
         let knownNames = Set(locals.map(\.name)).union(hiddenNames)
         for row in try cache.rows("SELECT DISTINCT local_session FROM network_events WHERE network=? ORDER BY local_session", [network]) {
@@ -374,8 +381,10 @@ actor ReasonService {
                                   uniquingKeysWith: { $0.updated > $1.updated ? $0 : $1 })
         let enginePath = networkRoot.appendingPathComponent("network.db")
         let knownRecords: [[String: String]]
+        var retained = Set<String>()
         if FileManager.default.fileExists(atPath: enginePath.path) {
             let engine = try SQLiteStore(enginePath, readOnly: true)
+            if let network = try teamID(in: engine) { retained = try disconnectedKeys(network) }
             knownRecords = try engine.rows("SELECT key,agent,name,cwd,doing,last_seen FROM sessions WHERE attached=1 OR tier!='none'")
         } else {
             knownRecords = []
@@ -397,7 +406,7 @@ actor ReasonService {
             if agent == "codex", item.nativeID != nil { item.nativeID = String(key.dropFirst("codex:".count)) }
             item.canManageParticipation = participation != nil
             if participation?.paused.contains(key) == true {
-                item.connection = .paused(address)
+                item.connection = retained.contains(key) ? .disconnected(address) : .paused(address)
             } else if current?.offline == false {
                 item.connection = .online(address)
             } else {
@@ -409,28 +418,40 @@ actor ReasonService {
     }
     func reconnectLocal(_ local: LocalSession, network: String) throws {
         let engine = try SQLiteStore(networkRoot.appendingPathComponent("network.db"), readOnly: true)
-        guard try teamID(in: engine) == network, !local.historyOnly,
-              try engine.rows("SELECT key FROM sessions WHERE name=? AND agent='codex' AND attached=1", [local.name]).first?["key"] == local.key,
-              try !pausedKeys(in: engine).contains(local.key) else {
+        guard try teamID(in: engine) == network, expectedTeam == nil || expectedTeam == network, !local.historyOnly,
+              try engine.rows("SELECT key FROM sessions WHERE name=? AND agent='codex' AND attached=1", [local.name]).first?["key"] == local.key else {
             throw NetworkError("本机会话或 Network 已变化，请刷新后重新选择。")
         }
+        let paused = try pausedKeys(in: engine).contains(local.key)
+        if paused, try !disconnectedKeys(network).contains(local.key) { throw NetworkError("本机会话已退出 Network。") }
         try verifyLocalThreads([local.key])
-        if try directory().liveLocalSession(named: local.name, agent: "codex") != nil { return }
+        if !paused, try directory().liveLocalSession(named: local.name, agent: "codex") != nil { return }
         guard var session = try PersonalSessionCatalog(home: home).discover().sessions.first(where: { $0.agent == "codex" && $0.id.lowercased() == local.key.lowercased() }) else {
             throw NetworkError("找不到这个本机 Codex 对话，请在 Codex 中打开后重试。")
         }
+        session.id = local.key
         session.nativeID = String(local.key.dropFirst("codex:".count))
-        _ = try registerPersonalSession(session)
+        if paused {
+            _ = try resumePersonalSession(session, address: local.name)
+            try forgetDisconnect(local.key, network: network)
+        } else {
+            _ = try registerPersonalSession(session)
+        }
     }
 
     func joinPersonalSession(_ key: String) throws -> String {
         guard let chosen = try personalSessions().first(where: { $0.id == key }), chosen.canJoin else {
             throw NetworkError("这个会话还需要在原工具中打开，或已经在线。")
         }
-        if case .paused = chosen.connection {
-            return try resumePersonalSession(chosen)
+        switch chosen.connection {
+        case .paused(let address), .disconnected(let address):
+            let network = try currentNetworkID()
+            let result = try resumePersonalSession(chosen, address: address)
+            try forgetDisconnect(key, network: network)
+            return result
+        default:
+            return try registerPersonalSession(chosen)
         }
-        return try registerPersonalSession(chosen)
     }
     private func registerPersonalSession(_ chosen: PersonalSession) throws -> String {
         guard let nativeID = chosen.nativeID, let cwd = chosen.cwd else {
@@ -461,15 +482,23 @@ actor ReasonService {
         guard let address = reply.address?.nonEmpty else { throw NetworkError("引擎没有返回会话地址。") }
         return address
     }
-    func removeLocal(_ local: LocalSession, network: String) throws {
+    func removeLocal(_ local: LocalSession, network: String, keepListed: Bool = false) throws {
         let engine = try SQLiteStore(networkRoot.appendingPathComponent("network.db"), readOnly: true)
         let keys = try engine.rows("SELECT key FROM sessions WHERE agent='codex' AND name=?", [local.name]).compactMap { $0["key"] }
-        guard try teamID(in: engine) == network else { throw NetworkError("当前 Network 已变化，请刷新。") }
+        guard try teamID(in: engine) == network, expectedTeam == nil || expectedTeam == network else { throw NetworkError("当前 Network 已变化，请刷新。") }
         if local.hasRegistration {
             guard keys.contains(local.key) else { throw NetworkError("会话注册已变化，请刷新后重试。") }
+            if keepListed {
+                guard !local.historyOnly, try !pausedKeys(in: engine).contains(local.key) else {
+                    throw NetworkError("本机会话状态已变化，请刷新后重试。")
+                }
+                // Persist the display intent first. The daemon remains authoritative about being paused.
+                _ = try store().rows("INSERT OR IGNORE INTO disconnected_locals(network,key) VALUES(?,?)", [network, local.key])
+            }
             try setParticipation(local.key, paused: true)
+            if !keepListed { try forgetDisconnect(local.key, network: network) }
         } else {
-            guard local.historyOnly, keys.isEmpty else { throw NetworkError("该会话已重新注册，请刷新后重试。") }
+            guard !keepListed, local.historyOnly, keys.isEmpty else { throw NetworkError("该会话已重新注册，请刷新后重试。") }
             _ = try store().rows("INSERT OR IGNORE INTO hidden_local_history(network,name) VALUES(?,?)", [network, local.name])
         }
     }
@@ -480,17 +509,16 @@ actor ReasonService {
         }
         let address: String
         switch chosen.connection {
-        case .online(let value), .offline(let value): address = value
+        case .online(let value), .offline(let value), .disconnected(let value): address = value
         case .notJoined, .paused: throw NetworkError("该会话已经退出。")
         }
+        let network = try currentNetworkID()
         try setParticipation(key, paused: true)
+        try forgetDisconnect(key, network: network)
         return address
     }
 
-    private func resumePersonalSession(_ session: PersonalSession) throws -> String {
-        guard case .paused(let address) = session.connection else {
-            throw NetworkError("该会话无需恢复接入。")
-        }
+    private func resumePersonalSession(_ session: PersonalSession, address: String) throws -> String {
         try setParticipation(session.id, paused: false)
         guard session.supportsImmediateJoin else { return address }
         do {
@@ -499,6 +527,22 @@ actor ReasonService {
             try setParticipation(session.id, paused: true)
             throw error
         }
+    }
+
+    private func currentNetworkID() throws -> String {
+        let db = try SQLiteStore(networkRoot.appendingPathComponent("network.db"), readOnly: true)
+        guard let network = try teamID(in: db), expectedTeam == nil || expectedTeam == network else {
+            throw NetworkError("当前 Network 已变化，请刷新。")
+        }
+        return network
+    }
+
+    private func disconnectedKeys(_ network: String) throws -> Set<String> {
+        Set(try store().rows("SELECT key FROM disconnected_locals WHERE network=?", [network]).compactMap { $0["key"] })
+    }
+
+    private func forgetDisconnect(_ key: String, network: String) throws {
+        _ = try store().rows("DELETE FROM disconnected_locals WHERE network=? AND key=?", [network, key])
     }
 
     private func pausedKeys(in database: SQLiteStore) throws -> Set<String> {
@@ -614,6 +658,7 @@ actor ReasonService {
               title TEXT,activity TEXT,PRIMARY KEY(network,address))
             """)
         _ = try database.rows("CREATE TABLE IF NOT EXISTS hidden_local_history(network TEXT NOT NULL,name TEXT NOT NULL,PRIMARY KEY(network,name))")
+        _ = try database.rows("CREATE TABLE IF NOT EXISTS disconnected_locals(network TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(network,key))")
         cache = database
         return database
     }
