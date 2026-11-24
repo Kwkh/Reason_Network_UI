@@ -12,8 +12,8 @@ final class NetworkModel: ObservableObject {
     @Published var messages: [Message] = []
     @Published private(set) var waitingForHistory = true
     @Published var conversations: [NetworkSession] = []
-    @Published var selectedLocal: String { didSet { guard oldValue != selectedLocal else { return }; UserDefaults.standard.set(selectedLocal, forKey: "selectedLocal"); changedConversation() } }
-    @Published var selectedPeer: String { didSet { guard oldValue != selectedPeer else { return }; UserDefaults.standard.set(selectedPeer, forKey: "selectedPeer"); changedConversation() } }
+    @Published var selectedLocal: String { didSet { guard oldValue != selectedLocal else { return }; UserDefaults.standard.set(selectedLocal, forKey: "selectedLocal" + preferenceScope); changedConversation() } }
+    @Published var selectedPeer: String { didSet { guard oldValue != selectedPeer else { return }; UserDefaults.standard.set(selectedPeer, forKey: "selectedPeer" + preferenceScope); changedConversation() } }
     struct Draft: Equatable {
         var text = ""
         var files: [URL] = []
@@ -63,13 +63,14 @@ final class NetworkModel: ObservableObject {
     @Published private(set) var changingSession: String?
     @Published private(set) var mySessionsNotice: String?
     @Published private(set) var mySessionsError: String?
-    private var running = false
     private var requestAgain = false
     private var messageCache: [String: [Message]] = [:]
-    init(service: ReasonService = ReasonService()) {
+    private let preferenceScope: String
+    init(service: ReasonService = ReasonService(), preferenceScope: String = "") {
+        self.preferenceScope = preferenceScope
         self.service = service
-        selectedLocal = UserDefaults.standard.string(forKey: "selectedLocal") ?? ""
-        selectedPeer = UserDefaults.standard.string(forKey: "selectedPeer") ?? ""
+        selectedLocal = UserDefaults.standard.string(forKey: "selectedLocal" + preferenceScope) ?? ""
+        selectedPeer = UserDefaults.standard.string(forKey: "selectedPeer" + preferenceScope) ?? ""
     }
     var conversationKey: String { (directory?.networkID ?? "") + "/" + selectedLocal + "/" + selectedPeer }
     var draft: String {
@@ -148,8 +149,6 @@ final class NetworkModel: ObservableObject {
     }
 
     func start() async {
-        guard !running else { return }; running = true
-        defer { running = false }
         while !Task.isCancelled {
             await refresh()
             do { try await Task.sleep(for: .seconds(3)) } catch { break }

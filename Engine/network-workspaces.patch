@@ -1,0 +1,576 @@
+diff --git a/src/daemon/directory.rs b/src/daemon/directory.rs
+index 12251d9..bb5fe23 100644
+--- a/src/daemon/directory.rs
++++ b/src/daemon/directory.rs
+@@ -64,7 +64,7 @@ enum Place {
+ impl Daemon {
+     /// This machine's sessions: running ones, plus (if `unmanaged`) Claude Code sessions without Reason Network.
+     pub(super) async fn local_rows(self: &Arc<Self>, me: Option<&str>, unmanaged: bool) -> Result<Vec<SessionInfo>> {
+-        let claude = self.shared(tokio::task::spawn_blocking(claude::scan).await?);
++        let claude = if crate::paths::managed_workspace() { Vec::new() } else { self.shared(tokio::task::spawn_blocking(claude::scan).await?) };
+         let mut cwds: Vec<String> = self.inner.lock().unwrap().live.values().map(|l| l.reg.cwd.clone()).collect();
+         cwds.extend(claude.iter().filter_map(|c| c.cwd.clone()));
+         let mut gits: HashMap<String, GitInfo> = HashMap::new();
+diff --git a/src/daemon/mail.rs b/src/daemon/mail.rs
+index 7a2ba92..702e68e 100644
+--- a/src/daemon/mail.rs
++++ b/src/daemon/mail.rs
+@@ -212,6 +212,14 @@ impl Daemon {
+                 None => "unknown",
+             };
+             let exclude = sender.reg.key.clone();
++            let (scope,to) = to.split_once("::").map_or((None,to), |(id,dst)|(Some(id),dst));
++            if let Some(id)=scope && g.team.as_ref().map(|t|t.id.as_str())!=Some(id) {bail!("Wrong Network");}
++            let reply_to = if let Some(parent)=reply_to.as_deref().and_then(|v|v.split_once("::")) {
++                if Some(parent.0)!=scope {bail!("Wrong reply Network");}
++                let original=g.store.message(parent.1)?.ok_or_else(||anyhow!("Original message not in this Network"))?;
++                if original.to!=from_addr || render::without_machine(&original.from)!=render::without_machine(to) {bail!("Reply does not match original mailbox or sender");}
++                Some(parent.1.to_owned())
++            } else {reply_to.clone()};
+             if let Some(key) = &idempotency_key {
+                 let key = blake3::hash(serde_json::to_string(&(&self.person, &exclude, key))?.as_bytes())
+                     .to_hex()
+@@ -525,7 +533,7 @@ impl Daemon {
+         };
+         let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+         let cli = matches!(channel, Channel::ClaudeDirect(_));
+-        let text = render::for_agent(&msgs, Some(&l.reg.agent), cli);
++        let text = render::for_agent_in(&msgs, Some(&l.reg.agent), cli, g.team.as_ref());
+         let claude_session = l.reg.agent_session_id.clone();
+         let hook_note = if matches!(l.reg.agent.as_str(), "opencode" | "pi") {
+             "queued: delivered within seconds once the session is idle"
+@@ -937,7 +945,7 @@ impl Daemon {
+             };
+             if !messages.is_empty() || tokio::time::Instant::now() >= deadline {
+                 // A `reason network listen` session replies with the CLI.
+-                let text = render::for_agent(&messages, agent.as_deref(), agent.as_deref() == Some("cli"));
++                let text = render::for_agent_in(&messages, agent.as_deref(), agent.as_deref() == Some("cli"), self.team_state().as_ref());
+                 return Ok(Inbox { messages, text });
+             }
+             let _ = tokio::time::timeout_at(deadline, arrived).await;
+diff --git a/src/daemon/mod.rs b/src/daemon/mod.rs
+index 3de5e54..432b2d0 100644
+--- a/src/daemon/mod.rs
++++ b/src/daemon/mod.rs
+@@ -12,6 +12,8 @@ mod reason;
+ mod sessions;
+ mod teamops;
+ mod update;
++#[cfg(unix)]
++mod workspaces;
+ 
+ use crate::{
+     config::Config,
+@@ -73,13 +75,13 @@ pub async fn run(service: bool) -> Result<()> {
+     if daemon.cfg.tray() && (service || crate::setup::service_installed()) {
+         tokio::spawn(tray());
+     }
+-    if daemon.cfg.reason {
++    if daemon.cfg.reason && !paths::managed_workspace() {
+         tokio::spawn(daemon.clone().reason_loop());
+     }
+     if crate::managed() {
+         tokio::spawn(daemon.clone().relay_loop());
+     }
+-    tokio::spawn(crate::migrate::run(log));
++    if !paths::managed_workspace() { tokio::spawn(crate::migrate::run(log)); }
+     tokio::spawn(daemon.clone().relays_loop());
+     if std::env::var_os("REASON_NETWORK_LOCAL_PARTICIPATION").is_none() && update::allowed(daemon.cfg.auto_update) {
+         tokio::spawn(daemon.clone().update_loop());
+@@ -349,7 +351,10 @@ impl Daemon {
+             let (this, tx) = (self.clone(), tx.clone());
+             // Each request runs on its own task: an inbox long-poll must not block the connection.
+             let task = async move {
+-                let reply = match this.handle(conn, f.body).await {
++                let reply = match {
++                    #[cfg(unix)] { this.dispatch(conn, f.body).await }
++                    #[cfg(not(unix))] { this.handle(conn, f.body).await }
++                } {
+                     Ok(v) => Reply::ok(f.id, v),
+                     Err(e) => Reply::err(f.id, e),
+                 };
+@@ -378,10 +383,25 @@ impl Daemon {
+             self.usage.count("tool", crate::usage::Dimensions { bucket: operation.into(), ..Default::default() }, 1);
+         }
+         Ok(match req {
++            Request::EnableWorkspaces => {
++                let g = self.inner.lock().unwrap();
++                if let Some(t) = &g.team {
++                    if g.store.get("manual-network")?.is_none() {
++                        for s in g.store.sessions()? {
++                            if s.attached && s.agent == "codex" && !g.paused.contains(&s.key) {
++                                g.store.set(&format!("workspace-member:{}",s.key), &t.id)?;
++                            }
++                        }
++                    }
++                }
++                g.store.set("manual-network","1")?;
++                Value::Null
++            }
++            Request::WorkspaceDispatch { .. } => anyhow::bail!("Invalid workspace dispatch"),
+             Request::SessionParticipation => {
+                 let g = self.inner.lock().unwrap();
+                 let pending: Vec<_> = g.live.iter().filter(|(_, l)| l.codex_resume_pending).map(|(key, _)| key).collect();
+-                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true,
++                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true, "workspaces": true,
+                         "resume_pending": pending })
+             }
+             Request::SetReceiveMode { key, network, mode } => {
+diff --git a/src/daemon/sessions.rs b/src/daemon/sessions.rs
+index 3308273..c31cdc3 100644
+--- a/src/daemon/sessions.rs
++++ b/src/daemon/sessions.rs
+@@ -87,7 +87,7 @@ impl Daemon {
+ 
+     pub(super) fn set_session_participation(&self, key: &str, paused: bool) -> Result<()> {
+         let mut g = self.inner.lock().unwrap();
+-        if paused && !g.live.contains_key(key) && g.store.session_by_key(key)?.is_none() {
++        if paused && !g.live.contains_key(key) && g.store.session_by_key(key)?.is_none() && g.store.get(&format!("workspace-member:{key}"))?.is_none() {
+             bail!("this session is not registered");
+         }
+         if !paused && g.paused.contains(key)
+@@ -95,6 +95,10 @@ impl Daemon {
+         {
+             g.store.touch_session(&session.name, util::now_ms())?;
+         }
++        if crate::paths::managed_workspace() || g.store.get("manual-network")?.is_some() {
++            let team = g.team.as_ref().ok_or_else(|| anyhow!("No Network"))?;
++            g.store.set(&format!("workspace-member:{key}"), if paused { "" } else { &team.id })?;
++        }
+         g.store.set_session_paused(key, paused)?;
+         if paused {
+             g.paused.insert(key.to_owned());
+@@ -151,6 +155,14 @@ impl Daemon {
+         let mut g = self.inner.lock().unwrap();
+         let g = &mut *g;
+         let key = reg.key.clone();
++        // An explicitly joined mailbox remains addressable through the broker even in pull mode.
++        let manual = crate::paths::managed_workspace() || reg.agent == "codex" && g.store.get("manual-network")?.is_some();
++        if manual {
++            let member = g.store.get(&format!("workspace-member:{key}"))?;
++            if reg.agent != "codex" || g.team.as_ref().is_none_or(|t| member.as_ref() != Some(&t.id)) {
++                bail!(SESSION_PAUSED);
++            }
++        }
+         if g.paused.contains(&key) { bail!(SESSION_PAUSED); }
+         if reg.agent == "antigravity" && conn.is_some() && reg.tier == Tier::Push {
+             let allowed =
+@@ -195,7 +207,7 @@ impl Daemon {
+                 l.mcp_push = reg.tier == Tier::Push;
+             }
+             l.reg.tier = if l.push_failed { l.reg.tier.max(Tier::Turn) } else { l.reg.tier.min(reg.tier) };
+-            l.attached |= l.reg.tier == Tier::Push;
++            l.attached |= manual || l.reg.tier == Tier::Push;
+             if l.last_hook.is_none() {
+                 l.reg.cwd = reg.cwd;
+                 l.git = git;
+@@ -207,7 +219,7 @@ impl Daemon {
+             }
+             let name = pick_name(g, &reg, &git, &others, &self.person, |r| self.holds(r, now))?;
+             self.take_over(g, &name, &key)?;
+-            let attached = conn.is_some() || reg.tier == Tier::Push || reg.agent == "cli";
++            let attached = manual || conn.is_some() || reg.tier == Tier::Push || reg.agent == "cli";
+             let mcp_push = conn.is_some() && reg.tier == Tier::Push;
+             self.usage.count(
+                 "registered",
+@@ -552,7 +564,7 @@ impl Daemon {
+         if !ids.is_empty() {
+             self.reached(g, &key);
+         }
+-        let text = (!msgs.is_empty()).then(|| render::for_agent(&msgs, Some(&agent_kind), false));
++        let text = (!msgs.is_empty()).then(|| render::for_agent_in(&msgs, Some(&agent_kind), false, g.team.as_ref()));
+         Ok(HookReply { address: Some(address), text, ids })
+     }
+ 
+diff --git a/src/daemon/workspaces.rs b/src/daemon/workspaces.rs
+new file mode 100644
+index 0000000..b79821f
+--- /dev/null
++++ b/src/daemon/workspaces.rs
+@@ -0,0 +1,290 @@
++//! Workspace agents share one Codex MCP/hook installation. Route by confirmed team and native thread,
++//! independently of the window's selection. Local socket replies are never retried after a timeout.
++use super::*;
++use anyhow::bail;
++use rusqlite::{Connection, OpenFlags, OptionalExtension};
++use std::path::PathBuf;
++
++pub(super) fn root() -> PathBuf {
++    paths::user_home().join(".reason/workspaces")
++}
++pub(super) fn managed() -> bool {
++    paths::home().parent() == Some(root().as_path())
++}
++
++struct Workspace {
++    team: String,
++    name: String,
++    dir: PathBuf,
++}
++
++fn joined(key: &str) -> Result<Vec<Workspace>> {
++    let entries = match std::fs::read_dir(root()) {
++        Ok(entries) => entries,
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
++        Err(e) => return Err(e.into()),
++    };
++    let mut found = Vec::new();
++    for entry in entries {
++        let entry = entry?;
++        if !entry.file_type()?.is_dir() {
++            continue;
++        }
++        let dir = entry.path();
++        let path = dir.join("network.db");
++        if !path.is_file() {
++            continue;
++        }
++        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
++        db.busy_timeout(std::time::Duration::from_millis(500))?;
++        if !db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='kv')", [], |r| r.get::<_, bool>(0))? {
++            continue;
++        }
++        let member = format!("workspace-member:{key}");
++        let item = db
++            .query_row(
++                "SELECT json_extract(value,'$.id'),json_extract(value,'$.meta.body.name') FROM kv
++            WHERE key='team' AND EXISTS(SELECT 1 FROM kv m WHERE m.key=? AND m.value=json_extract(kv.value,'$.id'))",
++                [member],
++                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
++            )
++            .optional()?;
++        if let Some((team, name)) = item {
++            found.push(Workspace { name: name.unwrap_or_else(|| team.clone()), team, dir });
++        }
++    }
++    Ok(found)
++}
++
++impl Workspace {
++    async fn call(&self, request: &Request) -> Result<Value> {
++        let path = paths::socket_in(&self.dir);
++        let result = tokio::time::timeout(Duration::from_secs(32), async {
++            let stream = tokio::net::UnixStream::connect(path).await?;
++            let (read, mut write) = stream.into_split();
++            let mut frame =
++                serde_json::to_vec(&json!({"id":1,"op":"workspace_dispatch","network":self.team,"request":request}))?;
++            frame.push(b'\n');
++            write.write_all(&frame).await?;
++            let line =
++                BufReader::new(read).lines().next_line().await?.ok_or_else(|| anyhow!("Workspace disconnected"))?;
++            let reply: Reply = serde_json::from_str(&line)?;
++            if !reply.ok {
++                bail!("{}", reply.error.unwrap_or_default());
++            }
++            Ok(reply.result.unwrap_or(Value::Null))
++        })
++        .await;
++        result.map_err(|_| anyhow!("Workspace timed out; check delivery before retrying"))?
++    }
++}
++
++impl Daemon {
++    pub(super) async fn dispatch(self: &Arc<Self>, conn: u64, mut req: Request) -> Result<Value> {
++        if let Request::WorkspaceDispatch { network, request } = req {
++            if self.team_id().as_ref() != Some(&network) {
++                bail!("Network membership changed");
++            }
++            let member = match request.as_ref() {
++                Request::Hook(h) => Some(format!("{}:{}", h.agent, h.session_id)),
++                Request::Who { me, .. } => me.clone(),
++                Request::Send { from, .. } | Request::DeliveryStatus { from, .. } => Some(from.clone()),
++                Request::Inbox { key, .. } | Request::Unread { key } | Request::Delivered { key, .. } => {
++                    Some(key.clone())
++                }
++                _ => None,
++            }
++            .ok_or_else(|| anyhow!("Workspace operation requires a session"))?;
++            {
++                let g = self.inner.lock().unwrap();
++                if g.store.get(&format!("workspace-member:{member}"))?.as_ref() != Some(&network) {
++                    bail!("Session no longer belongs to this Network");
++                }
++            }
++            return self.handle(conn, *request).await;
++        }
++        if managed() || !root().is_dir() {
++            return self.handle(conn, req).await;
++        }
++        let key = match &req {
++            Request::Send { from, .. } | Request::DeliveryStatus { from, .. } => from.clone(),
++            Request::Hook(h) if h.agent == "codex" => format!("codex:{}", h.session_id),
++            Request::Who { me: Some(key), .. }
++            | Request::Inbox { key, .. }
++            | Request::Unread { key }
++            | Request::Delivered { key, .. } => key.clone(),
++            Request::Register { session } => session.key.clone(),
++            _ => return self.handle(conn, req).await,
++        };
++        if !key.starts_with("codex:") {
++            return self.handle(conn, req).await;
++        }
++        let peers = joined(&key)?;
++        let local = self.team_id();
++        if let Request::DeliveryStatus { from, ids } = &req {
++            let mut receipts = self.inner.lock().unwrap().store.delivery_status(from, ids)?;
++            for ws in &peers {
++                let rows: Vec<Value> = serde_json::from_value(ws.call(&req).await?)?;
++                for (receipt, mut row) in receipts.iter_mut().zip(rows) {
++                    if row["stage"] != "unknown" {
++                        if receipt["stage"] != "unknown" {
++                            bail!("Ambiguous receipt ID across Networks");
++                        }
++                        row["network"] = json!(ws.team);
++                        *receipt = row;
++                    }
++                }
++            }
++            return Ok(json!(receipts));
++        }
++        if let Request::Send { to, reply_to, .. } = &mut req {
++            let dest = to.split_once("::");
++            let reply = reply_to.as_deref().and_then(|v| v.split_once("::"));
++            if let (Some((a, _)), Some((b, _))) = (dest, reply)
++                && a != b
++            {
++                bail!("Reply and destination belong to different Networks");
++            }
++            if let Some(scope) = dest.or(reply).map(|(id, _)| id.to_string()) {
++                if dest.is_none() {
++                    *to = format!("{scope}::{to}");
++                }
++                if local.as_ref() != Some(&scope) {
++                    let ws = peers
++                        .iter()
++                        .find(|w| w.team == scope)
++                        .ok_or_else(|| anyhow!("Session is not joined to that Network"))?;
++                    return ws.call(&req).await;
++                }
++            } else if !peers.is_empty() {
++                bail!(
++                    "Select a Network using the network-qualified address from list_team, or supply the message's qualified reply_to"
++                );
++            }
++            return self.handle(conn, req).await;
++        }
++        if peers.is_empty() {
++            return self.handle(conn, req).await;
++        }
++        let here = self.inner.lock().unwrap().live.contains_key(&key) && local.is_some();
++        match &req {
++            Request::Register { session } => {
++                let folder_allowed = !self.cfg.off_in(&session.cwd);
++                let registered = self.handle(conn, req).await;
++                match registered {
++                    Err(e) if e.to_string() == crate::config::OFF_HERE && folder_allowed => {
++                        Ok(json!({"address":"","name":"","unread":0}))
++                    }
++                    other => other,
++                }
++            }
++            Request::Hook(_) => {
++                let mut result = match self.handle(conn, req.clone()).await {
++                    Ok(v) => serde_json::from_value::<HookReply>(v)?,
++                    Err(e) if e.to_string() == crate::config::SESSION_PAUSED => HookReply::default(),
++                    Err(e) => return Err(e),
++                };
++                for ws in peers {
++                    // A worker may be restarting. Its unacknowledged mail remains in its own inbox.
++                    let Ok(v) = ws.call(&req).await else { continue };
++                    let reply: HookReply = serde_json::from_value(v)?;
++                    if result.address.is_none() {
++                        result.address = reply.address;
++                    }
++                    if let Some(t) = reply.text {
++                        result.text.get_or_insert_with(String::new).push_str(&format!("\n{t}"));
++                    }
++                    result.ids.extend(reply.ids.into_iter().map(|id| format!("{}::{id}", ws.team)));
++                }
++                Ok(json!(result))
++            }
++            Request::Who { .. } => {
++                let mut directory: Directory = serde_json::from_value(self.handle(conn, req.clone()).await?)?;
++                let original = directory.team.clone().unwrap_or_default();
++                directory.team = Some("Joined Networks".into());
++                if here {
++                    for s in &mut directory.sessions {
++                        s.address = format!("{}::{}", local.as_deref().unwrap_or(""), s.address);
++                        s.name = s.address.clone();
++                        s.doing = Some(format!("[{}] {}", original, s.doing.take().unwrap_or_default()));
++                    }
++                } else {
++                    directory.sessions.clear();
++                    directory.machines.clear();
++                }
++                for ws in peers {
++                    let Ok(response) = ws.call(&req).await else { continue };
++                    let d: Directory = serde_json::from_value(response)?;
++                    for mut s in d.sessions {
++                        s.address = format!("{}::{}", ws.team, s.address);
++                        s.name = s.address.clone();
++                        s.doing = Some(format!("[{}] {}", ws.name, s.doing.unwrap_or_default()));
++                        directory.sessions.push(s);
++                    }
++                    for m in d.machines {
++                        if !directory.machines.iter().any(|v| v.endpoint == m.endpoint) {
++                            directory.machines.push(m);
++                        }
++                    }
++                }
++                Ok(json!(directory))
++            }
++            Request::Unread { .. } => {
++                let mut u = if here { self.unread(&key)? } else { Unread { count: 0, from: vec![] } };
++                for ws in peers {
++                    if let Ok(v) = ws.call(&req).await {
++                        let more: Unread = serde_json::from_value(v)?;
++                        u.count += more.count;
++                        u.from.extend(more.from);
++                    }
++                }
++                Ok(json!(u))
++            }
++            Request::Delivered { ids, .. } => {
++                let mut local_ids = Vec::new();
++                for id in ids {
++                    if let Some((team, raw)) = id.split_once("::") {
++                        let ws =
++                            peers.iter().find(|w| w.team == team).ok_or_else(|| anyhow!("Network no longer joined"))?;
++                        ws.call(&Request::Delivered { key: key.clone(), ids: vec![raw.into()] }).await?;
++                    } else {
++                        local_ids.push(id.clone());
++                    }
++                }
++                if local_ids.is_empty() {
++                    Ok(Value::Null)
++                } else {
++                    self.handle(conn, Request::Delivered { key, ids: local_ids }).await
++                }
++            }
++            Request::Inbox { wait_secs, peek, .. } => {
++                let end = tokio::time::Instant::now() + Duration::from_secs((*wait_secs).min(MAX_WAIT));
++                let poll = Request::Inbox { key: key.clone(), wait_secs: 0, peek: *peek };
++                loop {
++                    let mut inbox = if here {
++                        self.inbox(key.clone(), 0, *peek).await?
++                    } else {
++                        Inbox { messages: vec![], text: String::new() }
++                    };
++                    for ws in &peers {
++                        let Ok(response) = ws.call(&poll).await else { continue };
++                        let mut more: Inbox = serde_json::from_value(response)?;
++                        for m in &mut more.messages {
++                            m.id = format!("{}::{}", ws.team, m.id);
++                        }
++                        inbox.messages.extend(more.messages);
++                        if !more.text.is_empty() {
++                            inbox.text.push('\n');
++                            inbox.text.push_str(&more.text);
++                        }
++                    }
++                    if !inbox.messages.is_empty() || tokio::time::Instant::now() >= end {
++                        return Ok(json!(inbox));
++                    }
++                    tokio::time::sleep(Duration::from_millis(450)).await;
++                }
++            }
++            _ => self.handle(conn, req).await,
++        }
++    }
++}
+diff --git a/src/paths.rs b/src/paths.rs
+index 0ab392c..1d8703e 100644
+--- a/src/paths.rs
++++ b/src/paths.rs
+@@ -28,6 +28,8 @@ fn legacy_env(name: &str) -> String {
+     format!("{}_{name}", LEGACY_NAME.to_uppercase())
+ }
+ 
++pub fn managed_workspace() -> bool { home().parent() == Some(user_home().join(".reason/workspaces").as_path()) }
++
+ fn default_home() -> PathBuf {
+     user_home().join(".reason").join("network")
+ }
+@@ -69,7 +71,7 @@ pub fn socket() -> PathBuf {
+ }
+ 
+ #[cfg(unix)]
+-fn socket_in(home: &Path) -> PathBuf {
++pub(crate) fn socket_in(home: &Path) -> PathBuf {
+     let stem = stem(home);
+     let path = home.join(format!("{stem}.sock"));
+     if path.as_os_str().len() < 100 {
+diff --git a/src/proto.rs b/src/proto.rs
+index 36d4106..048507c 100644
+--- a/src/proto.rs
++++ b/src/proto.rs
+@@ -92,6 +92,8 @@ pub struct HookCall {
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ #[serde(tag = "op", rename_all = "snake_case")]
+ pub enum Request {
++    EnableWorkspaces,
++    WorkspaceDispatch { network: String, request: Box<Request> },
+     SessionParticipation,
+     SetReceiveMode { key: String, network: String, mode: Tier },
+     SetSessionParticipation {
+diff --git a/src/render.rs b/src/render.rs
+index 73df291..7c8e8f6 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -265,10 +265,17 @@ pub fn without_machine(address: &str) -> &str {
+     address.split_once('@').map_or(address, |(a, _)| a)
+ }
+ 
++#[cfg(test)]
+ pub fn for_agent(msgs: &[Message], agent: Option<&str>, cli: bool) -> String {
++    for_agent_in(msgs,agent,cli,None)
++}
++
++pub fn for_agent_in(msgs:&[Message], agent:Option<&str>, cli:bool, team:Option<&crate::team::TeamState>)->String {
++    let scoped=team.filter(|_| agent==Some("codex") && crate::paths::user_home().join(".reason/workspaces").is_dir());
+     let mut out = String::new();
+     for m in msgs {
+         let mut attrs = format!("from=\"{}\"", attr(&m.from));
++        if let Some(t)=scoped { let _=write!(attrs," network=\"{}\" network_id=\"{}\"",attr(&t.shown_name()),attr(&t.id)); }
+         for (k, v) in [("agent", &m.from_agent), ("repo", &m.from_repo), ("via", &m.via), ("reply_to", &m.reply_to)] {
+             if let Some(v) = v {
+                 let _ = write!(attrs, " {k}=\"{}\"", attr(v));
+@@ -286,7 +293,7 @@ pub fn for_agent(msgs: &[Message], agent: Option<&str>, cli: bool) -> String {
+             out.push_str("\n</reason-approval>\n");
+             continue;
+         }
+-        let _ = writeln!(out, "<reason-message {attrs} id=\"{}\">", attr(&m.id));
++        let _ = writeln!(out, "<reason-message {attrs} id=\"{}\">", attr(&scoped.map_or_else(||m.id.clone(),|t|format!("{}::{}",t.id,m.id))));
+         // No escape codes either: a terminal that draws them could write over the frame's line.
+         out.push_str(&defang(&util::printable(m.body.trim())));
+         out.push_str("\n</reason-message>\n");
+@@ -302,7 +309,7 @@ pub fn for_agent(msgs: &[Message], agent: Option<&str>, cli: bool) -> String {
+         format!("From {person}'s agent.")
+     };
+     // No Reason Network tools (Reason's agent; a Claude session from before Reason Network), but commands run on this computer.
+-    let reply = if cli || agent == Some("reason") {
++    let reply = if let Some(t)=scoped { format!("Reply with send_message to \"{}::{}\" using reply_to \"{}::{}\".",t.id,last.from,t.id,last.id) } else if cli || agent == Some("reason") {
+         format!("Reply if useful: {ENGINE} send {} --from {} \"<reply>\"", last.from, last.to)
+     } else if agent == Some("hermes") {
+         // Hermes's plugin names its tools for the toolset.
+diff --git a/src/store.rs b/src/store.rs
+index 2d695fc..9c1dd47 100644
+--- a/src/store.rs
++++ b/src/store.rs
+@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS sessions (
+ );
+ CREATE INDEX IF NOT EXISTS sessions_key ON sessions (key);
+ CREATE TABLE IF NOT EXISTS paused_sessions (key TEXT PRIMARY KEY NOT NULL);
++CREATE TABLE IF NOT EXISTS workspace_sent(network TEXT NOT NULL,id TEXT NOT NULL,sender_key TEXT NOT NULL,sender TEXT NOT NULL,recipient TEXT NOT NULL,sent_at INTEGER NOT NULL,body TEXT NOT NULL,reply_to TEXT,files TEXT NOT NULL,PRIMARY KEY(network,id));
+ CREATE TABLE IF NOT EXISTS counts (
+     day TEXT PRIMARY KEY,
+     sent INTEGER NOT NULL DEFAULT 0,
+@@ -148,6 +149,8 @@ impl Store {
+             "queued" => "queued",
+             _ => "accepted",
+         };
++        self.db.execute("INSERT OR IGNORE INTO workspace_sent SELECT json_extract(value,'$.id'),?,?,?,?,?,?,?,? FROM kv WHERE key='team'",
++            params![message.id,key,message.from,recipient,message.sent_at,message.body,message.reply_to,serde_json::to_string(&message.files.iter().map(|f|&f.name).collect::<Vec<_>>())?])?;
+         self.prune_receipts(crate::util::now_ms())?;
+         self.db.execute(
+             "INSERT OR IGNORE INTO sent_receipts VALUES (?1,?2,?3,?4,?5,?6,?6)",

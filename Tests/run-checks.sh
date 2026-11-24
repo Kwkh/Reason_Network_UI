@@ -13,3 +13,12 @@ xcrun swiftc -parse-as-library -swift-version 5 -module-cache-path "$checks_dir/
  "$project_dir/Sources/PersonalSessions.swift" "$project_dir/Sources/SQLiteStore.swift" -lsqlite3 \
  "$project_dir/Sources/SetupModel.swift" "$project_dir/Tests/SetupChecks.swift" -o "$checks_dir/SetupChecks"
 "$checks_dir/SetupChecks" "$project_dir/Engine/Bin/reason-network-backend"
+
+if [[ "${1:-}" == "--workspaces" ]]; then
+    backend="$project_dir/Engine/Bin/reason-network-backend"
+    xcrun swiftc -parse-as-library -swift-version 5 -module-cache-path "$checks_dir/cache" \
+      "$project_dir"/Sources/{ParticipationInstaller,SetupService,Models,SQLiteStore,TranscriptMirror,PersonalSessions,ReasonService,NetworkModel,NetworkWorkspaces}.swift \
+      "$project_dir/Tests/WorkspaceChecks.swift" -lsqlite3 -o "$checks_dir/WorkspaceChecks"
+    python3 "$project_dir/Tests/workspace-checks.py" "$backend"
+    python3 "$project_dir/Tests/workspace-app-checks.py" "$backend" "$checks_dir/WorkspaceChecks"
+fi

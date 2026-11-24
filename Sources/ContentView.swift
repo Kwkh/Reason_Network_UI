@@ -42,7 +42,7 @@ struct ContentView: View {
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
             }
         }
-        .task { await model.start() }
+        .task(id: ObjectIdentifier(model)) { await model.start() }
         .alert("接收模式未切换或未确认", isPresented: Binding(get: { model.receiveModeError != nil },
                                                   set: { if !$0 { model.receiveModeError = nil } })) {
             Button("好", role: .cancel) {}
@@ -66,6 +66,7 @@ struct ContentView: View {
                         .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                 }
             }.padding(20).frame(minWidth: 440, minHeight: 300)
+                .networkSheetBackground()
         }
     }
 
@@ -913,7 +914,9 @@ private struct ConversationSidebar: View {
         .sheet(item: $page) { destination in
             switch destination {
             case .overview: NetworkOverview()
-            case .personal: PersonalSessionsView().frame(minWidth: 540, idealWidth: 620, minHeight: 420, idealHeight: 520)
+            case .personal:
+                PersonalSessionsView().frame(minWidth: 540, idealWidth: 620, minHeight: 420, idealHeight: 520)
+                    .networkSheetBackground()
             }
         }
     }

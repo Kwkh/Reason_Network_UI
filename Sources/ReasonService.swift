@@ -7,12 +7,19 @@ actor ReasonService {
     private let mirror: TranscriptMirror
     private var migrated = false
     private var lastCodexTitles: [String: String] = [:]
-    init(home: URL = FileManager.default.homeDirectoryForCurrentUser) {
+    private let networkRoot: URL
+    private let expectedTeam: String?
+    private let secondary: Bool
+    private var workspaceFolder: URL { home.appendingPathComponent(".reason/workspaces") }
+    init(home: URL = FileManager.default.homeDirectoryForCurrentUser, workspace: URL? = nil, expectedNetwork: String? = nil) {
+        expectedTeam = expectedNetwork
+        networkRoot = workspace ?? home.appendingPathComponent(".reason/network")
+        secondary = workspace != nil
         self.home = home
         mirror = TranscriptMirror(root: home.appendingPathComponent(".codex/sessions"))
     }
     func snapshot(local: String, peer: String, readingFrom: Message.RowKey? = nil, readingNetwork: String? = nil) throws -> Snapshot {
-        let engineURL = home.appendingPathComponent(".reason/network/network.db")
+        let engineURL = networkRoot.appendingPathComponent("network.db")
         func openEngine() throws -> (SQLiteStore, String?) {
             let engine = try SQLiteStore(engineURL, readOnly: true)
             return (engine, try teamID(in: engine))
@@ -35,7 +42,7 @@ actor ReasonService {
         guard let network = try teamID(in: engine), directory.team != nil else {
             throw NetworkError("本机尚未加入 Network。")
         }
-        guard network == expectedNetwork else { throw NetworkError("Network 正在切换，稍后将重新同步。") }
+        guard network == expectedNetwork, expectedTeam == nil || expectedTeam == network else { throw NetworkError("Network 正在切换，稍后将重新同步。") }
         directory.networkID = network
         let cache = try store()
         try selectNetwork(network, in: cache)
@@ -91,6 +98,7 @@ actor ReasonService {
         let hasFiles = try engine.rows("PRAGMA table_info(messages)").contains { $0["name"] == "files" }
         let fileColumn = hasFiles ? ",files" : ""
         // A registered mailbox can receive mail just before detaching, between UI polls.
+        let cutoff = (try? workspaceFolder.resourceValues(forKeys: [.creationDateKey]).creationDate)?.timeIntervalSince1970
         for registration in codexRecords {
             guard let name = registration["name"], let key = registration["key"] else { continue }
             let session = LocalSession(name: name, key: key)
@@ -99,9 +107,10 @@ actor ReasonService {
                     guard let id = row["id"], !otherMail.contains(id) else { continue }
                     try cache.reconcileEnvelope(Message(id: id, at: (Double(row["sent_at"] ?? "") ?? 0) / 1000, local: session.name, peer: row["sender"] ?? "", direction: "in", body: row["body"] ?? "", result: "", replyTo: row["reply_to"], attachments: receivedFiles(row["files"])), network: network, knowsFiles: hasFiles)
                 }
+                guard !secondary else { continue }
                 try mirror.sync(for: session) { batch in
                     try cache.transaction {
-                        for event in batch {
+                        for event in batch where cutoff.map({ event.at < $0 }) ?? true {
                             let origin = try cache.rows("SELECT network FROM network_periods WHERE since<=? ORDER BY since DESC, rowid DESC LIMIT 1", [String(event.at)]).first?["network"]
                             if let origin = origin?.nonEmpty {
                                 try cache.insertMirrored(event, network: origin)
@@ -168,26 +177,38 @@ actor ReasonService {
             json_extract(q.msg,'$.body') AS queued_body,json_extract(q.msg,'$.reply_to') AS queued_reply,
             (SELECT json_group_array(json_extract(value,'$.name')) FROM json_each(q.msg,'$.files')) AS queued_files
             """ : "NULL AS queued_body,NULL AS queued_reply,NULL AS queued_files"
-        let receipts = try engine.rows("""
+        let scoped = !(try engine.rows("PRAGMA table_info(workspace_sent)")).isEmpty
+        let payload = scoped ? "s.body AS sent_body,s.reply_to AS sent_reply,s.files AS sent_files" : "NULL AS sent_body"
+        let join = scoped ? "LEFT JOIN workspace_sent s ON s.network=? AND s.id=r.id" : ""
+        var receipts = try engine.rows("""
             SELECT r.id,r.sender,r.recipient,r.stage,r.sent_at,\(key) AS sender_key,
-                   m.body,m.reply_to,\(hasInboxFiles ? "m.files" : "NULL") AS files,\(queuedFields)
+                   m.body,m.reply_to,\(hasInboxFiles ? "m.files" : "NULL") AS files,\(queuedFields),\(payload)
             FROM sent_receipts r LEFT JOIN messages m ON m.id=r.id AND m.held=0
               AND m.sender=r.sender AND m.recipient=r.recipient
             \(queuedJoin)
-            """)
+            \(join)
+            """, scoped ? [network] : [])
+        if scoped {
+            // An inactive workspace can outlive the engine's seven-day status-receipt window.
+            receipts += try engine.rows("""
+                SELECT s.id,s.sender,s.recipient,s.sender_key,s.sent_at,'unknown' AS stage,
+                       s.body AS sent_body,s.reply_to AS sent_reply,s.files AS sent_files
+                FROM workspace_sent s WHERE s.network=? AND NOT EXISTS (SELECT 1 FROM sent_receipts r WHERE r.id=s.id)
+                """, [network])
+        }
         try cache.transaction {
             for row in receipts {
                 guard let id = row["id"], !otherMail.contains(id), let sender = row["sender"], sender.hasPrefix(person + "/"),
                       let peer = row["recipient"], let stage = row["stage"], let stamp = row["sent_at"].flatMap(Double.init) else { continue }
                 let at = stamp / 1000
                 let origin = try cache.rows("SELECT network FROM network_periods WHERE since<=? ORDER BY since DESC,rowid DESC LIMIT 1", [String(at)])
-                guard origin.first?["network"] == network else { continue }
+                guard row["sent_body"] != nil || origin.first?["network"] == network else { continue }
                 let local = String(sender.dropFirst(person.count + 1))
                 let scope = [network, id, local]
-                if row["sender_key"]?.hasPrefix("codex:") == true, let body = row["body"] ?? row["queued_body"] {
-                    let queuedNames = row["queued_files"].flatMap { try? JSONDecoder().decode([String].self, from: Data($0.utf8)) } ?? []
-                    let names = row["body"] != nil ? receivedFiles(row["files"]).map(\.name) : queuedNames
-                    let reply = (row["body"] != nil ? row["reply_to"] : row["queued_reply"]) ?? ""
+                if row["sender_key"]?.hasPrefix("codex:") == true, let body = row["sent_body"] ?? row["body"] ?? row["queued_body"] {
+                    let queuedNames = (row["sent_files"] ?? row["queued_files"]).flatMap { try? JSONDecoder().decode([String].self, from: Data($0.utf8)) } ?? []
+                    let names = row["sent_body"] == nil && row["body"] != nil ? receivedFiles(row["files"]).map(\.name) : queuedNames
+                    let reply = row["sent_reply"] ?? (row["body"] != nil ? row["reply_to"] : row["queued_reply"]) ?? ""
                     let files = names.map { MessageAttachment(name: $0) }
                     let event = Message(id: id, at: at, local: local, peer: peer, direction: "out", body: body, result: "",
                                         replyTo: reply, attachments: files, receiptStage: stage)
@@ -227,7 +248,7 @@ actor ReasonService {
     }
 
     func leaveNetwork(expected: String) throws {
-        let engine = try SQLiteStore(home.appendingPathComponent(".reason/network/network.db"), readOnly: true)
+        let engine = try SQLiteStore(networkRoot.appendingPathComponent("network.db"), readOnly: true)
         guard try teamID(in: engine) == expected else { throw NetworkError("当前 Network 已变化，请重新确认。") }
         let cache = try store()
         try selectNetwork(expected, in: cache)
@@ -256,7 +277,7 @@ actor ReasonService {
     }
 
     func attachmentText(_ file: MessageAttachment) throws -> String {
-        try file.readText(in: home.appendingPathComponent(".reason/network/inbox"))
+        try file.readText(in: networkRoot.appendingPathComponent("inbox"))
     }
 
     func history(network: String, local: String, peer: String, before: Message.RowKey? = nil) throws -> MessagePage {
@@ -304,7 +325,7 @@ actor ReasonService {
             bytes += try MessageAttachment.text(at: file).utf8.count
             guard bytes <= 512 * 1024 else { throw NetworkError("附件合计不能超过 512 KiB。") }
         }
-        let engine = try SQLiteStore(home.appendingPathComponent(".reason/network/network.db"), readOnly: true)
+        let engine = try SQLiteStore(networkRoot.appendingPathComponent("network.db"), readOnly: true)
         guard let key = try engine.rows("SELECT key FROM sessions WHERE name=? AND agent='codex' AND attached=1", [local]).first?["key"] else { throw NetworkError("本机 Codex 会话未连接") }
         guard try !pausedKeys(in: engine).contains(key) else { throw NetworkError("本机会话已退出 Network") }
         try verifyLocalThreads([key])
@@ -325,7 +346,7 @@ actor ReasonService {
         for file in files { arguments += ["--file", file.path] }
         let result: String
         do {
-            result = try run(arguments + [destination, "-"], input: content, timeout: 30)
+            result = try run(arguments + [FileManager.default.fileExists(atPath: workspaceFolder.path) ? network + "::" + destination : destination, "-"], input: content, timeout: 30)
         } catch let error as NetworkError where error.message.hasPrefix("Error: this session isn't registered with Reason Network") {
             // The daemon lost the sender after the directory check and before dispatch.
             throw LocalSenderOffline()
@@ -344,14 +365,14 @@ actor ReasonService {
         if notify && result.contains("not popped up:") { return status + " · 对方设备未弹窗" }
         return status
     }
-    private var console: SessionSocket { SessionSocket(socketURL: home.appendingPathComponent(".reason/network/network.sock")) }
+    private var console: SessionSocket { SessionSocket(socketURL: NetworkPaths.socket(in: networkRoot)) }
     func personalSessions() throws -> [PersonalSession] {
         let directory = try? directory()
         let participation = try? participationState()
         let discovered = try PersonalSessionCatalog(home: home).discover()
         var sessions = Dictionary(discovered.sessions.map { ($0.agent == "codex" ? $0.id.lowercased() : $0.id, $0) },
                                   uniquingKeysWith: { $0.updated > $1.updated ? $0 : $1 })
-        let enginePath = home.appendingPathComponent(".reason/network/network.db")
+        let enginePath = networkRoot.appendingPathComponent("network.db")
         let knownRecords: [[String: String]]
         if FileManager.default.fileExists(atPath: enginePath.path) {
             let engine = try SQLiteStore(enginePath, readOnly: true)
@@ -387,7 +408,7 @@ actor ReasonService {
         return sessions.values.sorted { ($0.updated, $0.id) > ($1.updated, $1.id) }
     }
     func reconnectLocal(_ local: LocalSession, network: String) throws {
-        let engine = try SQLiteStore(home.appendingPathComponent(".reason/network/network.db"), readOnly: true)
+        let engine = try SQLiteStore(networkRoot.appendingPathComponent("network.db"), readOnly: true)
         guard try teamID(in: engine) == network, !local.historyOnly,
               try engine.rows("SELECT key FROM sessions WHERE name=? AND agent='codex' AND attached=1", [local.name]).first?["key"] == local.key,
               try !pausedKeys(in: engine).contains(local.key) else {
@@ -423,12 +444,25 @@ actor ReasonService {
                                       "session_id": nativeID, "cwd": cwd, "mail": false]
         if let transcript = chosen.transcript { payload["transcript"] = transcript.path }
         struct JoinReply: Decodable { let address: String? }
-        let reply = try console.decode(payload, as: JoinReply.self)
+        var request = payload
+        let manual = FileManager.default.fileExists(atPath: workspaceFolder.path)
+        if manual {
+            let db = try SQLiteStore(networkRoot.appendingPathComponent("network.db"), readOnly: true)
+            guard let id = try teamID(in: db), expectedTeam == nil || expectedTeam == id else { throw NetworkError("尚未加入 Network。") }
+            try setParticipation(chosen.id, paused: false)
+            request = ["op": "workspace_dispatch", "network": id, "request": payload]
+        }
+        let reply: JoinReply
+        do { reply = try console.decode(request, as: JoinReply.self) }
+        catch {
+            if manual && chosen.connection == .notJoined { try? setParticipation(chosen.id, paused: true) }
+            throw error
+        }
         guard let address = reply.address?.nonEmpty else { throw NetworkError("引擎没有返回会话地址。") }
         return address
     }
     func removeLocal(_ local: LocalSession, network: String) throws {
-        let engine = try SQLiteStore(home.appendingPathComponent(".reason/network/network.db"), readOnly: true)
+        let engine = try SQLiteStore(networkRoot.appendingPathComponent("network.db"), readOnly: true)
         let keys = try engine.rows("SELECT key FROM sessions WHERE agent='codex' AND name=?", [local.name]).compactMap { $0["key"] }
         guard try teamID(in: engine) == network else { throw NetworkError("当前 Network 已变化，请刷新。") }
         if local.hasRegistration {
@@ -510,6 +544,10 @@ actor ReasonService {
         guard let link = TranscriptMirror.match(#"(https://reasonmachines\.com/network/join/[^\s]+)"#, in: output) else {
             throw NetworkError("未能取得邀请链接，请确认这台电脑已加入网络。")
         }
+        if let expectedTeam {
+            let ticket = try SetupInput.invitation(link)
+            guard try NetworkPaths.inviteID(ticket) == expectedTeam else { throw NetworkError("当前 Network 已变化，请刷新概览。") }
+        }
         return link
     }
     func diagnose(localKey: String?) throws -> String {
@@ -525,7 +563,7 @@ actor ReasonService {
     }
     private func store() throws -> SQLiteStore {
         if let cache { return cache }
-        let folder = home.appendingPathComponent(".reason/network/local-ui")
+        let folder = networkRoot.appendingPathComponent("local-ui")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let file = folder.appendingPathComponent("messages.sqlite3")
         let database = try SQLiteStore(file, readOnly: false)
@@ -581,7 +619,7 @@ actor ReasonService {
     }
     // Files avoid pipe-capacity deadlocks; the private temporary directory is removed after every command.
     private func run(_ arguments: [String], input: String? = nil, timeout: TimeInterval = 15) throws -> String {
-        guard let executable = NetworkPaths.executable(home: home) else { throw NetworkError("未找到 Reason Network。请打开环境配置安装后台。") }
+        guard let executable = secondary ? NetworkPaths.workspaceExecutable(home: home) : NetworkPaths.executable(home: home) else { throw NetworkError("未找到 Reason Network。请打开环境配置安装后台。") }
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("reason-native-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -602,6 +640,8 @@ actor ReasonService {
             !["CODEX_", "CLAUDE", "TINCAN_", "REASON_NETWORK_"].contains(where: { key.hasPrefix($0) }) && !["COPILOT_SESSION_ID", "GEMINI_CLI", "CURSOR_TRACE_ID"].contains(key)
         }
         env["PATH"] = home.appendingPathComponent(".local/bin").path + ":/usr/bin:/bin:/usr/sbin:/sbin"
+        env["HOME"] = home.path
+        if secondary { env.merge(NetworkPaths.workspaceEnvironment(networkRoot)) { _, new in new } }
         process.environment = env
         let start = Date()
         try process.run()

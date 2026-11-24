@@ -3,6 +3,7 @@ import AppKit
 
 struct AppRootView: View {
     @EnvironmentObject private var network: NetworkModel
+    @EnvironmentObject private var workspaces: WorkspaceController
     @StateObject private var setup = SetupModel()
     @State private var entered = false
     var body: some View {
@@ -13,23 +14,28 @@ struct AppRootView: View {
             } else if entered {
                 ContentView()
             } else {
-                SetupView(model: setup) { entered = true }
+                SetupView(model: setup) { workspaces.reload(); entered = true }
             }
         }
         .frame(minWidth: 540, minHeight: 520)
         .environmentObject(setup)
         .task {
             await setup.check()
-            entered = setup.snapshot.ready || (setup.snapshot.installed && setup.snapshot.background && setup.snapshot.wired && setup.snapshot.issue != nil)
+            workspaces.reload()
+            entered = !workspaces.items.isEmpty || setup.snapshot.ready || (setup.snapshot.installed && setup.snapshot.background && setup.snapshot.wired && setup.snapshot.issue != nil)
         }
         .onChange(of: network.departureCount) {
-            entered = false
-            setup.didLeave()
-            Task { await setup.check() }
+            guard network.departureCount > 0, network.directory == nil else { return }
+            Task {
+                await workspaces.didLeave()
+                if workspaces.items.isEmpty { entered = false; setup.didLeave() }
+                await setup.check()
+            }
         }
         .sheet(isPresented: $setup.presented) {
             SetupView(model: setup) { setup.presented = false }
                 .frame(width: 540, height: 590)
+                .networkSheetBackground()
         }
     }
 }
@@ -40,6 +46,10 @@ struct SetupView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var details = false
     @State private var help = false
+    @State private var creating = false
+    @State private var joining = false
+    @State private var joinError: String?
+    @EnvironmentObject private var workspaces: WorkspaceController
 
     var body: some View {
         ScrollView {
@@ -138,24 +148,37 @@ struct SetupView: View {
     private var join: some View {
         VStack(alignment: .leading, spacing: 16) {
             TextField("邀请链接或四词代码", text: $model.invitation, axis: .vertical)
-                .lineLimit(1...3).textFieldStyle(.plain).font(.system(size: 13))
-                .padding(12).background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
+                .lineLimit(1...3).networkFormField()
                 .accessibilityLabel("Network 邀请链接或一次性代码")
-            HStack {
-                Text("你的名称").foregroundStyle(.secondary)
-                TextField("名称", text: $model.name).textFieldStyle(.plain)
-            }.font(.system(size: 13)).padding(.horizontal, 2)
-            action("加入 Network") { await model.join() }
+            NetworkPersonField(person: $model.name)
+            if model.snapshot.needsBackendUpdate { action("更新兼容后台") { await model.configure() } }
+            Button("新建 Network") { creating = true }
+                .sheet(isPresented: $creating) { WorkspaceForm(action: .create, person: model.name, onComplete: completion) }
+            if let joinError { Text(joinError).font(.callout).foregroundStyle(.red) }
+            action(joining ? "正在加入…" : "加入 Network") {
+                joining = true
+                defer { joining = false }
+                do {
+                    try await workspaces.add(name: "", invitation: model.invitation, person: model.name)
+                    model.invitation = ""
+                    await model.check()
+                    completion()
+                } catch { joinError = error.localizedDescription }
+            }
                 .disabled(model.invitation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.snapshot.issue != nil)
-        }.disabled(model.busy)
+        }.disabled(model.busy || joining)
     }
     private var connected: some View {
+        let active = workspaces.current.directory
+        let team = active?.team ?? model.snapshot.team
+        let sessions = active.map { d in d.sessions.filter { $0.person == d.person && $0.machine == d.machine && $0.available }.count } ?? model.snapshot.sessions
+        return
         VStack(alignment: .leading, spacing: 18) {
-            Label(model.snapshot.team ?? "Network 已连接", systemImage: "checkmark.circle")
+            Label(team ?? "Network 已连接", systemImage: "checkmark.circle")
                 .font(.system(size: 15, weight: .medium))
-            Text(model.snapshot.sessions > 0 ? "本机会话已在线。" : "重启 Codex，在目标对话中发送一条消息后，会话即可出现。")
+            Text(sessions > 0 ? "本机会话已在线。" : "在「我的会话」里选择要接入这个 Network 的本机对话。")
                 .font(.system(size: 13)).foregroundStyle(.secondary)
-            if model.snapshot.sessions == 0 {
+            if sessions == 0 {
                 Button("打开 Codex", systemImage: "arrow.up.forward.app") {
                     if let url = ["com.openai.codex", "com.openai.chat"].compactMap({
                         NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0)
@@ -188,7 +211,29 @@ struct SetupView: View {
     }
 }
 
-private struct SetupActionStyle: ButtonStyle {
+extension View {
+    func networkSheetBackground() -> some View {
+        presentationBackground(Color(nsColor: .textBackgroundColor))
+    }
+
+    func networkFormField() -> some View {
+        textFieldStyle(.plain).font(.system(size: 13))
+            .padding(12).background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+struct NetworkPersonField: View {
+    @Binding var person: String
+
+    var body: some View {
+        HStack {
+            Text("你的名称").foregroundStyle(.secondary)
+            TextField("名称", text: $person).textFieldStyle(.plain).accessibilityLabel("你的名称")
+        }.font(.system(size: 13)).padding(.horizontal, 2)
+    }
+}
+
+struct SetupActionStyle: ButtonStyle {
     @Environment(\.colorScheme) private var scheme
     @Environment(\.isEnabled) private var enabled
 

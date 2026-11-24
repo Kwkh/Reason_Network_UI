@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 
 struct CopyInvitationButton: View {
+    @EnvironmentObject private var workspaces: WorkspaceController
     @EnvironmentObject private var model: NetworkModel
     @State private var copyingInvite = false
     @State private var inviteFeedback: String?
@@ -15,6 +16,7 @@ struct CopyInvitationButton: View {
                     defer { copyingInvite = false }
                     do {
                         let link = try await model.invitation()
+                        guard model === workspaces.current else { return }
                         NSPasteboard.general.clearContents()
                         inviteFeedback = NSPasteboard.general.setString(link, forType: .string) ? "已复制" : "复制失败"
                     } catch { inviteFeedback = "获取失败，请检查连接" }
@@ -28,9 +30,21 @@ struct CopyInvitationButton: View {
 }
 
 struct NetworkOverview: View {
+    @EnvironmentObject private var workspaces: WorkspaceController
+    var body: some View {
+        WorkspaceOverviewPage().environmentObject(workspaces.current)
+            .onAppear { workspaces.reload() }
+    }
+}
+
+private struct WorkspaceOverviewPage: View {
+    @EnvironmentObject private var workspaces: WorkspaceController
+    @State private var adding: WorkspaceAction?
+
     @EnvironmentObject private var model: NetworkModel
     @Environment(\.dismiss) private var dismiss
     @State private var includeOffline = false
+    private let panelInset: CGFloat = 34
 
     var body: some View {
         VStack(spacing: 0) {
@@ -39,7 +53,30 @@ struct NetworkOverview: View {
                 Spacer()
                 Button("完成") { dismiss() }.keyboardShortcut(.cancelAction)
             }
-            .padding(20)
+            .padding([.top, .horizontal], panelInset)
+            .padding(.bottom, 20)
+
+            Menu {
+                ForEach(workspaces.items) { item in
+                    Button {
+                        workspaces.select(item)
+                    } label: {
+                        let duplicate = workspaces.items.filter { $0.name == item.name }.count > 1
+                        let name = duplicate ? item.name + " · " + item.id.prefix(6) : item.name
+                        if item.id == workspaces.selection?.id { Label(name, systemImage: "checkmark") }
+                        else { Text(name) }
+                    }
+                }
+                Divider()
+                Button("新建 Network", systemImage: "plus") { adding = .create }
+                Button("加入 Network", systemImage: "link") { adding = .join }
+            } label: {
+                Text(workspaces.selection?.name ?? model.directory?.team ?? "选择 Network")
+                    .font(.title.weight(.semibold)).lineLimit(1).truncationMode(.tail)
+            }
+            .menuStyle(.borderlessButton).fixedSize(horizontal: true, vertical: false)
+            .accessibilityLabel("选择 Network")
+            .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, panelInset).padding(.bottom, 6)
 
             if let error = model.error {
                 ContentUnavailableView {
@@ -53,14 +90,12 @@ struct NetworkOverview: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 22) {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text(directory.team?.nonEmpty ?? "尚未加入 Network")
-                                .font(.title.weight(.semibold)).textSelection(.enabled)
                             let verified = directory.machines.first(where: \.isMe)?.verified
                             Label(directory.person + (verified.map { $0 ? " · 账号已验证" : " · 账号未验证" } ?? ""),
                                   systemImage: verified == true ? "checkmark.seal" : "person.crop.circle")
                                 .foregroundStyle(.secondary)
                         }
-                        CopyInvitationButton().disabled(directory.team?.nonEmpty == nil)
+                        CopyInvitationButton().id(ObjectIdentifier(model)).disabled(directory.team?.nonEmpty == nil)
                         HStack(spacing: 40) {
                             metric("在线会话", directory.sessions.filter(\.available).count)
                             metric("在线设备", directory.machines.filter(\.online).count)
@@ -87,14 +122,15 @@ struct NetworkOverview: View {
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 22).padding(.bottom, 20)
+                    .padding(.horizontal, panelInset).padding(.bottom, 20)
                 }
             } else {
                 ProgressView("正在读取网络状态…").frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .sheet(item: $adding) { WorkspaceForm(action: $0, person: model.directory?.person ?? NSUserName()) }
         .frame(width: 540, height: 510)
-        .background(Color(nsColor: .textBackgroundColor))
+        .networkSheetBackground()
     }
 
     private func metric(_ title: String, _ value: Int) -> some View {
@@ -144,5 +180,53 @@ struct NetworkOverview: View {
                 }
             }
         }
+    }
+}
+
+enum WorkspaceAction: String, Identifiable {
+    case create, join
+    var id: Self { self }
+    var title: String { self == .create ? "新建 Network" : "加入 Network" }
+}
+
+struct WorkspaceForm: View {
+    @EnvironmentObject private var workspaces: WorkspaceController
+    @Environment(\.dismiss) private var dismiss
+    let action: WorkspaceAction
+    @State var person: String
+    @State private var value = ""
+    @State private var busy = false
+    @State private var error: String?
+    var onComplete: () -> Void = {}
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(action.title).font(.title2.weight(.semibold))
+            Group {
+                if action == .create { TextField("Network 名称", text: $value) }
+                else { SecureField("完整邀请链接", text: $value) }
+            }.networkFormField()
+            NetworkPersonField(person: $person)
+            if let error { Text(error).foregroundStyle(.red).font(.callout).textSelection(.enabled) }
+            HStack {
+                if busy { ProgressView().controlSize(.small) }
+                Spacer()
+                Button("取消") { dismiss() }.buttonStyle(.plain).foregroundStyle(.secondary)
+                    .keyboardShortcut(.cancelAction)
+                Button(action.title) {
+                    busy = true
+                    Task {
+                        defer { busy = false }
+                        do {
+                            try await workspaces.add(name: value, invitation: action == .join ? value : nil, person: person)
+                            dismiss()
+                            onComplete()
+                        } catch { self.error = error.localizedDescription }
+                    }
+                }.buttonStyle(SetupActionStyle()).keyboardShortcut(.defaultAction)
+                    .disabled(value.isEmpty || person.isEmpty)
+            }
+        }.padding(24).frame(width: 380).disabled(busy).interactiveDismissDisabled(busy)
+            .networkSheetBackground()
     }
 }

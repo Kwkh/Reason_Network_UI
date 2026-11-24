@@ -21,7 +21,7 @@ mkdir -p "$staging"
 /usr/bin/ditto "$app" "$staging/Reason Network.app"
 ln -s /Applications "$staging/Applications"
 cat > "$staging/Read Me.txt" <<'INFO'
-Reason Network UI · macOS 14+
+Reason Network · macOS 14+
 
 将 Reason Network.app 拖入 Applications 后打开。
 首次启动会检查环境，可一键安装内置兼容后台、配置代理接入和通过邀请加入 Network。
@@ -37,7 +37,7 @@ Reason Network UI · macOS 14+
 源码和发布：https://github.com/Kwkh/Reason_Network_UI
 后台来源：https://github.com/reason-machines/reason-network
 INFO
-artifact="Reason-Network-UI-$version-macOS-universal.dmg"
+artifact="Reason-Network-$version-macOS-universal.dmg"
 hdiutil create -volname 'Reason Network' -srcfolder "$staging" -ov -format UDZO "$output_dir/$artifact"
 (cd "$output_dir" && shasum -a 256 "$artifact" > "$artifact.sha256")
 printf 'Packaged version %s (build %s): %s\n' "$version" "$build_number" "$output_dir/$artifact"

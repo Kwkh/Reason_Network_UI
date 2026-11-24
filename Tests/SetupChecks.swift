@@ -102,6 +102,18 @@ else:
         try expect(configured.installed && configured.background && configured.wired && !configured.joined, "verified configuration remains distinct from membership")
         let plist = home.appendingPathComponent("Library/LaunchAgents/com.reasonmachines.network.plist")
         let data = try Data(contentsOf: plist)
+        guard let installed = NetworkPaths.workspaceExecutable(home: home) else { throw NetworkError("Missing installed backend") }
+        try expect(installed.lastPathComponent == "reason-network" && installed.deletingLastPathComponent().lastPathComponent.count == 16, "stable daemon filename inside its build directory")
+        let legacy = installed.deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("reason-network-" + installed.deletingLastPathComponent().lastPathComponent)
+        try fm.copyItem(at: installed, to: legacy)
+        var oldJob = try PropertyListSerialization.propertyList(from: data, format: nil) as! [String: Any]
+        oldJob["ProgramArguments"] = [legacy.path, "daemon", "--service"]
+        try PropertyListSerialization.data(fromPropertyList: oldJob, format: .xml, options: 0).write(to: plist)
+        let legacyState = await service.inspect()
+        try expect(legacyState.needsBackendUpdate && legacyState.participation, "healthy legacy install offers name migration")
+        try await installer.activate()
+        try expect(try Data(contentsOf: plist) == data && fm.fileExists(atPath: legacy.path), "name migration keeps rollback binary")
         let log = home.appendingPathComponent("control.log")
         let before = try Data(contentsOf: log)
         try expect(configured.participation && installer.configured, "compatible background installed and probed")

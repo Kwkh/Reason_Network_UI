@@ -3,6 +3,37 @@ import Darwin
 
 /// The standalone installer and the official Reason CLI use different engine locations.
 enum NetworkPaths {
+    static func inviteID(_ ticket: String) throws -> String {
+        var encoded = String(ticket.dropFirst(4)).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        encoded += String(repeating: "=", count: (4 - encoded.count % 4) % 4)
+        guard ticket.hasPrefix("rn1-"), let bytes = Data(base64Encoded: encoded), bytes.count >= 32 else {
+            throw NetworkError("请使用完整邀请链接，以便找到这个 Network 之前的聊天记录。")
+        }
+        return bytes.prefix(16).map { String(format: "%02x", $0) }.joined()
+    }
+
+
+    static func socket(in directory: URL) -> URL {
+        let path = directory.appendingPathComponent("network.sock")
+        guard path.path.utf8.count >= 100 else { return path }
+        let hash = path.path.utf8.reduce(UInt64(0xcbf29ce484222325)) { ($0 ^ UInt64($1)) &* 0x100000001b3 }
+        return URL(fileURLWithPath: String(format: "/tmp/reason-network-%u/%016llx.sock", getuid(), hash))
+    }
+
+    static func workspaceExecutable(home: URL) -> URL? {
+        let file = home.appendingPathComponent("Library/LaunchAgents/com.reasonmachines.network.plist")
+        guard let data = try? Data(contentsOf: file),
+              let job = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let path = (job["ProgramArguments"] as? [String])?.first,
+              FileManager.default.isExecutableFile(atPath: path) else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+
+    static func workspaceEnvironment(_ root: URL) -> [String: String] {
+        ["REASON_NETWORK_HOME": root.path, "REASON_NETWORK_NO_SERVICE": "1", "REASON_NETWORK_NO_TRAY": "1",
+         "REASON_NETWORK_LOCAL_PARTICIPATION": "1"]
+    }
+
     static func executable(home: URL) -> URL? {
         [".local/bin/reason-network", ".reason/bin/reason-network"].map(home.appendingPathComponent)
             .first { FileManager.default.isExecutableFile(atPath: $0.path) }
@@ -69,15 +100,15 @@ enum SetupInput {
 struct SetupCommand {
     let output: String
     let status: Int32
-    static func run(_ executable: URL, _ arguments: [String], home: URL, timeout: TimeInterval = 30) async throws -> SetupCommand {
+    static func run(_ executable: URL, _ arguments: [String], home: URL, timeout: TimeInterval = 30, environment: [String: String] = [:]) async throws -> SetupCommand {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                continuation.resume(with: Result { try execute(executable, arguments, home: home, timeout: timeout) })
+                continuation.resume(with: Result { try execute(executable, arguments, home: home, timeout: timeout, environment: environment) })
             }
         }
     }
 
-    private static func execute(_ executable: URL, _ arguments: [String], home: URL, timeout: TimeInterval) throws -> SetupCommand {
+    private static func execute(_ executable: URL, _ arguments: [String], home: URL, timeout: TimeInterval, environment: [String: String]) throws -> SetupCommand {
         let fm = FileManager.default
         let folder = fm.temporaryDirectory.appendingPathComponent("reason-setup-" + UUID().uuidString)
         try fm.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -88,7 +119,7 @@ struct SetupCommand {
         defer { try? handle.close() }
         let process = Process()
         process.executableURL = executable; process.arguments = arguments
-        process.environment = NetworkPaths.environment(home: home)
+        process.environment = NetworkPaths.environment(home: home).merging(environment) { _, override in override }
         process.currentDirectoryURL = home
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = handle; process.standardError = handle
@@ -152,6 +183,7 @@ actor SetupService: SetupServicing {
             result.sessions = directory.sessions.filter { $0.person == directory.person && $0.agent == "codex" && $0.tier != "none" }.count
         } catch { result.issue = SetupInput.redacted(error.localizedDescription) }
         if installer.configured {
+            result.needsBackendUpdate = installer.needsPathMigration
             result.participation = installer.probe(home)
             if !result.participation && ParticipationInstaller.capabilities(at: home) != nil {
                 result.participation = true
