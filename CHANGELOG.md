@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.2 (21)
+
+- 退出 Codex、Claude Code 或 dsh 后，对话会随 Network 状态刷新转为离线。重新打开原对话时可以沿用原地址、接收偏好和聊天记录。
+- Codex、Claude Code、Gemini CLI 和 dsh 改名后，本机与队友的在线会话目录会同步新标题。补全了 Gemini 和 dsh 的标题读取。
+- 侧栏只列出具有原生会话身份的 dsh 对话，退出 Network 后会从本机列表移除。
+- 查看已解散 Network 的只读记录时，可通过标题旁的删除按钮清除这份本机记录。
+
 ## 1.2.1 (20)
 
 - 首次配置会识别已接入的 Codex、Claude Code、Gemini CLI 和 dsh。配置任意一种即可加入或新建 Network，只用 dsh 的设备也能完成向导。

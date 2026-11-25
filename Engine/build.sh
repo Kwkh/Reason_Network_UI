@@ -19,8 +19,12 @@ git apply "$engine_dir/departure-notices.patch"
 git apply "$engine_dir/multi-agent-workspaces.patch"
 git apply "$engine_dir/native-agent-wake.patch"
 git apply "$engine_dir/app-integrations.patch"
+git apply "$engine_dir/dsh-session-identity.patch"
+git apply "$engine_dir/native-titles.patch"
+git apply "$engine_dir/harness-presence.patch"
 export MACOSX_DEPLOYMENT_TARGET=14.0
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
+cargo test --locked --release native_rename_after_long_records_and_compression
 cargo test --locked --release founder_management_is_scoped_and_terminal
 cargo test --locked --release paused_session_rejects_hooks_and_mcp_until_explicitly_resumed
 cargo test --locked --release dropping_an_unpublished_connection_closes_its_peer

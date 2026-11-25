@@ -110,7 +110,7 @@ def activate(plist, candidate, root, state, primary):
                         pid, = struct.unpack("i", sock.getsockopt(0, 2, struct.calcsize("i")))
                         process = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "comm="], capture_output=True, text=True)
                         peer = Path(process.stdout.strip()).resolve() if process.returncode == 0 else None
-                        if peer == candidate and reply.get("ok") and reply["result"].get("workspaces"):
+                        if peer == candidate and reply.get("ok") and reply["result"].get("harness_presence"):
                             print(plist.stem, "is running", candidate.name)
                             return
                         if not handed_off and peer in cli_paths:
@@ -119,7 +119,7 @@ def activate(plist, candidate, root, state, primary):
             except (OSError, ValueError):
                 pass
             time.sleep(0.5)
-        raise RuntimeError("Daemon did not advertise workspace routing")
+        raise RuntimeError("Daemon did not advertise harness presence tracking")
     except BaseException:
         subprocess.run(["launchctl", "bootout", service], check=False)
         replace_plist(old)

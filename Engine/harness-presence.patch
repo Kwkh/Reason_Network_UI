@@ -1,0 +1,397 @@
+diff --git a/src/daemon/directory.rs b/src/daemon/directory.rs
+--- a/src/daemon/directory.rs
++++ b/src/daemon/directory.rs
+@@ -282,7 +282,7 @@
+         // Not the person's own mailboxes: each machine has its own (`terminal`).
+         let now = util::now_ms();
+         let kept: Vec<String> =
+-            known.iter().filter(|r| r.agent != "cli" && self.holds(r, now)).map(|r| r.name.clone()).collect();
++            known.iter().filter(|r| r.agent != "cli" && self.holds(&g.store, r, now)).map(|r| r.name.clone()).collect();
+         // Teammates' machines take 100 of each, so only the most recent go; the rest are named only here.
+         if kept.len() > PRESENCE_NAMES && !self.capped.swap(true, std::sync::atomic::Ordering::Relaxed) {
+             super::log(&format!(
+diff --git a/src/daemon/mod.rs b/src/daemon/mod.rs
+--- a/src/daemon/mod.rs
++++ b/src/daemon/mod.rs
+@@ -168,6 +168,8 @@
+     store: Store,
+     paused: HashSet<String>,
+     live: HashMap<String, Live>,
++    #[cfg(target_os = "macos")]
++    owners: HashMap<String, crate::harness::Owner>,
+     conns: HashMap<u64, mpsc::UnboundedSender<String>>,
+     antigravity_conn: Option<u64>,
+     next_conn: u64,
+@@ -192,6 +194,8 @@
+ 
+ /// A session running on this machine.
+ struct Live {
++    #[cfg(target_os = "macos")]
++    requires_owner: bool,
+     through_reason: Option<bool>,
+     reg: SessionReg,
+     preferred_mode: Option<Tier>,
+@@ -305,6 +309,8 @@
+                 swept: 0,
+                 quota: Default::default(),
+                 off: HashMap::new(),
++                #[cfg(target_os = "macos")]
++                owners: HashMap::new(),
+                 codex_watch: HashSet::new(),
+             }),
+             arrived: Notify::new(),
+@@ -419,7 +425,7 @@
+             Request::SessionParticipation => {
+                 let g = self.inner.lock().unwrap();
+                 let pending: Vec<_> = g.live.iter().filter(|(_, l)| l.codex_resume_pending).map(|(key, _)| key).collect();
+-                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true, "workspaces": true, "native_titles": true, "native_agent_wake": true, "multi_agent_sessions": true, "departure_notices": true, "admin_network": g.team.as_ref().filter(|t| t.founder == self.key.public()).map(|t| &t.id),
++                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true, "workspaces": true, "harness_presence": cfg!(target_os = "macos"), "native_titles": true, "native_agent_wake": true, "multi_agent_sessions": true, "departure_notices": true, "admin_network": g.team.as_ref().filter(|t| t.founder == self.key.public()).map(|t| &t.id),
+                         "resume_pending": pending })
+             }
+             Request::SetReceiveMode { key, network, mode } => {
+diff --git a/src/daemon/sessions.rs b/src/daemon/sessions.rs
+--- a/src/daemon/sessions.rs
++++ b/src/daemon/sessions.rs
+@@ -171,8 +171,14 @@
+     fn register_quiet(
+         &self,
+         conn: Option<u64>,
+-        mut reg: SessionReg,
++        reg: SessionReg,
+         git: GitInfo,
++    ) -> Result<(Registered, (String, Vec<Message>))> {
++        self.register_source(conn, reg, git, false)
++    }
++
++    fn register_source(
++        &self, conn: Option<u64>, mut reg: SessionReg, git: GitInfo, joining: bool,
+     ) -> Result<(Registered, (String, Vec<Message>))> {
+         // Older desktop MCP clients may reconnect to a newly upgraded daemon.
+         if reg.agent == "dsh" && !reg.key.strip_prefix("dsh:").is_some_and(|id| !id.is_empty()) {
+@@ -231,7 +237,23 @@
+                 .collect();
+             self.moved_on(g, before, now);
+         }
++        #[cfg(target_os = "macos")]
++        let requires_owner = if let Some(id) = reg.agent_session_id.as_deref().filter(|_| crate::harness::tracked(&reg.agent)) {
++            let previous = g.owners.get(&key).copied();
++            let owner = crate::harness::resolve(&reg.agent, id,
++                reg.pid, previous, joining);
++            if let Some(owner) = owner { g.owners.insert(key.clone(), owner); }
++            owner.is_some() || reg.pid.is_some() || joining || (manual && conn.is_none())
++        } else { false };
++        #[cfg(target_os = "macos")]
++        if joining && let Some(l) = g.live.get(&key)
++            && (!l.requires_owner || g.owners.get(&key).is_some_and(|owner| owner.alive())) {
++            let address = self.addr(&l.name);
++            return Ok((Registered { name: l.name.clone(), unread: g.store.unread_count(&address)?, address }, (key, Vec::new())));
++        }
+         if let Some(l) = g.live.get_mut(&key) {
++            #[cfg(target_os = "macos")]
++            { l.requires_owner |= requires_owner; }
+             // Known already (e.g. from a hook, now the MCP server connects, or a reconnect).
+             if conn.is_some() {
+                 l.conn = conn;
+@@ -249,7 +271,7 @@
+             if conn.is_none() {
+                 reg.tier = reg.tier.min(self.hook_tier(&reg.agent, false));
+             }
+-            let name = pick_name(g, &reg, &git, &others, &self.person, |r| self.holds(r, now))?;
++            let name = pick_name(g, &reg, &git, &others, &self.person, |r| self.holds(&g.store, r, now))?;
+             self.take_over(g, &name, &key)?;
+             let attached = manual || conn.is_some() || reg.tier == Tier::Push || reg.agent == "cli";
+             let mcp_push = conn.is_some() && reg.tier == Tier::Push;
+@@ -263,6 +285,8 @@
+             g.live.insert(
+                 key.clone(),
+                 Live {
++                    #[cfg(target_os = "macos")]
++                    requires_owner,
+                     preferred_mode,
+                     through_reason: Some(conn.is_none() && reg.agent == "reason"),
+                     reg,
+@@ -289,6 +313,11 @@
+         g.store.upsert_session(&remembered(l, now), &self.person)?;
+         let name = l.name.clone();
+         let address = self.addr(&name);
++        #[cfg(target_os = "macos")]
++        if l.requires_owner && !g.owners.get(&key).is_some_and(|owner| owner.alive()) {
++            g.live.remove(&key);
++            return Ok((Registered { name, address, unread: 0 }, (key, Vec::new())));
++        }
+         let pending: Vec<Message> = g.pending(&address)?;
+         let wake: Vec<Message> = pending.iter().filter(|m| m.wake).cloned().collect();
+         log(&format!("session {address} registered"));
+@@ -319,7 +348,7 @@
+                 if others.terminals || !others.live.contains(&l.name) {
+                     return Ok(());
+                 }
+-                pick_name(&g, &l.reg, &l.git, others, &self.person, |r| self.holds(r, now))?
++                pick_name(&g, &l.reg, &l.git, others, &self.person, |r| self.holds(&g.store, r, now))?
+             };
+             log(&format!(
+                 "{} is on another machine too, and an older engine is in the team: now {name}",
+@@ -334,8 +363,8 @@
+ 
+     /// Whether a session remembered here still keeps its name from every other session: one that can come back to it
+     /// (see [`Remembered::kept`]), until it would be forgotten. The person's own mailboxes are never forgotten.
+-    pub(super) fn holds(&self, r: &Remembered, now: i64) -> bool {
+-        r.kept() && (r.mailbox || now - r.last_seen <= FORGET_MS || !self.forgetting(now))
++    pub(super) fn holds(&self, store: &crate::store::Store, r: &Remembered, now: i64) -> bool {
++        r.kept() && (r.mailbox || now - r.last_seen <= FORGET_MS || store.get(&format!("workspace-member:{}", r.key)).ok().flatten().is_some_and(|id| !id.is_empty()) || !self.forgetting(now))
+     }
+ 
+     /// Whether sessions gone a day are forgotten yet: not just after a start, while sessions that are still up haven't
+@@ -414,7 +443,7 @@
+                 bail!("'{n}' is your person name; pick another session name");
+             }
+             // A name kept for a session that is offline stays its own, with its mail: never renamed into.
+-            if let Some(r) = g.store.session_by_name(n)?.filter(|r| r.key != key && self.holds(r, now)) {
++            if let Some(r) = g.store.session_by_name(n)?.filter(|r| r.key != key && self.holds(&g.store, r, now)) {
+                 bail!(
+                     "'{n}' belongs to a session that is offline (last seen {} ago); pick another name",
+                     util::ago(r.last_seen, now)
+@@ -497,15 +526,32 @@
+         }
+         // Only in folders that are on (again): it left the one that is off.
+         self.inner.lock().unwrap().off.remove(&key);
++        if event == "app-join" {
++            let cwd = cwd.ok_or_else(|| anyhow!("A workspace directory is required"))?;
++            let git = self.git(&cwd).await;
++            let reg = SessionReg { key, agent: agent.to_owned(), agent_session_id: Some(session_id),
++                cwd, pid: None, tier: Tier::Pull, name };
++            let (registered, _) = self.register_source(None, reg, git, true)?;
++            return Ok(HookReply { address: Some(registered.address), ..Default::default() });
++        }
+         if event == "end" {
+             let mut g = self.inner.lock().unwrap();
++            #[cfg(target_os = "macos")]
++            {
++                // The old host can report SessionEnd after the thread was resumed by a new process.
++                if pid.is_some() && g.owners.get(&key).is_some_and(|owner| owner.alive())
++                    && g.live.get(&key).and_then(|l| l.reg.pid).is_some_and(|current| Some(current) != pid) {
++                    return Ok(HookReply::default());
++                }
++                g.owners.remove(&key);
++            }
+             if agent == "antigravity" {
+                 g.store.remember_native_app(&key, None, &[])?;
+             }
+             // Gemini's MCP server outlives a conversation (`/clear`): its hooks say when one ends.
+             if g.live
+                 .get(&key)
+-                .is_some_and(|l| l.conn.is_none() || agent::session_from_hooks(agent) || agent == "antigravity")
++                .is_some_and(|l| l.conn.is_none() || agent::session_from_hooks(agent) || agent == "antigravity" || matches!(agent, "codex" | "dsh" | "claude-code"))
+                 && let Some(l) = g.live.remove(&key)
+             {
+                 let _ = g.store.touch_session(&l.name, now);
+@@ -546,6 +592,12 @@
+         }
+         let mut g = self.inner.lock().unwrap();
+         let g = &mut *g;
++        #[cfg(target_os = "macos")]
++        if known && pid.is_some() && crate::harness::tracked(agent)
++            && let Some(owner) = crate::harness::resolve(agent, &session_id, pid, g.owners.get(&key).copied(), false) {
++            g.owners.insert(key.clone(), owner);
++            if let Some(l) = g.live.get_mut(&key) { l.requires_owner = true; }
++        }
+         let Some(l) = g.live.get_mut(&key) else { return Ok(HookReply::default()) };
+         if let Some(t) = transcript {
+             l.transcript = Some(t.into());
+@@ -665,6 +717,13 @@
+         for key in mine {
+             let l = g.live.get_mut(&key).expect("listed above");
+             // Hooks still vouch for it: keep it, reachable through them.
++            #[cfg(target_os = "macos")]
++            if l.requires_owner {
++                l.conn = None;
++                l.mcp_push = false;
++                l.reg.tier = self.hook_tier(&l.reg.agent, l.push_failed);
++                continue;
++            }
+             if l.last_hook.is_some()
+                 && (l.reg.pid.is_some_and(util::pid_alive)
+                     || l.reg.agent == "antigravity"
+@@ -689,16 +748,21 @@
+     /// Forgets hook-only sessions whose agent is gone or has been silent too long.
+     pub(super) fn prune(&self, g: &mut Inner) {
+         let now = util::now_ms();
++        #[cfg(target_os = "macos")]
++        g.owners.retain(|_, owner| owner.alive());
+         let dead: Vec<String> = g
+             .live
+             .iter()
+-            .filter(|(_, l)| {
++            .filter(|(_key, l)| {
++                #[cfg(target_os = "macos")]
++                if l.requires_owner { return !g.owners.contains_key(*_key); }
+                 l.conn.is_none()
+                     && (l.reg.pid.is_some_and(|p| !util::pid_alive(p))
+                         || l.last_hook.is_none_or(|t| now - t > HOOK_TTL_MS))
+             })
+             .map(|(k, _)| k.clone())
+             .collect();
++        if !dead.is_empty() { self.presence_changed(); }
+         for key in dead {
+             if let Some(l) = g.live.remove(&key) {
+                 let _ = g.store.touch_session(&l.name, now);
+diff --git a/src/dsh_wake.rs b/src/dsh_wake.rs
+--- a/src/dsh_wake.rs
++++ b/src/dsh_wake.rs
+@@ -1,6 +1,10 @@
+ use std::path::PathBuf;
+ 
+ pub fn endpoint(id: &str) -> Option<PathBuf> {
++    endpoint_with_pid(id).map(|(path, _)| path)
++}
++
++pub fn endpoint_with_pid(id: &str) -> Option<(PathBuf, u32)> {
+     #[cfg(target_os = "macos")]
+     {
+         use std::os::unix::fs::{FileTypeExt, MetadataExt};
+@@ -13,7 +17,7 @@
+         let mut matches = std::fs::read_dir(dir).ok()?.flatten().filter_map(|entry| {
+             let name = entry.file_name();
+             let pid = name.to_str()?.strip_prefix(&prefix)?.strip_prefix('-')?.strip_suffix(".sock")?.parse().ok()?;
+-            (crate::util::pid_alive(pid) && entry.file_type().ok()?.is_socket()).then(|| entry.path())
++            (crate::util::pid_alive(pid) && entry.file_type().ok()?.is_socket()).then(|| (entry.path(), pid))
+         });
+         let path = matches.next()?;
+         matches.next().is_none().then_some(path)
+diff --git a/src/harness.rs b/src/harness.rs
+new file mode 100644
+--- /dev/null
++++ b/src/harness.rs
+@@ -0,0 +1,107 @@
++//! The lifetime of a user-facing harness. A saved thread and a detached wake server
++//! can both outlive it. Bind to a process incarnation so PID reuse cannot revive it.
++use std::path::PathBuf;
++
++pub fn tracked(agent: &str) -> bool {
++    matches!(agent, "codex" | "claude-code" | "dsh")
++}
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub struct Process {
++    pid: u32,
++    started: (u64, u64),
++}
++
++fn process(pid: u32) -> Option<(Process, u32)> {
++    use std::mem::{MaybeUninit, size_of};
++    if pid < 2 || pid > i32::MAX as u32 { return None; }
++    let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
++    let size = size_of::<libc::proc_bsdinfo>() as i32;
++    // SAFETY: libproc initializes the entire struct on an exact-size return.
++    let count = unsafe { libc::proc_pidinfo(pid as i32, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
++    if count != size { return None; }
++    let info = unsafe { info.assume_init() };
++    if info.pbi_uid != unsafe { libc::geteuid() } || info.pbi_status == libc::SZOMB { return None; }
++    Some((Process { pid, started: (info.pbi_start_tvsec, info.pbi_start_tvusec) }, info.pbi_ppid))
++}
++
++fn path(pid: u32) -> Option<PathBuf> {
++    use std::ffi::CStr;
++    let mut buf = [0u8; 4096];
++    let n = unsafe { libc::proc_pidpath(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
++    if n <= 0 { return None; }
++    Some(PathBuf::from(CStr::from_bytes_until_nul(&buf).ok()?.to_str().ok()?))
++}
++
++#[derive(Clone, Copy)]
++pub struct Owner {
++    host: Process,
++    desktop: Option<Process>,
++}
++
++impl Owner {
++    pub fn alive(self) -> bool {
++        let current = |p: Process| process(p.pid).is_some_and(|(found, _)| found == p);
++        current(self.host) && self.desktop.is_none_or(current)
++    }
++}
++
++fn desktop_paths(agent: &str) -> &'static [&'static str] {
++    match agent {
++        "codex" => &["ChatGPT.app/Contents/MacOS/ChatGPT", "Codex.app/Contents/MacOS/Codex"],
++        "dsh" => &["DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness"],
++        _ => &[],
++    }
++}
++
++fn desktop(agent: &str) -> Option<Owner> {
++    // A private fixture or a different profile must not borrow the login user's GUI.
++    let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
++    let mut buf = vec![0i8; 4096];
++    let mut result = std::ptr::null_mut();
++    let status = unsafe { libc::getpwuid_r(libc::geteuid(), entry.as_mut_ptr(), buf.as_mut_ptr(), buf.len(), &mut result) };
++    if status != 0 || result.is_null() { return None; }
++    let home = unsafe { std::ffi::CStr::from_ptr((*result).pw_dir) }.to_str().ok()?;
++    if crate::paths::user_home() != std::path::Path::new(home) { return None; }
++    let mut found = None;
++    for suffix in desktop_paths(agent) {
++        let name = suffix.rsplit('/').next()?;
++        let out = std::process::Command::new("/usr/bin/pgrep").args(["-x", name]).output().ok()?;
++        for pid in String::from_utf8_lossy(&out.stdout).lines().filter_map(|s| s.parse().ok()) {
++            if path(pid).is_some_and(|p| p.ends_with(suffix)) && let Some((host, _)) = process(pid) {
++                if found.is_some() { return None; }
++                found = Some(Owner { host, desktop: None });
++            }
++        }
++    }
++    found
++}
++
++pub fn resolve(agent: &str, id: &str, reported: Option<u32>, previous: Option<Owner>, joining: bool) -> Option<Owner> {
++    let previous = previous.filter(|p| p.alive());
++    let pid = match agent {
++        "claude-code" if reported.is_none() => crate::claude::scan().into_iter()
++            .find(|c| c.session_id.as_deref() == Some(id)).map(|c| c.pid),
++        "dsh" => crate::dsh_wake::endpoint_with_pid(id).map(|(_, pid)| pid).or(reported),
++        _ => reported,
++    };
++    let Some(pid) = pid else { return previous.or_else(|| joining.then(|| desktop(agent)).flatten()); };
++    let (host, mut parent) = process(pid)?;
++    if let Some(owner) = previous && owner.host == host { return Some(owner); }
++    // A launchd-owned Codex server can continue accepting queue requests after Quit.
++    // Only a separately witnessed original client may keep the session online.
++    if agent == "codex" && parent == 1 && path(pid).is_some_and(|p| p.file_name().is_some_and(|n| n == "codex")) {
++        return previous.or_else(|| desktop(agent));
++    }
++    let mut gui = None;
++    for _ in 0..12 {
++        if parent < 2 { break; }
++        let Some((ancestor, next)) = process(parent) else { break };
++        if path(parent).is_some_and(|p| desktop_paths(agent).iter().any(|suffix| p.ends_with(suffix))) {
++            gui = Some(ancestor);
++            break;
++        }
++        parent = next;
++    }
++    Some(Owner { host, desktop: gui })
++}
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -3,6 +3,8 @@
+ mod bridge;
+ mod claude;
+ mod dsh_wake;
++#[cfg(target_os = "macos")]
++mod harness;
+ mod client;
+ mod codex;
+ mod config;
+diff --git a/src/store.rs b/src/store.rs
+--- a/src/store.rs
++++ b/src/store.rs
+@@ -717,7 +717,8 @@
+         let mut st = self
+             .db
+             .prepare_cached(&format!("SELECT {SESSION_COLS} FROM sessions WHERE last_seen < ?1 AND mailbox = 0
+-                                      AND key NOT IN (SELECT key FROM paused_sessions)"))?;
++                                      AND key NOT IN (SELECT key FROM paused_sessions)
++                                      AND NOT EXISTS (SELECT 1 FROM kv WHERE kv.key = 'workspace-member:' || sessions.key AND kv.value != '')"))?;
+         let gone: Vec<Remembered> = st.query_map([before], remembered)?.collect::<rusqlite::Result<_>>()?;
+         for r in gone.iter().filter(|r| !live.contains(r.name.as_str())) {
+             self.forget_session(r, person)?;

@@ -1,14 +1,19 @@
 """Exercise the stock local transport with two isolated, concurrently running networks."""
+import hashlib
 import json
 import os
 from pathlib import Path
 import select
+import shutil
+import signal
+from contextlib import ExitStack
 import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+from uuid import uuid4
 
 binary = Path(sys.argv[1]).resolve()
 
@@ -52,6 +57,9 @@ def mcp_directory(home, root, agent, native_id):
             rpc("initialize", dict(protocolVersion="2025-11-25", capabilities={},
                                    clientInfo=dict(name=agent, version="1")), 1)
             rpc("notifications/initialized", {})
+            if agent == "dsh":
+                missing = rpc("tools/call", dict(name="list_team", arguments={}), 3)
+                assert missing.get("isError") and "session_id" in missing["content"][0]["text"], missing
             arguments = {"session_id": native_id} if agent == "dsh" else {}
             result = rpc("tools/call", dict(name="list_team", arguments=arguments), 2)
             assert not result.get("isError"), result
@@ -74,7 +82,7 @@ with tempfile.TemporaryDirectory(prefix="rn-ws-", dir="/tmp") as temp:
         for _ in range(150):
             assert proc.poll() is None, "daemon exited"
             try:
-                assert call(root,"session_participation")["workspaces"]
+                assert call(root,"session_participation")["harness_presence"]
                 return proc
             except OSError:
                 time.sleep(.05)
@@ -89,7 +97,7 @@ with tempfile.TemporaryDirectory(prefix="rn-ws-", dir="/tmp") as temp:
             return db.execute("SELECT json_extract(value,'$.id') FROM kv WHERE key='team'").fetchone()[0]
 
     def hook(root, name):
-        return call(root,"hook",agent="codex",event="stop",session_id=name,name=name,cwd=temp,mail=False)
+        return call(root,"hook",agent="codex",event="stop", pid=os.getpid(),session_id=name,name=name,cwd=temp,mail=False)
 
     def send(to, body, sender="alpha", **kwargs):
         return request(a,"send",**{"from":"codex:"+sender,"to":to,"body":body,"wake":False},**kwargs)
@@ -101,8 +109,8 @@ with tempfile.TemporaryDirectory(prefix="rn-ws-", dir="/tmp") as temp:
         call(a,"enable_workspaces")
         team_b = create(b,"Blue")
         assert team_a != team_b
-        assert not request(b,"hook",agent="codex",event="stop",session_id="gamma",cwd=temp,mail=False)["ok"]
-        assert not request(a,"hook",agent="codex",event="stop",session_id="gamma",cwd=temp,mail=False)["ok"]
+        assert not request(b,"hook",agent="codex",event="stop", pid=os.getpid(),session_id="gamma",cwd=temp,mail=False)["ok"]
+        assert not request(a,"hook",agent="codex",event="stop", pid=os.getpid(),session_id="gamma",cwd=temp,mail=False)["ok"]
         for name in ["alpha","beta"]:
             call(b,"set_session_participation",key="codex:"+name,paused=False)
             hook(b,name)
@@ -136,19 +144,26 @@ with tempfile.TemporaryDirectory(prefix="rn-ws-", dir="/tmp") as temp:
         assert not send(team_b+"::qa/beta","after-exit")["ok"]
         assert send(team_a+"::qa/beta","still here")["ok"]
         print("PASS: manual membership, isolated overview and histories, qualified directory and replies, ambiguous sends refused, independent exit")
+        # An old desktop MCP client can outlive the daemon upgrade.
+        host = dict(key="proc:12345", agent="dsh", cwd=temp, tier="pull", name="desktop-dsh")
+        assert not request(a, "register", session=host)["ok"]
+        with sqlite3.connect(a/"network.db") as db:
+            db.execute("INSERT INTO sessions (key,name,agent,cwd,tier,last_seen) VALUES (?,?,?,?,?,?)",
+                       (host["key"], host["name"], "dsh", temp, "pull", int(time.time()*1000)))
+        assert not any(s["name"] == "desktop-dsh" for s in call(a, "who", all=True)["sessions"])
         # Different tools deliberately share one native ID. Only their full keys identify a mailbox.
         for agent in ["claude-code", "gemini", "dsh"]:
             key = agent + ":same-id"
             for root, team in [(a, team_a), (b, team_b)]:
                 call(root, "set_session_participation", key=key, paused=False)
                 call(root, "workspace_dispatch", network=team, request=dict(
-                    op="hook", agent=agent, event="stop", session_id="same-id", name=agent, cwd=temp, mail=False))
+                    op="hook", agent=agent, event="stop", pid=os.getpid(), session_id="same-id", name=agent, cwd=temp, mail=False))
                 call(root, "set_receive_mode", key=key, network=team, mode="pull")
                 assert send(team+"::qa/"+agent, team+"/"+agent, sender="beta")["ok"]
             directory = mcp_directory(home, a, agent, "same-id")
             assert team_a+"::qa/"+agent in directory and team_b+"::qa/"+agent in directory, directory
             # Closing a synthetic MCP client ends its own live registration. Re-open the local hook.
-            call(a, "hook", agent=agent, event="stop", session_id="same-id", cwd=temp, mail=False)
+            call(a, "hook", agent=agent, event="stop", pid=os.getpid(), session_id="same-id", cwd=temp, mail=False)
             inbox = call(a, "inbox", key=key, wait_secs=0, peek=True)
             assert {m["body"] for m in inbox["messages"]} == {team_a+"/"+agent, team_b+"/"+agent}
             for row in inbox["messages"]:
@@ -163,6 +178,96 @@ with tempfile.TemporaryDirectory(prefix="rn-ws-", dir="/tmp") as temp:
             assert not request(a, "send", **{"from":key,"to":team_b+"::qa/beta","body":"paused","wake":False})["ok"]
             assert request(a, "send", **{"from":key,"to":team_a+"::qa/beta","body":"still here","wake":False})["ok"]
         print("PASS: mixed-tool inboxes, qualified replies, ambiguous address rejection and independent pauses")
+
+        for agent in ("codex", "claude-code", "dsh"):
+            name = "lifecycle-" + agent
+            key = agent + ":" + name
+            def event(kind, **fields):
+                return dict(op="hook", agent=agent, session_id=name, event=kind,
+                            cwd=temp, name=name, mail=False, **fields)
+            def state(root):
+                return next(row["status"] for row in call(root, "who", all=True)["sessions"] if row["name"] == name)
+            for root, team in [(a, team_a), (b, team_b)]:
+                call(root, "set_session_participation", key=key, paused=False)
+                reply = call(root, "workspace_dispatch", network=team, request=event("app-join"))
+                assert reply["address"] == "qa/" + name and state(root) == "offline"
+            with subprocess.Popen(["/bin/sleep", "45"]) as original:
+                call(a, **event("prompt", pid=original.pid))
+                for root, team in [(a, team_a), (b, team_b)]:
+                    assert state(root) == "busy"
+                    call(root, "workspace_dispatch", network=team, request=event("app-join"))
+                    assert state(root) == "busy"
+                    call(root, "set_receive_mode", key=key, network=team, mode="pull")
+                # Keep the MCP connection open while the actual originating process exits.
+                with socket.socket(socket.AF_UNIX) as transport:
+                    transport.connect(str(a / "network.sock"))
+                    reg = dict(key=key, agent=agent, agent_session_id=name, cwd=temp, tier="pull", pid=original.pid)
+                    transport.sendall(json.dumps(dict(id=1, op="register", session=reg)).encode()+b"\n")
+                    assert json.loads(transport.makefile("rb").readline())["ok"]
+                    original.terminate()
+                    original.wait(timeout=5)
+                    assert state(a) == state(b) == "offline"
+                    for root in (a, b):
+                        assert key not in call(root, "session_participation")["paused"]
+                        with sqlite3.connect(root/"network.db") as db:
+                            assert db.execute("SELECT value FROM kv WHERE key=?", ("receive-mode:"+key,)).fetchone() == ("pull",)
+            # Reopening the same thread uses its previous address. An explicit disconnect stays scoped.
+            call(b, "set_session_participation", key=key, paused=True)
+            assert call(a, **event("prompt", pid=os.getpid()))["address"] == "qa/" + name
+            assert state(a) == "busy"
+            assert not any(row["name"] == name for row in call(b, "who", all=True)["sessions"])
+            call(a, **event("end", pid=os.getpid()))
+            assert state(a) == "offline"
+        print("PASS: three harnesses, two Networks, manual offline join, live MCP surviving host exit, scoped reopen")
+
+        # Manual join can discover a real host even before its first hook.
+        for agent in ("claude-code", "dsh"):
+            sid = str(uuid4())
+            key = agent + ":" + sid
+            name = "native-" + agent
+            call(a, "set_session_participation", key=key, paused=False)
+            with ExitStack() as cleanup, subprocess.Popen(["/bin/sleep", "20"]) as native:
+                if agent == "claude-code":
+                    reg = home / ".claude/sessions" / (str(native.pid) + ".json")
+                    reg.parent.mkdir(parents=True, exist_ok=True)
+                    reg.write_text(json.dumps(dict(sessionId=sid, pid=native.pid, cwd=temp)))
+                else:
+                    digest = hashlib.sha256(sid.encode()).hexdigest()[:32]
+                    directory = Path("/tmp") / ("reason-dsh-" + str(os.getuid()))
+                    directory.mkdir(mode=0o700, exist_ok=True)
+                    path = directory / (digest + "-" + str(native.pid) + ".sock")
+                    listener = cleanup.enter_context(socket.socket(socket.AF_UNIX))
+                    listener.bind(str(path))
+                    cleanup.callback(path.unlink, missing_ok=True)
+                    listener.listen(1)
+                reply = call(a, "hook", event="app-join", agent=agent, session_id=sid, name=name, cwd=temp)
+                assert reply["address"] == "qa/"+name
+                def status():
+                    return next(row["status"] for row in call(a, "who", all=True)["sessions"] if row["name"] == name)
+                assert status() != "offline"
+                native.terminate()
+                native.wait(timeout=5)
+                assert status() == "offline"
+        print("PASS: native Claude registry and dsh plugin endpoint follow the original host lifetime")
+
+        # The native wake service survives its launcher. Its PID alone cannot make
+        # an archived/closed desktop process appear online in this isolated profile.
+        detached = home/"codex"
+        shutil.copyfile("/bin/sleep", detached)
+        detached.chmod(0o700)
+        launcher = "import subprocess, sys; print(subprocess.Popen([sys.argv[1], '30'], stdout=subprocess.DEVNULL).pid)"
+        pid = int(subprocess.check_output([sys.executable, "-c", launcher, str(detached)]))
+        try:
+            name = "detached-server"
+            call(a, "set_session_participation", key="codex:"+name, paused=False)
+            call(a, "hook", event="stop", agent="codex", session_id=name, name=name, cwd=temp, pid=pid)
+            assert next(row["status"] for row in call(a, "who", all=True)["sessions"] if row["name"] == name) == "offline"
+        finally:
+            os.kill(pid, signal.SIGTERM)
+        print("PASS: a detached Codex wake service alone cannot advertise an online conversation")
+
+
+
         with sqlite3.connect(b/"network.db") as db:
             history_count = db.execute("SELECT COUNT(*) FROM workspace_sent WHERE network=?", (team_b,)).fetchone()[0]
         assert call(a,"session_participation")["admin_network"] == team_a

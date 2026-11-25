@@ -63,6 +63,10 @@ struct WorkspaceChecks {
         precondition(roster.isOnlyLocalHistory(former.address, origins: [former.address: ["departed-host"]], registered: [], listed: []))
         precondition(directory.isOnlyLocalHistory(former.address, origins: [:], registered: [], listed: []))
         try await verifyHistoryDeletion(home: home, network: first, other: second.id)
+        do {
+            try await hub.deleteArchive(first)
+            preconditionFailure("An active workspace is not a deletable archive")
+        } catch is NetworkError {}
         try await hub.current.leaveNetwork(first.id, dissolving: true)
         await hub.didLeave()
         precondition(hub.items.isEmpty && hub.archives.map(\.id) == [first.id])
@@ -70,6 +74,17 @@ struct WorkspaceChecks {
         let messages = try cached.rows("SELECT body FROM network_events WHERE network=?",[first.id])
         precondition(messages.contains { $0["body"] == first.name })
         print("PASS: founder-only App action, self-device exclusion and archived history after dissolution")
+        let otherBefore = try cached.rows("SELECT id FROM network_events WHERE network=? ORDER BY id", [second.id])
+        precondition(!otherBefore.isEmpty)
+        try await hub.deleteArchive(first)
+        precondition(hub.archives.isEmpty && WorkspaceStore(home: home).dissolved().isEmpty)
+        let writer = try SQLiteStore(first.root.appendingPathComponent("local-ui/messages.sqlite3"), readOnly: false)
+        _ = try writer.rows("INSERT INTO network_events(network,id,local_session,direction) VALUES(?,?,?,?)",
+                            [first.id, "replayed", "beta", "in"])
+        let after = try cached.rows("SELECT id FROM network_events WHERE network=?", [first.id])
+        let otherAfter = try cached.rows("SELECT id FROM network_events WHERE network=? ORDER BY id", [second.id])
+        precondition(after.isEmpty && otherBefore == otherAfter)
+        print("PASS: local archive deletion, workspace isolation and replay suppression after reopen")
         await hub.refreshDepartureNotices()
         precondition(hub.departureNotices.isEmpty, "An initiating device must not report a remote departure")
         try await verifyDepartureNotices(home: home, first: first, second: second)
@@ -100,6 +115,12 @@ struct WorkspaceChecks {
                 let candidate = try require(candidates.first { $0.id == key })
                 precondition(candidate.title == title && candidate.canJoin)
                 _ = try await service.joinPersonalSession(key)
+                if agent != "gemini" {
+                    let socket = SessionSocket(socketURL: NetworkPaths.socket(in: ws.root))
+                    let hook: [String: Any] = ["op":"hook", "agent":agent, "event":"prompt",
+                                               "session_id":id, "cwd":home.path, "pid":getpid(), "mail":false]
+                    _ = try socket.request(["op":"workspace_dispatch","network":ws.id,"request":hook])
+                }
                 let snap = try await service.snapshot(local: "", peer: "")
                 let sender = try require(snap.localSessions.first { $0.key == key })
                 precondition(sender.title == title && snap.directory.liveLocalSession(named: sender.name, agent: agent) != nil)
@@ -121,6 +142,25 @@ struct WorkspaceChecks {
                 precondition(offline.directory.liveLocalSession(named: sender.name, agent: sender.agent) == nil)
                 try await service.reconnectLocal(sender, network: ws.id)
             }
+        }
+        let service = ReasonService(home: home, expectedNetwork: first.id)
+        let before = try await service.snapshot(local: "", peer: "")
+        let addresses = Dictionary(uniqueKeysWithValues: before.localSessions.filter { $0.key.hasSuffix(":" + id) }.map { ($0.key, $0.name) })
+        try fixture(".claude/projects/qa/" + id + ".jsonl", [
+            ["cwd": home.path, "customTitle": "Claude renamed"], ["type": "ai-title", "aiTitle": "Generated"]
+        ])
+        try fixture(".gemini/tmp/qa/chats/session.jsonl", [
+            ["sessionId": id, "title": "Gemini QA"], ["$set": ["title": "Gemini renamed"]]
+        ])
+        try fixture(".dsh/sessions/qa/" + id + "/session.v4.jsonl", [
+            ["id": id, "cwd": home.path], ["type": "session/title", "data": ["title": "dsh renamed"]]
+        ])
+        let updated = try await service.snapshot(local: "", peer: "")
+        for (agent, title) in [("claude-code", "Claude renamed"), ("gemini", "Gemini renamed"), ("dsh", "dsh renamed")] {
+            let key = agent + ":" + id
+            let sender = try require(updated.localSessions.first { $0.key == key })
+            precondition(sender.name == addresses[key] && sender.title == title)
+            precondition(updated.directory.liveLocalSession(named: sender.name, agent: agent)?.clientTitle == title)
         }
         print("PASS: three native tools with identical IDs, native titles, sender selection, scoped send/receive history, pull and reconnect in two workspaces")
     }
@@ -217,7 +257,7 @@ struct WorkspaceChecks {
                 let key = "codex:" + id
                 _ = try socket.request(["op":"set_session_participation","key":key,"paused":false])
                 let hook: [String: Any] = ["op":"hook","agent":"codex","event":"stop","session_id":id,
-                                            "name":name,"cwd":home.path,"mail":false]
+                                            "name":name,"cwd":home.path,"pid":getpid(),"mail":false]
                 _ = try socket.request(["op":"workspace_dispatch","network":item.id,"request":hook])
                 _ = try socket.request(["op":"set_receive_mode","key":key,"network":item.id,"mode":"pull"])
             }
@@ -262,7 +302,7 @@ struct WorkspaceChecks {
         precondition(model.tier == "pull" && model.notice.text.contains("1/1") && model.onlineReceiveTargets.map(\.key) == [sender.key])
         _ = try socket.request(["op":"set_session_participation", "key":"codex:" + betaID, "paused":false])
         let hook: [String: Any] = ["op":"hook","agent":"codex","event":"stop","session_id":betaID,
-                                   "name":"beta","cwd":home.path,"mail":false]
+                                   "name":"beta","cwd":home.path,"pid":getpid(),"mail":false]
         _ = try socket.request(["op":"workspace_dispatch","network":first.id,"request":hook])
         await model.refresh()
         precondition(model.draft == first.name && model.messages == history)

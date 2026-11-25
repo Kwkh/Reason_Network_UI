@@ -65,8 +65,20 @@ final class SQLiteStore {
         return origins
     }
 
+    func prepareArchiveDeletion() throws {
+        _ = try rows("CREATE TABLE IF NOT EXISTS deleted_archives(network TEXT PRIMARY KEY)")
+        if !(try rows("SELECT 1 FROM sqlite_master WHERE type='table' AND name='network_events'")).isEmpty {
+            _ = try rows("""
+                CREATE TRIGGER IF NOT EXISTS skip_deleted_archive BEFORE INSERT ON network_events
+                WHEN EXISTS (SELECT 1 FROM deleted_archives WHERE network=NEW.network)
+                BEGIN SELECT RAISE(IGNORE); END
+                """)
+        }
+    }
+
     func prepareHistoryDeletion() throws {
         try transaction {
+            try prepareArchiveDeletion()
             _ = try rows("CREATE TABLE IF NOT EXISTS session_origins(network TEXT,peer TEXT,endpoint TEXT,PRIMARY KEY(network,peer,endpoint))")
             _ = try rows("CREATE TABLE IF NOT EXISTS history_clears(network TEXT,local_session TEXT,peer TEXT,through REAL NOT NULL,PRIMARY KEY(network,local_session,peer))")
             _ = try rows("CREATE TABLE IF NOT EXISTS cleared_event_ids(network TEXT,local_session TEXT,direction TEXT,id TEXT,PRIMARY KEY(network,local_session,direction,id))")

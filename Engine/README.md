@@ -25,4 +25,4 @@ cp "BACKUP" "$HOME/Library/LaunchAgents/com.reasonmachines.network.plist"
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.reasonmachines.network.plist"
 ```
 
-同一工具的原生会话 ID 和工具名共同确定发送身份。dsh 的共享 MCP 客户端可在工具调用的 `session_id` 参数中传入当前 Shell 工具提供的 `DSH_SESSION_ID`。此入口需要使用新版内置 MCP 程序。在环境配置页运行配置后，重新加载 dsh 并打开原对话，即可在 App 选择即时推送。空闲对话收到唤醒消息后开始下一回合，忙碌时排到下一回合；主机关闭后保留未读。Claude Code 通过原会话的消息通道接收，审批行为遵循 Claude Code 设置。读取压缩的 dsh 日志标题和目录需要本机安装 zstd，已注册会话也能使用后台记录的工作目录。
+同一工具的原生会话 ID 和工具名共同确定发送身份。dsh 的共享 MCP 客户端可在工具调用的 `session_id` 参数中传入当前 Shell 工具提供的 `DSH_SESSION_ID`。此入口需要使用新版内置 MCP 程序。在环境配置页运行配置后，重新加载 dsh 并打开原对话，即可在 App 选择即时推送。空闲对话收到唤醒消息后开始下一回合，忙碌时排到下一回合；主机关闭后保留未读。Claude Code 通过原会话的消息通道接收，审批行为遵循 Claude Code 设置。后台直接读取四种工具的原生会话标题，并随在线目录更新队友看到的名称。dsh 的压缩日志由内置的 zstd 解码。改名后会话地址和聊天记录继续沿用。

@@ -3,6 +3,8 @@ set -euo pipefail
 project_dir="${0:A:h:h}"
 checks_dir="$(mktemp -d /tmp/reason-native-checks.XXXXXX)"
 trap 'rm -rf "$checks_dir"' EXIT
+mkdir -p "$checks_dir/Contents/MacOS"
+ln -s "$project_dir/Engine/Bin/reason-network-backend" "$checks_dir/Contents/MacOS/reason-network-backend"
 xcrun swiftc -parse-as-library -swift-version 5 -module-cache-path "$checks_dir/cache" \
  "$project_dir/Sources/ParticipationInstaller.swift" "$project_dir/Sources/SetupService.swift" "$project_dir/Sources/AppLanguage.swift" "$project_dir/Sources/Models.swift" "$project_dir/Sources/SQLiteStore.swift" \
  "$project_dir/Sources/TranscriptMirror.swift" "$project_dir/Sources/PersonalSessions.swift" "$project_dir/Sources/ReasonService.swift" \

@@ -1,0 +1,55 @@
+--- a/src/agent.rs
++++ b/src/agent.rs
+@@ -89,7 +89,7 @@
+ 
+ /// Agents that run one MCP server process for many sessions, so the session must come from each call.
+ pub fn multiplexed(agent: &str) -> bool {
+-    matches!(agent, "codex" | "opencode" | "cursor" | "antigravity")
++    matches!(agent, "codex" | "opencode" | "cursor" | "antigravity" | "dsh")
+ }
+ 
+ /// The session id an agent exports to its MCP servers, if any. `REASON_NETWORK_SESSION` is set by our own pi extension.
+--- a/src/mcp.rs
++++ b/src/mcp.rs
+@@ -395,7 +395,8 @@
+         if off_here() {
+             anyhow::bail!(OFF_HERE);
+         }
+-        if meta_id.is_none() && agent::multiplexed(agent) {
++        // A dsh desktop profile shares its cwd and MCP connection across native conversations.
++        if agent != "dsh" && meta_id.is_none() && agent::multiplexed(agent) {
+             match self.link.call::<Option<String>>(Request::Attach { agent: agent.into(), cwd: agent::cwd() }).await {
+                 Ok(Some(key)) => return Ok(key),
+                 Err(e) if e.to_string() == crate::config::BUSY_OFF => anyhow::bail!(crate::config::BUSY_OFF),
+@@ -418,6 +419,7 @@
+         }
+         let key = match &id {
+             Some(id) => format!("{agent}:{id}"),
++            None if agent == "dsh" => anyhow::bail!("Pass the native dsh session_id for this conversation."),
+             None => format!("proc:{}", std::process::id()),
+         };
+         let tier = if self.pushed(agent) { Tier::Push } else { Tier::Pull };
+--- a/src/daemon/sessions.rs
++++ b/src/daemon/sessions.rs
+@@ -174,6 +174,10 @@
+         mut reg: SessionReg,
+         git: GitInfo,
+     ) -> Result<(Registered, (String, Vec<Message>))> {
++        // Older desktop MCP clients may reconnect to a newly upgraded daemon.
++        if reg.agent == "dsh" && !reg.key.strip_prefix("dsh:").is_some_and(|id| !id.is_empty()) {
++            bail!("A native dsh session_id is required");
++        }
+         // Every session comes in here: one in a folder that is off never does.
+         if self.cfg.off_in(&reg.cwd) {
+             bail!(OFF_HERE);
+--- a/src/daemon/directory.rs
++++ b/src/daemon/directory.rs
+@@ -239,6 +239,8 @@
+     fn remembered(&self, g: &super::Inner) -> Vec<Remembered> {
+         let live: HashSet<&str> = g.live.values().map(|l| l.name.as_str()).collect();
+         let mut known = g.store.sessions().unwrap_or_default();
++        // Older daemons persisted dsh desktop MCP processes as offline recipients.
++        known.retain(|r| r.agent != "dsh" || r.key.starts_with("dsh:"));
+         known.retain(|r| !live.contains(r.name.as_str()) && !self.cfg.off_in(&r.cwd) && !g.paused.contains(&r.key) && !crate::codex::unavailable(&r.key));
+         known
+     }

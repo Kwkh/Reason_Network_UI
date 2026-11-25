@@ -73,10 +73,11 @@ actor ReasonService {
         let registrations = localRecords.filter { !paused.contains($0["key"] ?? "") }
         let catalog = PersonalSessionCatalog(home: home)
         let keys = Set(localRecords.compactMap { $0["key"] }.filter { !$0.hasPrefix("codex:") })
-        if !keys.isEmpty && (keys != titleKeys || Date().timeIntervalSince(titlesUpdated) > 30) {
-            otherTitles = Dictionary(catalog.otherSessions(keys: keys).compactMap { session in
+        if !keys.isEmpty && (keys != titleKeys || Date().timeIntervalSince(titlesUpdated) > 30),
+           let native = try? catalog.nativeSessions() {
+            otherTitles = Dictionary(native.filter { keys.contains($0.id) }.compactMap { session in
                 session.nativeTitle.map { (session.id, $0) }
-            }, uniquingKeysWith: { first, _ in first })
+            }, uniquingKeysWith: { _, latest in latest })
             titleKeys = keys
             titlesUpdated = Date()
         }
@@ -104,7 +105,7 @@ actor ReasonService {
             let session = directory.sessions[i]
             if session.person == directory.person, session.machine == directory.machine,
                let key = attached.first(where: { $0["name"] == session.name && $0["agent"] == session.agent })?["key"],
-               let title = localTitle(key) {
+               session.clientTitle == nil, let title = localTitle(key) {
                 directory.sessions[i].clientTitle = title
             }
         }
@@ -118,10 +119,10 @@ actor ReasonService {
             let index = directory.sessions.firstIndex {
                 $0.person == directory.person && $0.machine == directory.machine && $0.name == name && $0.agent == row["agent"]
             }
-            let title = localTitle(key)
             let published = index.map { directory.sessions[$0] }
+            let title = published?.clientTitle ?? localTitle(key)
             let remembered = labels[directory.person + "/" + name]
-            let displayTitle = title ?? published?.clientTitle ?? remembered?.title
+            let displayTitle = title ?? remembered?.title
             let activity = published?.doing ?? row["doing"]?.nonEmpty ?? remembered?.activity
             return LocalSession(name: name, key: key, doing: displayTitle ?? activity,
                                 historyOnly: restrictions[name] != nil, restriction: restrictions[name])
@@ -159,7 +160,10 @@ actor ReasonService {
         let registeredNames = Set(localRecords.compactMap { $0["name"] })
         let hiddenHistory = Set(try cache.rows("SELECT name FROM hidden_local_history WHERE network=?", [network]).compactMap { $0["name"] })
         let disconnectedNames = Set(disconnected.compactMap { $0["name"] })
-        let hiddenNames = pausedNames.subtracting(disconnectedNames).union(hiddenHistory.subtracting(registeredNames))
+        // Older dsh desktop clients registered their MCP host as a separate local peer.
+        // Use registration keys so a real conversation may still be named "desktop-dsh".
+        let processNames = Set(try engine.rows("SELECT name FROM sessions WHERE agent='dsh' AND key LIKE 'proc:%' EXCEPT SELECT name FROM sessions WHERE agent!='dsh' OR key NOT LIKE 'proc:%'").compactMap { $0["name"] })
+        let hiddenNames = pausedNames.subtracting(disconnectedNames).union(hiddenHistory.subtracting(registeredNames)).union(processNames)
         directory.sessions.removeAll {
             $0.person == directory.person && $0.machine == directory.machine && LocalSession.supportedAgents.contains($0.agent ?? "") && (hiddenNames.contains($0.name) || disconnectedNames.contains($0.name))
         }
@@ -459,7 +463,7 @@ actor ReasonService {
         if FileManager.default.fileExists(atPath: enginePath.path) {
             let engine = try SQLiteStore(enginePath, readOnly: true)
             if let network = try teamID(in: engine) { retained = try disconnectedKeys(network) }
-            knownRecords = try engine.rows("SELECT key,agent,name,cwd,doing,last_seen FROM sessions WHERE attached=1 OR tier!='none'")
+            knownRecords = try engine.rows("SELECT key,agent,name,cwd,doing,last_seen FROM sessions WHERE (attached=1 OR tier!='none') AND NOT (agent='dsh' AND key LIKE 'proc:%')")
         } else {
             knownRecords = []
         }
@@ -513,6 +517,10 @@ actor ReasonService {
         } else {
             _ = try registerPersonalSession(session)
         }
+        if ["codex", "claude-code", "dsh"].contains(local.agent),
+           try directory().liveLocalSession(named: local.name, agent: local.agent) == nil {
+            throw NetworkError("会话已加入。请在原工具中打开该对话，等待上线。")
+        }
     }
 
     func joinPersonalSession(_ key: String) throws -> String {
@@ -537,7 +545,7 @@ actor ReasonService {
         guard FileManager.default.fileExists(atPath: cwd, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw NetworkError("会话的项目目录已不存在，无法接入。")
         }
-        var payload: [String: Any] = ["op": "hook", "event": "stop", "agent": chosen.agent,
+        var payload: [String: Any] = ["op": "hook", "event": ["codex", "claude-code", "dsh"].contains(chosen.agent) ? "app-join" : "stop", "agent": chosen.agent,
                                       "session_id": nativeID, "cwd": cwd, "mail": false]
         if let transcript = chosen.transcript { payload["transcript"] = transcript.path }
         struct JoinReply: Decodable { let address: String? }
@@ -701,9 +709,12 @@ actor ReasonService {
         return InterfaceMessage { L10n.text("最近一次推送已进入 Codex 队列，但未能唤醒此会话。请在 Codex 打开该对话，无需重发。\n\n") + detail }
     }
     private func directory() throws -> Directory {
+        // The stock CLI may strip newer fields when it decodes and re-encodes the directory.
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        if let data = try? console.request(["op": "who", "all": false]),
+           let current = try? decoder.decode(Directory.self, from: data) { return current }
         let output = try run(["who", "--json"])
         guard let data = output.data(using: .utf8) else { throw NetworkError("无法读取 Network 目录") }
-        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         return try decoder.decode(Directory.self, from: data)
     }
     private func store() throws -> SQLiteStore {

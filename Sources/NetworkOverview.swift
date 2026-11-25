@@ -305,6 +305,9 @@ struct ArchiveChoices: View {
 
 struct NetworkArchiveView: View {
     let workspace: NetworkWorkspace
+    @EnvironmentObject private var workspaces: WorkspaceController
+    @State private var confirmDeletion = false
+    @State private var deleting = false
     @Environment(\.dismiss) private var dismiss
     @State private var messages: [Message] = []
     @State private var more = false
@@ -313,6 +316,13 @@ struct NetworkArchiveView: View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
                 Text(workspace.name).font(.title2.bold())
+                Button {
+                    confirmDeletion = true
+                } label: {
+                    Image(systemName: "trash").frame(width: 24, height: 24).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain).foregroundStyle(.secondary)
+                .help(L10n.text("删除本机归档")).accessibilityLabel(L10n.text("删除本机归档"))
                 Spacer()
                 Button(L10n.text("完成")) { dismiss() }
             }
@@ -336,6 +346,24 @@ struct NetworkArchiveView: View {
                 }
             }
         }.padding(34).frame(width: 540, height: 510).networkSheetBackground().onAppear { load() }
+        .disabled(deleting).interactiveDismissDisabled(deleting)
+        .alert(L10n.format("删除「%@」的本机归档？", workspace.name), isPresented: $confirmDeletion) {
+            Button(L10n.text("取消"), role: .cancel) {}
+            Button(L10n.text("删除本机归档"), role: .destructive) {
+                deleting = true
+                Task {
+                    do {
+                        try await workspaces.deleteArchive(workspace)
+                        dismiss()
+                    } catch {
+                        failure = error.localizedDescription
+                        deleting = false
+                    }
+                }
+            }
+        } message: {
+            Text(L10n.text("将删除这台 Mac 上该 Network 的全部聊天记录。其他成员保留自己的副本。此操作无法撤销。"))
+        }
     }
     private func load() {
         let file = workspace.root.appendingPathComponent("local-ui/messages.sqlite3")

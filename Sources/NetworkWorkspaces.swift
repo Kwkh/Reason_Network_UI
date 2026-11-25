@@ -51,11 +51,34 @@ struct WorkspaceStore: Sendable {
         profiles().flatMap { root -> [NetworkWorkspace] in
             guard let db = try? SQLiteStore(root.appendingPathComponent("network.db"), readOnly: true),
                   let rows = try? db.rows("SELECT substr(key,11) AS id, json_extract(value,'$.meta.body.name') AS name FROM kv WHERE key LIKE 'dissolved:%'") else { return [] }
+            guard !rows.isEmpty else { return [] }
+            let cacheURL = root.appendingPathComponent("local-ui/messages.sqlite3")
+            let deleted = (try? SQLiteStore(cacheURL, readOnly: true).rows("SELECT network FROM deleted_archives")) ?? []
+            let hidden = Set(deleted.compactMap { $0["network"] })
             return rows.compactMap { row in
-                guard let id = row["id"], let name = row["name"] else { return nil }
+                guard let id = row["id"], !hidden.contains(id), let name = row["name"] else { return nil }
                 return NetworkWorkspace(id: id, name: name, root: root)
             }
         }.sorted { ($0.name,$0.id) < ($1.name,$1.id) }
+    }
+
+    func deleteArchive(_ workspace: NetworkWorkspace) throws {
+        guard profiles().contains(workspace.root),
+              membership(at: workspace.root)?.id != workspace.id else { throw NetworkError("归档状态已变化，请刷新后重试。") }
+        let engine = try SQLiteStore(workspace.root.appendingPathComponent("network.db"), readOnly: true)
+        guard !(try engine.rows("SELECT 1 FROM kv WHERE key=?", ["dissolved:" + workspace.id])).isEmpty else {
+            throw NetworkError("归档状态已变化，请刷新后重试。")
+        }
+        let folder = workspace.root.appendingPathComponent("local-ui")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let cache = try SQLiteStore(folder.appendingPathComponent("messages.sqlite3"), readOnly: false)
+        try cache.transaction {
+            try cache.prepareArchiveDeletion()
+            _ = try cache.rows("INSERT OR IGNORE INTO deleted_archives(network) VALUES(?)", [workspace.id])
+            if !(try cache.rows("SELECT 1 FROM sqlite_master WHERE type='table' AND name='network_events'")).isEmpty {
+                _ = try cache.rows("DELETE FROM network_events WHERE network=?", [workspace.id])
+            }
+        }
     }
 
     func remoteDepartures() async -> [NetworkDeparture] {
@@ -232,6 +255,12 @@ final class WorkspaceController: ObservableObject {
             selection = nil
             current = NetworkModel(service: ReasonService(home: store.home))
         }
+    }
+
+    func deleteArchive(_ workspace: NetworkWorkspace) async throws {
+        let store = self.store
+        try await Task.detached { try store.deleteArchive(workspace) }.value
+        archives = store.dissolved()
     }
 
     func didLeave() async {
