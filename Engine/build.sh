@@ -13,8 +13,14 @@ git apply "$engine_dir/codex-wake.patch"
 git apply "$engine_dir/connection-recovery.patch"
 git apply "$engine_dir/native-thread-guard.patch"
 git apply "$engine_dir/network-workspaces.patch"
+git apply "$engine_dir/codex-resume-server.patch"
+git apply "$engine_dir/founder-admin.patch"
+git apply "$engine_dir/departure-notices.patch"
+git apply "$engine_dir/multi-agent-workspaces.patch"
+git apply "$engine_dir/native-agent-wake.patch"
 export MACOSX_DEPLOYMENT_TARGET=14.0
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
+cargo test --locked --release founder_management_is_scoped_and_terminal
 cargo test --locked --release paused_session_rejects_hooks_and_mcp_until_explicitly_resumed
 cargo test --locked --release dropping_an_unpublished_connection_closes_its_peer
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
@@ -25,4 +31,5 @@ codesign --force -s - "$work/backend"
 codesign --verify --strict --all-architectures "$work/backend"
 python3 "$engine_dir/../Tests/receive-mode-checks.py" "$work/backend"
 python3 "$engine_dir/../Tests/workspace-checks.py" "$work/backend"
+python3 "$engine_dir/../Tests/native-wake-checks.py" "$work/backend"
 install -m 755 "$work/backend" "$engine_dir/Bin/reason-network-backend"

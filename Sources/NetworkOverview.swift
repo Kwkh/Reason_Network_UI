@@ -37,7 +37,7 @@ struct CopyInvitationButton: View {
             } label: {
                 Label {
                     ZStack(alignment: .leading) {
-                        Text("复制邀请链接").hidden().accessibilityHidden(true)
+                        Text(L10n.text("复制邀请链接")).hidden().accessibilityHidden(true)
                         Text(copied ? L10n.text("已复制") : L10n.text("复制邀请链接"))
                             .contentTransition(reduceMotion ? .identity : .numericText(value: copied ? 1 : 0))
                             .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: copied)
@@ -78,15 +78,18 @@ private struct WorkspaceOverviewPage: View {
 
     @EnvironmentObject private var model: NetworkModel
     @Environment(\.dismiss) private var dismiss
+    @State private var archive: NetworkWorkspace?
+    @State private var dissolution: NetworkWorkspace?
+    @State private var failure: InterfaceMessage?
     @State private var includeOffline = false
     private let panelInset: CGFloat = 34
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("概览").font(.title2.weight(.semibold))
+                Text(L10n.text("概览")).font(.title2.weight(.semibold))
                 Spacer()
-                Button("完成") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button(L10n.text("完成")) { dismiss() }.keyboardShortcut(.cancelAction)
             }
             .padding([.top, .horizontal], panelInset)
             .padding(.bottom, 20)
@@ -103,23 +106,24 @@ private struct WorkspaceOverviewPage: View {
                     }
                 }
                 Divider()
-                Button("新建 Network", systemImage: "plus") { adding = .create }
-                Button("加入 Network", systemImage: "link") { adding = .join }
+                ArchiveChoices(items: workspaces.archives, selection: $archive)
+                Button(L10n.text("新建 Network"), systemImage: "plus") { adding = .create }
+                Button(L10n.text("加入 Network"), systemImage: "link") { adding = .join }
             } label: {
                 Text(workspaces.selection?.name ?? model.directory?.team ?? L10n.text("选择 Network"))
                     .font(.title.weight(.semibold)).lineLimit(1).truncationMode(.tail)
             }
             .menuStyle(.borderlessButton).fixedSize(horizontal: true, vertical: false)
-            .accessibilityLabel("选择 Network")
+            .accessibilityLabel(L10n.text("选择 Network"))
             .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, panelInset).padding(.bottom, 6)
 
             if let error = model.error {
                 ContentUnavailableView {
-                    Label("无法载入网络概览", systemImage: "network.slash")
+                    Label(L10n.text("无法载入网络概览"), systemImage: "network.slash")
                 } description: {
                     Text(error.text)
                 } actions: {
-                    Button("重试") { Task { await model.refresh() } }
+                    Button(L10n.text("重试")) { Task { await model.refresh() } }
                 }
             } else if let directory = model.directory {
                 ScrollView {
@@ -139,8 +143,8 @@ private struct WorkspaceOverviewPage: View {
                         sessionList(directory)
                         Divider()
                         VStack(alignment: .leading, spacing: 12) {
-                            Text("设备").font(.headline)
-                            if directory.machines.isEmpty { Text("暂无设备").foregroundStyle(.secondary) }
+                            Text(L10n.text("设备")).font(.headline)
+                            if directory.machines.isEmpty { Text(L10n.text("暂无设备")).foregroundStyle(.secondary) }
                             ForEach(directory.machines) { device in
                                 HStack {
                                     Image(systemName: device.isMe ? "laptopcomputer" : "desktopcomputer")
@@ -156,13 +160,32 @@ private struct WorkspaceOverviewPage: View {
                             }
                         }
                     }
+                    .safeAreaInset(edge: .bottom, alignment: .leading) {
+                        if directory.managesNetwork == true, let item = workspaces.selection, item.id == directory.networkID {
+                            Button(L10n.text("解散 Network…"), role: .destructive) { dissolution = item }
+                                .padding(.top, 16)
+                        }
+                    }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, panelInset).padding(.bottom, 20)
                 }
             } else {
-                ProgressView("正在读取网络状态…").frame(maxWidth: .infinity, maxHeight: .infinity)
+                ProgressView(L10n.text("正在读取网络状态…")).frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .alert(L10n.text("解散 Network？"), isPresented: Binding(get: { dissolution != nil }, set: { if !$0 { dissolution = nil } }), presenting: dissolution) { item in
+            Button(L10n.text("取消"), role: .cancel) {}
+            Button(L10n.text("解散"), role: .destructive) {
+                Task { do { try await model.leaveNetwork(item.id, dissolving: true); dismiss() }
+                       catch { failure = InterfaceMessage { error.localizedDescription } } }
+            }
+        } message: { item in
+            Text(L10n.format("「%@」将永久停止通信，邀请链接失效。设备同步后退出，本机已保存的聊天记录会保留。", item.name))
+        }
+        .alert(L10n.text("无法解散 Network"), isPresented: Binding(get: { failure != nil }, set: { if !$0 { failure = nil } })) {
+            Button(L10n.text("好"), role: .cancel) {}
+        } message: { Text(failure?.text ?? "") }
+        .sheet(item: $archive) { NetworkArchiveView(workspace: $0) }
         .sheet(item: $adding) { WorkspaceForm(action: $0, person: model.directory?.person ?? NSUserName()) }
         .frame(width: 540, height: 510)
         .networkSheetBackground()
@@ -238,15 +261,15 @@ struct WorkspaceForm: View {
         VStack(alignment: .leading, spacing: 16) {
             Text(action.title).font(.title2.weight(.semibold))
             Group {
-                if action == .create { TextField("Network 名称", text: $value) }
-                else { SecureField("完整邀请链接", text: $value) }
+                if action == .create { TextField(L10n.text("Network 名称"), text: $value) }
+                else { SecureField(L10n.text("完整邀请链接"), text: $value) }
             }.networkFormField()
             NetworkPersonField(person: $person)
             if let error { Text(error.text).foregroundStyle(.red).font(.callout).textSelection(.enabled) }
             HStack {
                 if busy { ProgressView().controlSize(.small) }
                 Spacer()
-                Button("取消") { dismiss() }.buttonStyle(.plain).foregroundStyle(.secondary)
+                Button(L10n.text("取消")) { dismiss() }.buttonStyle(.plain).foregroundStyle(.secondary)
                     .keyboardShortcut(.cancelAction)
                 Button(action.title) {
                     busy = true
@@ -263,5 +286,65 @@ struct WorkspaceForm: View {
             }
         }.padding(24).frame(width: 380).disabled(busy).interactiveDismissDisabled(busy)
             .networkSheetBackground()
+    }
+}
+
+struct ArchiveChoices: View {
+    let items: [NetworkWorkspace]
+    @Binding var selection: NetworkWorkspace?
+    var body: some View {
+        if !items.isEmpty {
+            Menu(L10n.text("已解散 Network 的记录")) {
+                ForEach(items) { item in
+                    Button(items.filter { $0.name == item.name }.count > 1 ? item.name + " · " + item.id.prefix(6) : item.name) { selection = item }
+                }
+            }
+        }
+    }
+}
+
+struct NetworkArchiveView: View {
+    let workspace: NetworkWorkspace
+    @Environment(\.dismiss) private var dismiss
+    @State private var messages: [Message] = []
+    @State private var more = false
+    @State private var failure: String?
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text(workspace.name).font(.title2.bold())
+                Spacer()
+                Button(L10n.text("完成")) { dismiss() }
+            }
+            Text(L10n.text("只读聊天记录")).foregroundStyle(.secondary)
+            if let failure { Text(failure).textSelection(.enabled) }
+            else if messages.isEmpty { Text(L10n.text("还没有消息")).foregroundStyle(.secondary) }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    ForEach(messages, id: \.rowKey) { message in
+                        VStack(alignment: .leading) {
+                            HStack {
+                                Text(verbatim: message.outgoing ? "\(message.local) → \(message.peer)" : "\(message.peer) → \(message.local)")
+                                Spacer()
+                                Text(Date(timeIntervalSince1970: message.at), format: .dateTime.month().day().hour().minute())
+                            }.font(.caption).foregroundStyle(.secondary)
+                            Text(verbatim: message.body).textSelection(.enabled)
+                            ForEach(Array(message.attachments.enumerated()), id: \.offset) { _, file in Label(file.name, systemImage: "paperclip") }
+                        }
+                    }
+                    if more { Button(L10n.text("更早的消息")) { load() } }
+                }
+            }
+        }.padding(34).frame(width: 540, height: 510).networkSheetBackground().onAppear { load() }
+    }
+    private func load() {
+        let file = workspace.root.appendingPathComponent("local-ui/messages.sqlite3")
+        guard FileManager.default.fileExists(atPath: file.path) else { return }
+        do {
+            let db = try SQLiteStore(file, readOnly: true)
+            let rows = try db.rows("SELECT * FROM network_events WHERE network=? ORDER BY at DESC,id DESC,direction DESC,local_session DESC LIMIT 101 OFFSET ?", [workspace.id,String(messages.count)])
+            messages.append(contentsOf: rows.prefix(100).map(SQLiteStore.event))
+            more = rows.count > 100
+        } catch { failure = error.localizedDescription }
     }
 }

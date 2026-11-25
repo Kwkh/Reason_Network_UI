@@ -14,8 +14,15 @@ with tempfile.TemporaryDirectory(prefix="rn-mode-", dir="/tmp") as root:
     home = Path(root)
     state = home / "network"
     state.mkdir()
-    stub = home / "codex"
+    stub = home / "Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+    stub.parent.mkdir(parents=True)
     stub.write_text("""#!/bin/sh
+if [ "$1 $2" = "app-server daemon" ]; then
+  case "$3" in
+    version) test -f "$HOME/server-ready"; exit $? ;;
+    start) test ! -f "$HOME/server-fails" || exit 1; touch "$HOME/server-ready"; exit $? ;;
+  esac
+fi
 if [ "$1 $2" = "queue --help" ]; then
   test ! -f "$HOME/unsupported" || exit 2
   if [ -f "$HOME/old-cli" ]; then echo 'codex queue --thread ID --message TEXT'; exit 0; fi
@@ -30,7 +37,7 @@ fi
 """)
     stub.chmod(0o700)
     env = dict(HOME=root, PATH="/usr/bin:/bin", REASON_NETWORK_HOME=str(state),
-               REASON_NETWORK_CODEX_BIN=str(stub), REASON_NETWORK_LOCAL_PARTICIPATION="1",
+               REASON_NETWORK_LOCAL_PARTICIPATION="1",
                REASON_NETWORK_NO_TRAY="1", REASON_NETWORK_NO_SERVICE="1")
     proc = None
 
@@ -127,7 +134,13 @@ fi
         assert not request("set_receive_mode", key="codex:alpha", network=network, mode="push")["ok"]
         assert tiers()["alpha"] == "turn"
         (home / "old-cli").unlink()
+        (home / "server-fails").touch()
+        assert not request("set_receive_mode", key="codex:alpha", network=network, mode="push")["ok"]
+        assert tiers()["alpha"] == "turn"
+        (home / "server-fails").unlink()
         assert mode("push") == "push"
+        assert (home / "server-ready").exists()
+        (home / "server-ready").unlink()
         send("quiet sample", wake=False)
         quiet = hook("alpha", mail=True)
         assert "quiet sample" in quiet["text"]
@@ -140,6 +153,7 @@ fi
             time.sleep(.05)
         else:
             raise AssertionError("push did not reach the native CLI")
+        assert (home / "server-ready").exists()
         (home / "resume-failed").touch()
         send("warning sample")
         for _ in range(100):

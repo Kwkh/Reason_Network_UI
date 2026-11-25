@@ -1,0 +1,203 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 865eff4..cbf4683 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2767,6 +2767,7 @@ dependencies = [
+  "data-encoding",
+  "deunicode",
+  "futures-lite",
++ "futures-util",
+  "getrandom 0.4.3",
+  "iroh",
+  "iroh-mdns-address-lookup",
+@@ -2781,6 +2782,7 @@ dependencies = [
+  "serde",
+  "serde_json",
+  "tokio",
++ "tokio-websockets",
+  "toml",
+  "toml_edit",
+  "tracing-core",
+@@ -3667,6 +3669,7 @@ checksum = "d52efb639344a7c6adb8e62c6f3d2c19c001ff1b79a5041ba1c6ed42e19c6aa5"
+ dependencies = [
+  "base64 0.22.1",
+  "bytes",
++ "fastrand",
+  "futures-core",
+  "futures-sink",
+  "getrandom 0.4.3",
+diff --git a/Cargo.toml b/Cargo.toml
+index 484f3bf..be5dbba 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -19,6 +19,8 @@ cliclack = "0.5"
+ data-encoding = "2"
+ deunicode = { version = "=1.6.2", default-features = false }
+ futures-lite = "2"
++futures-util = { version = "0.3", features = ["sink"] }
++tokio-websockets = { version = "0.13", features = ["client", "ring", "fastrand"] }
+ getrandom = "0.4"
+ iroh = "1.4"
+ iroh-mdns-address-lookup = "0.6"
+diff --git a/src/agent.rs b/src/agent.rs
+index 2849973..390a8cf 100644
+--- a/src/agent.rs
++++ b/src/agent.rs
+@@ -134,6 +134,17 @@ pub fn find_bin(name: &str) -> Option<PathBuf> {
+         return p.is_file().then_some(p);
+     }
+     let home = paths::user_home();
++    #[cfg(target_os = "macos")]
++    if name == "codex" {
++        // GUI installations need no shell shim; prefer the CLI shipped with the desktop client.
++        for root in [home.join("Applications"), PathBuf::from("/Applications")] {
++            for bundle in ["ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
++                           "Codex.app/Contents/Resources/codex"] {
++                let path = root.join(bundle);
++                if executable(&path) { return Some(path); }
++            }
++        }
++    }
+     #[cfg(unix)]
+     let extra = [
+         home.join(".local/bin"),
+diff --git a/src/codex.rs b/src/codex.rs
+index 123e8bb..cb4dc69 100644
+--- a/src/codex.rs
++++ b/src/codex.rs
+@@ -12,6 +12,57 @@ use std::{
+     sync::{Mutex, OnceLock},
+ };
+ 
++/// Ask the same CLI used for queueing to connect to its default per-user endpoint.
++pub(crate) async fn ensure_resume_server() -> anyhow::Result<()> {
++    async fn run(action: &str) -> anyhow::Result<std::process::Output> {
++        let command = crate::agent::command_for("codex")
++            .ok_or_else(|| anyhow::anyhow!("后台找不到 Codex 命令行工具。"))?;
++        Ok(tokio::time::timeout(std::time::Duration::from_secs(if action == "start" { 45 } else { 4 }),
++            tokio::process::Command::from(command).args(["app-server", "daemon", action])
++            .stdin(std::process::Stdio::null()).kill_on_drop(true).output()).await??)
++    }
++    if run("version").await.is_ok_and(|out| out.status.success()) { return Ok(()); }
++    let started = run("start").await?;
++    if !started.status.success() || !run("version").await?.status.success() {
++        anyhow::bail!("无法连接 Codex 唤醒服务，请检查 Codex 安装后重试。");
++    }
++    Ok(())
++}
++
++/// A queue warning means the message already exists. Retry only the native
++/// thread/resume request, with no message body or turn/start request.
++pub(crate) async fn resume_queued(thread: &str) -> anyhow::Result<()> {
++    use futures_util::{SinkExt, StreamExt};
++    use serde_json::{Value, json};
++    use tokio_websockets::{ClientBuilder, Message};
++    ensure_resume_server().await?;
++    let root = std::env::var_os("CODEX_HOME").map(PathBuf::from)
++        .unwrap_or_else(|| crate::paths::user_home().join(".codex"));
++    tokio::time::timeout(std::time::Duration::from_secs(12), async {
++        let socket = tokio::net::UnixStream::connect(root.join("app-server-control/app-server-control.sock")).await?;
++        let (mut ws, _) = ClientBuilder::from_uri("ws://localhost".parse()?).connect_on(socket).await?;
++        for (id,method,params) in [
++            (1, "initialize", json!({"clientInfo":{"name":"reason_network","version":"1","title":"Reason Network"}})),
++            (2, "thread/resume", json!({"threadId":thread})),
++        ] {
++            if id == 2 { ws.send(Message::text(r#"{"method":"initialized"}"#)).await?; }
++            let request = json!({"id":id,"method":method,"params":params});
++            ws.send(Message::text(request.to_string())).await?;
++            loop {
++                let frame = ws.next().await.ok_or_else(|| anyhow::anyhow!("Codex connection closed"))??;
++                let Some(text) = frame.as_text() else { continue };
++                let reply: Value = serde_json::from_str(text)?;
++                if reply["id"].as_i64() != Some(id) { continue; }
++                if reply.get("result").is_none() || (id == 2 && reply["result"]["thread"]["id"].as_str() != Some(thread)) {
++                    anyhow::bail!("Codex rejected {method}");
++                }
++                break;
++            }
++        }
++        Ok::<(),anyhow::Error>(())
++    }).await?
++}
++
+ /// Only native Codex UUIDs can be verified against the desktop thread index. Other
+ /// agent identities and legacy process-based registrations follow the usual routing.
+ pub(crate) fn unavailable(key: &str) -> bool {
+diff --git a/src/daemon/mail.rs b/src/daemon/mail.rs
+index 702e68e..1f025f8 100644
+--- a/src/daemon/mail.rs
++++ b/src/daemon/mail.rs
+@@ -711,6 +711,13 @@ impl Daemon {
+                 if bin == "codex" && codex::unavailable(&key) {
+                     return Err("local Codex thread unavailable".into());
+                 }
++                if bin == "codex" {
++                    if let Err(error) = codex::ensure_resume_server().await {
++                        // Queue once even when waking is unavailable. Its warning records deferred processing.
++                        log(&format!("Codex wake preflight for {key} ({ids:?}): {error}"));
++                    }
++                    if codex::unavailable(&key) { return Err("local Codex thread unavailable".into()); }
++                }
+                 let program = agent::command_for(bin).ok_or_else(|| format!("{bin} not found"))?;
+                 let out = crate::util::no_window(tokio::process::Command::from(program))
+                     .args(&args)
+@@ -726,7 +733,19 @@ impl Daemon {
+                         return Err(format!("queue exited with {}", o.status));
+                     }
+                     let stderr = String::from_utf8_lossy(&o.stderr).to_ascii_lowercase();
+-                    return Ok(stderr.lines().any(|line| line.contains("resum") && line.contains("warn")));
++                    if let Some(warning) = stderr.lines().find(|line| line.contains("resum") && line.contains("warn")) {
++                        log(&format!("Codex wake for {key} ({ids:?}): {}", warning.chars().take(500).collect::<String>()));
++                        if let Some(thread) = key.strip_prefix("codex:") {
++                            if !codex::unavailable(&key) {
++                                match codex::resume_queued(thread).await {
++                                    Ok(()) => return Ok(false),
++                                    Err(e) => log(&format!("Codex resume retry {key} ({ids:?}): {e}")),
++                                }
++                            }
++                        }
++                        return Ok(true);
++                    }
++                    return Ok(false);
+                 }
+                 match tokio::time::timeout(Duration::from_secs(30), out).await {
+                     Ok(Ok(o)) if o.status.success() => Ok(false),
+diff --git a/src/daemon/sessions.rs b/src/daemon/sessions.rs
+index c31cdc3..a6fae5e 100644
+--- a/src/daemon/sessions.rs
++++ b/src/daemon/sessions.rs
+@@ -58,6 +58,14 @@ impl Daemon {
+     pub(super) async fn set_receive_mode(&self, key: &str, network: &str, mode: Tier) -> Result<Tier> {
+         // Probe outside the daemon lock and never inject a test message into a real thread.
+         if mode == Tier::Push {
++            {
++                let mut g = self.inner.lock().unwrap();
++                self.prune(&mut g);
++                if g.team.as_ref().map(|t| t.id.as_str()) != Some(network) { bail!("当前 Network 已变化，请刷新。"); }
++                let live = g.live.get(key).ok_or_else(|| anyhow!("本机会话已离线，请重新接入。"))?;
++                if live.reg.agent != "codex" { bail!("该会话不支持此接收模式。"); }
++                if live.reg.agent_session_id.as_deref().is_none_or(str::is_empty) { bail!("后台没有收到这个 Codex 对话的线程 ID。"); }
++            }
+             let cmd = agent::command_for("codex").ok_or_else(|| anyhow!("后台找不到 Codex 命令行工具。"))?;
+             let mut cmd = tokio::process::Command::from(cmd);
+             let output = tokio::time::timeout(std::time::Duration::from_secs(3),
+@@ -68,16 +76,18 @@ impl Daemon {
+             if !output.status.success() || !help.contains("--thread") || !help.contains("--message") || !help.contains("--resume") {
+                 bail!("当前 Codex 命令行工具不支持按线程投递并唤醒，请更新 Codex。");
+             }
++            crate::codex::ensure_resume_server().await?;
+         }
+         let mut g = self.inner.lock().unwrap();
+         self.prune(&mut g);
+         if g.team.as_ref().map(|t| t.id.as_str()) != Some(network) { bail!("当前 Network 已变化，请刷新。"); }
+         let live = g.live.get(key).ok_or_else(|| anyhow!("本机会话已离线，请重新接入。"))?;
+         if live.reg.agent != "codex" || mode == Tier::None { bail!("该会话不支持此接收模式。"); }
+-        if mode == Tier::Push && let Some(reason) = live.push_problem() { bail!("{reason}"); }
++        if mode == Tier::Push && live.reg.agent_session_id.as_deref().is_none_or(str::is_empty) { bail!("后台没有收到这个 Codex 对话的线程 ID。"); }
+         if mode == Tier::Turn && live.last_hook.is_none() { bail!("该会话尚未建立回合接收通道，请在 Codex 中运行一个回合后重试。"); }
+         g.store.set(&format!("receive-mode:{key}"), mode.as_str())?;
+         let live = g.live.get_mut(key).expect("validated under lock");
++        if mode == Tier::Push { live.push_failed = false; }
+         live.preferred_mode = Some(mode);
+         let effective = live.effective_tier();
+         drop(g);

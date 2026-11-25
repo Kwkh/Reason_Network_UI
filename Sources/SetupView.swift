@@ -9,16 +9,27 @@ struct AppRootView: View {
     var body: some View {
         Group {
             if !setup.checked {
-                ProgressView("正在检查环境…").controlSize(.small)
+                ProgressView(L10n.text("正在检查环境…")).controlSize(.small)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if entered {
                 ContentView()
             } else {
-                SetupView(model: setup) { workspaces.reload(); entered = true }
+                SetupView(model: setup, isSheet: false) { workspaces.reload(); entered = true }
+            }
+        }
+        .environmentObject(setup)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if let event = workspaces.departureNotices.first {
+                DepartureNoticeBanner(event: event) { workspaces.acknowledgeDeparture(event.id) }
             }
         }
         .frame(minWidth: 540, minHeight: 520)
-        .environmentObject(setup)
+        .task {
+            while !Task.isCancelled {
+                await workspaces.refreshDepartureNotices()
+                do { try await Task.sleep(for: .seconds(4)) } catch { return }
+            }
+        }
         .task {
             await setup.check()
             workspaces.reload()
@@ -33,21 +44,50 @@ struct AppRootView: View {
             }
         }
         .sheet(isPresented: $setup.presented) {
-            SetupView(model: setup) { setup.presented = false }
+            SetupView(model: setup, isSheet: true) { setup.presented = false }
                 .frame(width: 540, height: 590)
                 .networkSheetBackground()
         }
     }
 }
 
+struct DepartureNoticeBanner: View {
+    let event: NetworkDeparture
+    let acknowledge: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: event.reason == .dissolved ? "archivebox" : "rectangle.portrait.and.arrow.right")
+                .font(.body).foregroundStyle(.secondary).frame(width: 20, height: 20)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(event.title).font(.headline)
+                Text(event.detail).font(.callout).foregroundStyle(.secondary)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityElement(children: .combine)
+            Spacer(minLength: 8)
+            Button(L10n.text("好"), action: acknowledge)
+                .buttonStyle(.bordered).controlSize(.small)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 12)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .frame(maxWidth: 620)
+        .padding(.horizontal, 16).padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+    }
+}
+
 struct SetupView: View {
     @ObservedObject var model: SetupModel
+    let isSheet: Bool
     let completion: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var details = false
     @State private var help = false
     @State private var creating = false
     @State private var joining = false
+    @State private var archive: NetworkWorkspace?
     @State private var joinError: InterfaceMessage?
     @EnvironmentObject private var workspaces: WorkspaceController
 
@@ -94,6 +134,7 @@ struct SetupView: View {
                     else { connected }
                 }
                 .frame(maxWidth: .infinity, minHeight: 150, alignment: .topLeading)
+                ArchiveChoices(items: workspaces.archives, selection: $archive)
                 if model.busy {
                     HStack(spacing: 10) {
                         ProgressView().controlSize(.small)
@@ -106,34 +147,36 @@ struct SetupView: View {
                         .font(.system(size: 12)).foregroundStyle(.red).textSelection(.enabled)
                 }
                 if let issue = model.snapshot.issue {
-                    DisclosureGroup("连接详情", isExpanded: $details) {
+                    DisclosureGroup(L10n.text("连接详情"), isExpanded: $details) {
                         Text(issue.text).font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(.secondary).textSelection(.enabled).padding(.top, 8)
                     }.font(.system(size: 12))
                 }
                 HStack(spacing: 18) {
-                    Button("重新检查", systemImage: "arrow.clockwise") { Task { await model.check() } }
+                    Button(L10n.text("重新检查"), systemImage: "arrow.clockwise") { Task { await model.check() } }
                         .disabled(model.busy)
-                    Button("帮助", systemImage: "questionmark.circle") { help.toggle() }
+                    Button(L10n.text("帮助"), systemImage: "questionmark.circle") { help.toggle() }
                         .popover(isPresented: $help) {
                             VStack(alignment: .leading, spacing: 14) {
-                                Text("如何连接").font(.headline)
-                                Text("向队友获取 Network 邀请链接；邀请方需保持在线。同一身份的新机器可使用原机器生成的一次性代码。")
-                                Text("配置会为已安装的代理添加官方 MCP / hooks，并设置后台服务。已有 Network 不会被替换。")
-                                Link("官方说明", destination: URL(string: "https://reasonmachines.com/network")!)
+                                Text(L10n.text("如何连接")).font(.headline)
+                                Text(L10n.text("向队友获取 Network 邀请链接；邀请方需保持在线。同一身份的新机器可使用原机器生成的一次性代码。"))
+                                Text(L10n.text("配置会为已安装的代理添加官方 MCP / hooks，并设置后台服务。已有 Network 不会被替换。"))
+                                Link(L10n.text("官方说明"), destination: URL(string: "https://reasonmachines.com/network")!)
                             }.font(.system(size: 12)).padding(20).frame(width: 300)
                         }
                     Spacer()
-                    if model.presented {
-                        Button("关闭") { completion() }.disabled(model.busy)
+                    if isSheet {
+                        Button(L10n.text("关闭")) { completion() }.disabled(model.busy)
                     }
                 }
                 .font(.system(size: 12)).buttonStyle(.plain).foregroundStyle(.secondary)
             }
-            .padding(38).frame(maxWidth: 510, alignment: .leading)
+            .padding(38)
+            .frame(maxWidth: isSheet ? .infinity : 510, alignment: .leading)
             .frame(maxWidth: .infinity, minHeight: 510, alignment: .top)
         }
         .background(Color(nsColor: .textBackgroundColor))
+        .sheet(item: $archive) { NetworkArchiveView(workspace: $0) }
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: model.step)
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: model.busy)
     }
@@ -150,27 +193,27 @@ struct SetupView: View {
             checkRow(L10n.text("逐会话管理后台"), complete: model.snapshot.background && model.snapshot.participation)
             checkRow(L10n.text("Codex 接入"), complete: model.snapshot.wired)
             if !model.snapshot.codex {
-                Text("请先安装并打开 Codex，再回来继续配置。")
+                Text(L10n.text("请先安装并打开 Codex，再回来继续配置。"))
                     .font(.system(size: 12)).foregroundStyle(.secondary)
-                Link("获取 Codex", destination: URL(string: "https://chatgpt.com/download/")!)
+                Link(L10n.text("获取 Codex"), destination: URL(string: "https://chatgpt.com/download/")!)
             }
             if model.snapshot.installed {
                 action(L10n.text("配置后台与会话")) { await model.configure() }
             } else {
                 action(L10n.text("安装并配置")) { await model.install() }
             }
-            Text("安装 App 内置的兼容后台，并为已安装的代理配置接入。")
+            Text(L10n.text("安装 App 内置的兼容后台，并为已安装的代理配置接入。"))
                 .font(.system(size: 11)).foregroundStyle(.secondary)
         }
     }
     private var join: some View {
         VStack(alignment: .leading, spacing: 16) {
-            TextField("邀请链接或四词代码", text: $model.invitation, axis: .vertical)
+            TextField(L10n.text("邀请链接或四词代码"), text: $model.invitation, axis: .vertical)
                 .lineLimit(1...3).networkFormField()
-                .accessibilityLabel("Network 邀请链接或一次性代码")
+                .accessibilityLabel(L10n.text("Network 邀请链接或一次性代码"))
             NetworkPersonField(person: $model.name)
             if model.snapshot.needsBackendUpdate { action(L10n.text("更新兼容后台")) { await model.configure() } }
-            Button("新建 Network") { creating = true }
+            Button(L10n.text("新建 Network")) { creating = true }
                 .sheet(isPresented: $creating) { WorkspaceForm(action: .create, person: model.name, onComplete: completion) }
             if let joinError { Text(joinError.text).font(.callout).foregroundStyle(.red) }
             action(joining ? L10n.text("正在加入…") : L10n.text("加入 Network")) {
@@ -196,7 +239,7 @@ struct SetupView: View {
             Text(sessions > 0 ? L10n.text("本机会话已在线。") : L10n.text("在「我的会话」里选择要接入这个 Network 的本机对话。"))
                 .font(.system(size: 13)).foregroundStyle(.secondary)
             if sessions == 0 {
-                Button("打开 Codex", systemImage: "arrow.up.forward.app") {
+                Button(L10n.text("打开 Codex"), systemImage: "arrow.up.forward.app") {
                     if let url = ["com.openai.codex", "com.openai.chat"].compactMap({
                         NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0)
                     }).first {
@@ -207,7 +250,7 @@ struct SetupView: View {
             if model.snapshot.needsBackendUpdate {
                 action(L10n.text("更新兼容后台")) { await model.configure() }
             }
-            Button("进入聊天", action: completion)
+            Button(L10n.text("进入聊天"), action: completion)
                 .buttonStyle(SetupActionStyle())
                 .disabled(!model.snapshot.ready || model.busy)
         }
@@ -244,8 +287,8 @@ struct NetworkPersonField: View {
 
     var body: some View {
         HStack {
-            Text("你的名称").foregroundStyle(.secondary)
-            TextField("名称", text: $person).textFieldStyle(.plain).accessibilityLabel("你的名称")
+            Text(L10n.text("你的名称")).foregroundStyle(.secondary)
+            TextField(L10n.text("名称"), text: $person).textFieldStyle(.plain).accessibilityLabel(L10n.text("你的名称"))
         }.font(.system(size: 13)).padding(.horizontal, 2)
     }
 }

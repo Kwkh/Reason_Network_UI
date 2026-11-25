@@ -8,6 +8,28 @@ struct NetworkWorkspace: Identifiable, Equatable {
     let root: URL
 }
 
+struct NetworkDeparture: Identifiable, Equatable, Sendable {
+    enum Reason: String, Sendable { case dissolved, removed }
+    let id: String
+    let network: String
+    let name: String
+    let reason: Reason
+
+    var title: String {
+        switch reason {
+        case .dissolved: L10n.format("「%@」已解散", name)
+        case .removed: L10n.format("这台 Mac 已被移出「%@」", name)
+        }
+    }
+
+    var detail: String {
+        switch reason {
+        case .dissolved: L10n.text("可在「已解散 Network 的记录」中查看本机聊天记录。")
+        case .removed: L10n.text("如需重新加入，请向成员索取新的邀请链接。")
+        }
+    }
+}
+
 struct WorkspaceStore: Sendable {
     let home: URL
     var primary: URL { home.appendingPathComponent(".reason/network") }
@@ -25,6 +47,32 @@ struct WorkspaceStore: Sendable {
         return NetworkWorkspace(id: id, name: name, root: root)
     }
 
+    func dissolved() -> [NetworkWorkspace] {
+        profiles().flatMap { root -> [NetworkWorkspace] in
+            guard let db = try? SQLiteStore(root.appendingPathComponent("network.db"), readOnly: true),
+                  let rows = try? db.rows("SELECT substr(key,11) AS id, json_extract(value,'$.meta.body.name') AS name FROM kv WHERE key LIKE 'dissolved:%'") else { return [] }
+            return rows.compactMap { row in
+                guard let id = row["id"], let name = row["name"] else { return nil }
+                return NetworkWorkspace(id: id, name: name, root: root)
+            }
+        }.sorted { ($0.name,$0.id) < ($1.name,$1.id) }
+    }
+
+    func remoteDepartures() async -> [NetworkDeparture] {
+        profiles().flatMap { root -> [NetworkDeparture] in
+            guard let db = try? SQLiteStore(root.appendingPathComponent("network.db"), readOnly: true),
+                  let rows = try? db.rows("""
+                    SELECT key, json_extract(value,'$.network') AS network, json_extract(value,'$.name') AS name,
+                           json_extract(value,'$.reason') AS reason FROM kv WHERE key GLOB 'departure:*' AND json_valid(value)
+                    """) else { return [] }
+            return rows.compactMap { row in
+                guard let key = row["key"], let network = row["network"], let name = row["name"],
+                      let reason = row["reason"].flatMap(NetworkDeparture.Reason.init(rawValue:)) else { return nil }
+                return NetworkDeparture(id: key, network: network, name: name, reason: reason)
+            }
+        }.sorted { $0.id < $1.id }
+    }
+
     func joined() -> [NetworkWorkspace] { profiles().compactMap(membership).sorted { ($0.name,$0.id) < ($1.name,$1.id) } }
 
     private func previousProfile(for id: String) -> URL? {
@@ -40,6 +88,9 @@ struct WorkspaceStore: Sendable {
     func stopSecondaryService(at root: URL) async throws {
         guard root.deletingLastPathComponent().standardizedFileURL.path == folder.standardizedFileURL.path,
               UUID(uuidString: root.lastPathComponent) != nil, membership(at: root) == nil else { return }
+        // Keep the endpoint available so offline members can learn of a dissolution.
+        if let db = try? SQLiteStore(root.appendingPathComponent("network.db"), readOnly: true),
+           let records = try? db.rows("SELECT 1 FROM kv WHERE key LIKE 'dissolved:%' LIMIT 1"), !records.isEmpty { return }
         let label = "local.reasonnetwork.workspace." + root.lastPathComponent
         let target = "gui/" + String(getuid()) + "/" + label
         let ctl = URL(fileURLWithPath: "/bin/launchctl")
@@ -139,8 +190,31 @@ final class WorkspaceController: ObservableObject {
     private let store: WorkspaceStore
     @Published private(set) var current: NetworkModel
     @Published private(set) var items: [NetworkWorkspace] = []
+    @Published private(set) var archives: [NetworkWorkspace] = []
     @Published private(set) var selection: NetworkWorkspace?
     private var models: [String: NetworkModel] = [:]
+    @Published private(set) var departureNotices: [NetworkDeparture] = []
+    private let receiptsKey = "acknowledgedNetworkDepartures"
+
+    func refreshDepartureNotices() async {
+        let events = await store.remoteDepartures()
+        guard !Task.isCancelled else { return }
+        var known = Set(UserDefaults.standard.stringArray(forKey: receiptsKey) ?? [])
+        known.formUnion(departureNotices.map(\.id))
+        let fresh = events.filter { known.insert($0.id).inserted }
+        if !fresh.isEmpty {
+            departureNotices.append(contentsOf: fresh)
+            if fresh.contains(where: { $0.reason == .dissolved }) { archives = store.dissolved() }
+        }
+    }
+
+    func acknowledgeDeparture(_ id: String) {
+        guard departureNotices.contains(where: { $0.id == id }) else { return }
+        var acknowledged = Set(UserDefaults.standard.stringArray(forKey: receiptsKey) ?? [])
+        acknowledged.insert(id)
+        UserDefaults.standard.set(Array(acknowledged), forKey: receiptsKey)
+        departureNotices.removeAll { $0.id == id }
+    }
 
     init(home: URL = FileManager.default.homeDirectoryForCurrentUser) {
         store = WorkspaceStore(home: home)
@@ -149,6 +223,7 @@ final class WorkspaceController: ObservableObject {
     }
 
     func reload() {
+        archives = store.dissolved()
         items = store.joined()
         let preferred = selection?.id ?? UserDefaults.standard.string(forKey: "selectedReasonNetwork")
         if let next = items.first(where: { $0.id == preferred }) ?? items.first(where: { $0.root.path == store.primary.path }) ?? items.first {

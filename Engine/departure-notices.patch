@@ -1,0 +1,132 @@
+diff --git a/src/daemon/mod.rs b/src/daemon/mod.rs
+index eb3924a..77265e5 100644
+--- a/src/daemon/mod.rs
++++ b/src/daemon/mod.rs
+@@ -405,7 +405,7 @@ impl Daemon {
+             Request::SessionParticipation => {
+                 let g = self.inner.lock().unwrap();
+                 let pending: Vec<_> = g.live.iter().filter(|(_, l)| l.codex_resume_pending).map(|(key, _)| key).collect();
+-                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true, "workspaces": true, "admin_network": g.team.as_ref().filter(|t| t.founder == self.key.public()).map(|t| &t.id),
++                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true, "workspaces": true, "departure_notices": true, "admin_network": g.team.as_ref().filter(|t| t.founder == self.key.public()).map(|t| &t.id),
+                         "resume_pending": pending })
+             }
+             Request::SetReceiveMode { key, network, mode } => {
+diff --git a/src/daemon/teamops.rs b/src/daemon/teamops.rs
+index 3491e5d..9286ed1 100644
+--- a/src/daemon/teamops.rs
++++ b/src/daemon/teamops.rs
+@@ -39,11 +39,15 @@ impl Daemon {
+         state.member(peer).map(|_| state.without_secrets())
+     }
+ 
+-    fn archive_dissolution(&self, g: &mut Inner, state: &TeamState) -> Result<()> {
+-        g.store.set(&format!("dissolved:{}",state.id), &serde_json::to_string(&state.without_secrets())?)?;
+-        g.store.delete_prefix("team")?;
++    fn end_membership(&self, g: &mut Inner, state: &TeamState, remote: bool) -> Result<()> {
++        let dissolved = state.dissolved.is_some();
++        let archive = dissolved.then(|| serde_json::to_string(&state.without_secrets())).transpose()?;
++        let notice = remote.then(|| serde_json::json!({
++            "network": state.id, "name": state.shown_name(),
++            "reason": if dissolved { "dissolved" } else { "removed" }
++        }).to_string());
++        g.store.end_membership(&state.id, archive, notice)?;
+         g.team = None;
+-        g.store.delete_prefix("presence:")?;
+         Ok(())
+     }
+ 
+@@ -56,7 +60,7 @@ impl Daemon {
+                 state.put_member(&self.key, m.endpoint, &m.person, &m.machine, false);
+             }
+             state.dissolved = Some(team::Signed::new(true, &self.key, id, "dissolved"));
+-            self.archive_dissolution(&mut g, &state)?;
++            self.end_membership(&mut g, &state, false)?;
+             state
+         };
+         if let Some(net) = self.net() { net.broadcast(&Wire::State { state: Box::new(state.without_secrets()) }); }
+@@ -202,7 +206,7 @@ impl Daemon {
+             let after: HashSet<EndpointId> = team.active().map(|m| m.endpoint).collect();
+             let state = team.clone();
+             if state.dissolved.is_some() {
+-                if let Err(e) = self.archive_dissolution(&mut g, &state) { log(&format!("saving dissolution: {e}")); return; }
++                if let Err(e) = self.end_membership(&mut g, &state, true) { log(&format!("saving dissolution: {e}")); return; }
+                 drop(g);
+                 if let Some(net) = self.net() { net.broadcast(&Wire::State { state: Box::new(state.without_secrets()) }); }
+                 self.restart_soon();
+@@ -212,7 +216,13 @@ impl Daemon {
+             let gone = !after.contains(&me);
+             // Removed: what came with the news (a team link that replaced the one this machine knew, from a teammate
+             // on an older build) is never written here, not even to the database's log.
+-            if !gone {
++            if gone {
++                if let Err(e) = self.end_membership(&mut g, &state, true) {
++                    log(&format!("saving device removal: {e}"));
++                    return;
++                }
++                let _ = g.store.scrub();
++            } else {
+                 let _ = self.save_team(&g);
+             }
+             (state, before.difference(&after).copied().collect::<Vec<_>>(), gone, relay_changed)
+@@ -226,12 +236,6 @@ impl Daemon {
+         }
+         if gone {
+             log("this machine was removed from the team");
+-            let mut g = self.inner.lock().unwrap();
+-            g.team = None;
+-            let _ = self.save_team(&g);
+-            let _ = g.store.delete_prefix("presence:");
+-            let _ = g.store.scrub();
+-            drop(g);
+             self.restart_soon();
+         } else if relay_changed {
+             log("the team's relay changed; restarting to use it");
+@@ -793,11 +797,22 @@ mod tests {
+         assert!(offline.is_member(&offline.key.public()));
+         founder.remove(&target,Some(&team.id)).unwrap();
+         assert!(!founder.is_member(&offline.key.public()) && founder.is_member(&guest.key.public()));
++        let notices = |d: &Daemon| -> Vec<serde_json::Value> {
++            d.inner.lock().unwrap().store.prefixed("departure:").unwrap().into_iter()
++                .map(|(_, value)| serde_json::from_str(&value).unwrap()).collect()
++        };
++        assert!(notices(&offline).is_empty());
++        let removal = founder.team_state().unwrap();
++        offline.merge_state(&removal);
++        offline.merge_state(&removal);
++        assert_eq!(notices(&offline), vec![serde_json::json!({"network": team.id, "name": team.shown_name(), "reason":"removed"})]);
+         founder.dissolve(&team.id).unwrap();
++        assert!(notices(&founder).is_empty());
+         let final_state = founder.archived_state(&team.id,&guest.key.public()).unwrap();
+         assert!(final_state.link.is_none() && final_state.invites.is_empty());
+         guest.merge_state(&final_state);
+         assert!(guest.team_state().is_none());
++        assert_eq!(notices(&guest), vec![serde_json::json!({"network": team.id, "name": team.shown_name(), "reason":"dissolved"})]);
+         offline.merge_state(&guest.archived_state(&team.id,&offline.key.public()).unwrap());
+         assert!(offline.team_state().is_none());
+         offline.merge_state(&team);
+diff --git a/src/store.rs b/src/store.rs
+index 9c1dd47..231a9e4 100644
+--- a/src/store.rs
++++ b/src/store.rs
+@@ -587,6 +587,21 @@ impl Store {
+         Ok(rows.collect::<rusqlite::Result<_>>()?)
+     }
+ 
++    /// Commit the remote decision alongside the local membership change, including after an App restart.
++    pub fn end_membership(&self, network: &str, archive: Option<String>, notice: Option<String>) -> Result<()> {
++        let tx = self.db.unchecked_transaction()?;
++        if let Some(archive) = archive {
++            self.set(&format!("dissolved:{network}"), &archive)?;
++        }
++        if let Some(notice) = notice {
++            self.set(&format!("departure:{}", ulid::Ulid::generate()), &notice)?;
++        }
++        self.delete_prefix("team")?;
++        self.delete_prefix("presence:")?;
++        tx.commit()?;
++        Ok(())
++    }
++
+     pub fn get(&self, key: &str) -> Result<Option<String>> {
+         Ok(self.db.query_row("SELECT value FROM kv WHERE key = ?1", [key], |r| r.get(0)).optional()?)
+     }

@@ -12,7 +12,15 @@ final class NetworkModel: ObservableObject {
     @Published var messages: [Message] = []
     @Published private(set) var waitingForHistory = true
     @Published var conversations: [NetworkSession] = []
-    @Published var selectedLocal: String { didSet { guard oldValue != selectedLocal else { return }; UserDefaults.standard.set(selectedLocal, forKey: "selectedLocal" + preferenceScope); changedConversation() } }
+    @Published var selectedLocal: String {
+        didSet {
+            guard oldValue != selectedLocal else { return }
+            UserDefaults.standard.set(selectedLocal, forKey: "selectedLocal" + preferenceScope)
+            UserDefaults.standard.set(own?.key, forKey: "selectedLocalKey" + preferenceScope)
+            conversations = []
+            changedConversation()
+        }
+    }
     @Published var selectedPeer: String { didSet { guard oldValue != selectedPeer else { return }; UserDefaults.standard.set(selectedPeer, forKey: "selectedPeer" + preferenceScope); changedConversation() } }
     struct Draft: Equatable {
         var text = ""
@@ -96,7 +104,7 @@ final class NetworkModel: ObservableObject {
             let address = directory.person + "/" + session.name
             if !result.contains(where: { $0.address == address }) {
                 result.append(NetworkSession(address: address, name: session.name, person: directory.person,
-                                             machine: directory.machine, agent: "codex", status: "offline", clientTitle: session.title, restriction: session.restriction))
+                                             machine: directory.machine, agent: session.agent, status: "offline", clientTitle: session.title, restriction: session.restriction))
             }
         }
         for previous in conversations where previous.address != ownAddress && !result.contains(where: { $0.address == previous.address }) {
@@ -119,10 +127,10 @@ final class NetworkModel: ObservableObject {
         if session.historyOnly { return .history }
         if reconnectingKey == session.key { return .reconnecting }
         guard error == nil, let directory else { return .unknown }
-        return directory.liveLocalSession(named: session.name, agent: "codex") == nil ? .offline : .online
+        return directory.liveLocalSession(named: session.name, agent: session.agent) == nil ? .offline : .online
     }
     var senderOffline: Bool {
-        online && own?.historyOnly == false && directory?.liveLocalSession(named: selectedLocal, agent: "codex") == nil
+        online && own?.historyOnly == false && directory?.liveLocalSession(named: selectedLocal, agent: own?.agent ?? "") == nil
     }
     var reconnectingSender: Bool { own != nil && reconnectingKey == own?.key }
     @Published private(set) var reconnectingKey: String?
@@ -132,7 +140,7 @@ final class NetworkModel: ObservableObject {
         !leavingNetwork && !sending && !changingAllConnections && online && !senderOffline && !reconnectingSender && !disconnectingSender && own?.historyOnly == false && peer?.available == true && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !options.files.isEmpty)
     }
     var online: Bool { directory != nil && error == nil }
-    var tier: String? { guard online else { return nil }; return directory?.liveLocalSession(named: selectedLocal, agent: "codex")?.tier }
+    var tier: String? { guard online else { return nil }; return directory?.liveLocalSession(named: selectedLocal, agent: own?.agent ?? "")?.tier }
     @Published var receiveModeError: InterfaceMessage?
 
     func changeReceiveMode(_ mode: ReceiveMode, local: LocalSession, network: String) async {
@@ -166,7 +174,7 @@ final class NetworkModel: ObservableObject {
         await refresh()
         guard directory?.networkID == network else { return }
         let failures = targets.compactMap { local -> InterfaceMessage? in
-            let current = directory?.liveLocalSession(named: local.name, agent: "codex")?.tier.flatMap(ReceiveMode.init(rawValue:))
+            let current = directory?.liveLocalSession(named: local.name, agent: local.agent)?.tier.flatMap(ReceiveMode.init(rawValue:))
             let reason: InterfaceMessage
             if let error = errors[local.key] { reason = error }
             else if let current, self.error == nil {
@@ -231,6 +239,15 @@ final class NetworkModel: ObservableObject {
                 }
                 if directory != snapshot.directory { directory = snapshot.directory }
                 if locals != snapshot.localSessions { locals = snapshot.localSessions }
+                let savedKey = UserDefaults.standard.string(forKey: "selectedLocalKey" + preferenceScope)
+                if let savedKey, let sender = locals.first(where: { $0.key == savedKey }), sender.name != selectedLocal {
+                    selectedLocal = sender.name
+                    requestAgain = true
+                    continue
+                }
+                if let own, savedKey == nil {
+                    UserDefaults.standard.set(own.key, forKey: "selectedLocalKey" + preferenceScope)
+                }
                 let defaultSender = locals.first(where: { !$0.historyOnly })?.name ?? ""
                 if !locals.contains(where: { $0.name == selectedLocal }), selectedLocal != defaultSender {
                     selectedLocal = defaultSender
@@ -251,6 +268,7 @@ final class NetworkModel: ObservableObject {
             } catch {
                 guard !leavingNetwork, departure == departureCount else { return }
                 guard generation == selectionGeneration, floor == readingFrom else { requestAgain = true; continue }
+                if error is ReasonService.MembershipEnded { clearAfterDeparture(); return }
                 self.error = InterfaceMessage { error.localizedDescription }
             }
         } while requestAgain && !Task.isCancelled
@@ -260,7 +278,8 @@ final class NetworkModel: ObservableObject {
         let local = selectedLocal, peer = selectedPeer, item = options, key = conversationKey
         sending = true; notice = "发送中…"
         do {
-            let status = try await service.send(network: network, local: local, to: peer, body: item.text, files: item.files, notify: item.notify)
+            guard let sender = own, sender.name == local else { throw LocalSenderOffline() }
+            let status = try await service.send(network: network, local: local, expectedKey: sender.key, to: peer, body: item.text, files: item.files, notify: item.notify)
             if drafts[key] == item { drafts.removeValue(forKey: key) }
             if key == conversationKey { notice = status }
             await refresh()
@@ -384,13 +403,37 @@ final class NetworkModel: ObservableObject {
             mySessionsError = InterfaceMessage { error.localizedDescription }
         }
     }
-    func leaveNetwork(_ id: String) async throws {
+    func deleteLocalHistory(network: String, local: String, peer: String) async throws {
+        guard directory?.networkID == network, selectedLocal == local, !leavingNetwork else {
+            throw NetworkError("会话状态已变化，请刷新后重试。")
+        }
+        try await service.deleteLocalHistory(network: network, local: local, peer: peer)
+        messageCache.removeValue(forKey: network + "/" + local + "/" + peer)
+        if directory?.networkID == network && selectedLocal == local {
+            selectionGeneration += 1
+            conversations.removeAll { $0.address == peer }
+            if selectedPeer == peer { readingFrom = nil; messages = []; hasEarlier = false }
+        }
+        await refresh()
+    }
+
+    func removeDevice(_ device: Device, network: String) async throws {
+        guard directory?.networkID == network, directory?.managesNetwork == true, !device.isMe else {
+            throw NetworkError("当前 Network 已变化，请重新确认。")
+        }
+        try await service.removeDevice(device.endpoint, network: network)
+        await refresh()
+    }
+    func leaveNetwork(_ id: String, dissolving: Bool = false) async throws {
         guard directory?.networkID == id, !leavingNetwork, !sending, changingSession == nil else {
             throw NetworkError("Network 状态已变化或有操作正在进行，请稍后重试。")
         }
         leavingNetwork = true
         defer { leavingNetwork = false }
-        try await service.leaveNetwork(expected: id)
+        try await service.leaveNetwork(expected: id, dissolving: dissolving)
+        clearAfterDeparture()
+    }
+    private func clearAfterDeparture() {
         selectionGeneration += 1
         readingFrom = nil
         directory = nil

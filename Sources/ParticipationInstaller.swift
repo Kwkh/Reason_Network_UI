@@ -9,7 +9,7 @@ struct ParticipationInstaller: Sendable {
     var launchctl = URL(fileURLWithPath: "/bin/launchctl")
     var probe: @Sendable (URL) -> Bool = { home in
         guard let executable = NetworkPaths.workspaceExecutable(home: home) else { return false }
-        return capabilities(at: home, onlyFrom: executable)?["workspaces"] as? Bool == true
+        return capabilities(at: home, onlyFrom: executable)?["native_agent_wake"] as? Bool == true
     }
 
     static func capabilities(at home: URL, onlyFrom executable: URL? = nil) -> [String: Any]? {
@@ -119,7 +119,12 @@ struct ParticipationInstaller: Sendable {
             guard let env = updated["EnvironmentVariables"] as? [String: String], env["REASON_NETWORK_HOME"] == root.path,
                   env["REASON_NETWORK_LOCAL_PARTICIPATION"] == "1" else { throw NetworkError(localizing: { L10n.text("无法识别工作区服务 ") + name }) }
         }
-        if (updated["ProgramArguments"] as? [String])?.first == daemon.path && (!isPrimary || configured && probe(home)) { return }
+        if (updated["ProgramArguments"] as? [String])?.first == daemon.path {
+            if isPrimary, configured && probe(home) { return }
+            if !isPrimary, let data = try? socket.request(["op": "session_participation"], timeout: 1, onlyFrom: daemon),
+               let capabilities = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               capabilities["native_agent_wake"] as? Bool == true { return }
+        }
         updated["ProgramArguments"] = [daemon.path, "daemon", "--service"]
         var env = updated["EnvironmentVariables"] as? [String: String] ?? [:]
         env["REASON_NETWORK_LOCAL_PARTICIPATION"] = "1"

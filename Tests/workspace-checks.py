@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import select
 import socket
 import sqlite3
 import subprocess
@@ -22,6 +23,41 @@ def call(root, op, **args):
     reply = request(root, op, **args)
     assert reply["ok"], (op,reply)
     return reply.get("result")
+
+def mcp_directory(home, root, agent, native_id):
+    env = dict(HOME=str(home), PATH="/usr/bin:/bin", REASON_NETWORK_HOME=str(root),
+               REASON_NETWORK_AGENT=agent, REASON_NETWORK_NO_SERVICE="1", REASON_NETWORK_NO_TRAY="1")
+    if agent == "gemini":
+        env["GEMINI_SESSION_ID"] = native_id
+    elif agent == "claude-code":
+        env["CLAUDE_CODE_SESSION_ID"] = native_id
+    with subprocess.Popen([binary, "mcp"], env=env, cwd=home, stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0) as proc:
+        def rpc(method, params, number=None):
+            frame = dict(jsonrpc="2.0", method=method, params=params)
+            if number is not None:
+                frame["id"] = number
+            proc.stdin.write(json.dumps(frame).encode() + b"\n")
+            if number is None:
+                return
+            while select.select([proc.stdout], [], [], 12)[0]:
+                line = proc.stdout.readline()
+                assert line, "MCP server disconnected"
+                response = json.loads(line)
+                if response.get("id") == number:
+                    assert "error" not in response, response
+                    return response["result"]
+            raise TimeoutError(method)
+        try:
+            rpc("initialize", dict(protocolVersion="2025-11-25", capabilities={},
+                                   clientInfo=dict(name=agent, version="1")), 1)
+            rpc("notifications/initialized", {})
+            arguments = {"session_id": native_id} if agent == "dsh" else {}
+            result = rpc("tools/call", dict(name="list_team", arguments=arguments), 2)
+            assert not result.get("isError"), result
+            return result["content"][0]["text"]
+        finally:
+            proc.terminate()
 
 with tempfile.TemporaryDirectory(prefix="rn-ws-", dir="/tmp") as temp:
     home = Path(temp)
@@ -100,6 +136,49 @@ with tempfile.TemporaryDirectory(prefix="rn-ws-", dir="/tmp") as temp:
         assert not send(team_b+"::qa/beta","after-exit")["ok"]
         assert send(team_a+"::qa/beta","still here")["ok"]
         print("PASS: manual membership, isolated overview and histories, qualified directory and replies, ambiguous sends refused, independent exit")
+        # Different tools deliberately share one native ID. Only their full keys identify a mailbox.
+        for agent in ["claude-code", "gemini", "dsh"]:
+            key = agent + ":same-id"
+            for root, team in [(a, team_a), (b, team_b)]:
+                call(root, "set_session_participation", key=key, paused=False)
+                call(root, "workspace_dispatch", network=team, request=dict(
+                    op="hook", agent=agent, event="stop", session_id="same-id", name=agent, cwd=temp, mail=False))
+                call(root, "set_receive_mode", key=key, network=team, mode="pull")
+                assert send(team+"::qa/"+agent, team+"/"+agent, sender="beta")["ok"]
+            directory = mcp_directory(home, a, agent, "same-id")
+            assert team_a+"::qa/"+agent in directory and team_b+"::qa/"+agent in directory, directory
+            # Closing a synthetic MCP client ends its own live registration. Re-open the local hook.
+            call(a, "hook", agent=agent, event="stop", session_id="same-id", cwd=temp, mail=False)
+            inbox = call(a, "inbox", key=key, wait_secs=0, peek=True)
+            assert {m["body"] for m in inbox["messages"]} == {team_a+"/"+agent, team_b+"/"+agent}
+            for row in inbox["messages"]:
+                team = row["body"].split("/")[0]
+                parent = team + "::" + row["id"].split("::")[-1]
+                assert parent in inbox["text"]
+                call(a, "send", **{"from":key, "to":"qa/beta", "body":"reply "+row["body"], "reply_to":parent, "wake":False})
+                other = team_b if team == team_a else team_a
+                assert not request(a, "send", **{"from":key, "to":other+"::qa/beta", "body":"wrong", "reply_to":parent, "wake":False})["ok"]
+            assert not request(a, "send", **{"from":key,"to":"qa/beta","body":"ambiguous","wake":False})["ok"]
+            call(b, "set_session_participation", key=key, paused=True)
+            assert not request(a, "send", **{"from":key,"to":team_b+"::qa/beta","body":"paused","wake":False})["ok"]
+            assert request(a, "send", **{"from":key,"to":team_a+"::qa/beta","body":"still here","wake":False})["ok"]
+        print("PASS: mixed-tool inboxes, qualified replies, ambiguous address rejection and independent pauses")
+        with sqlite3.connect(b/"network.db") as db:
+            history_count = db.execute("SELECT COUNT(*) FROM workspace_sent WHERE network=?", (team_b,)).fetchone()[0]
+        assert call(a,"session_participation")["admin_network"] == team_a
+        assert call(b,"session_participation")["admin_network"] == team_b
+        assert not request(b,"dissolve_network",network=team_a)["ok"]
+        call(b,"dissolve_network",network=team_b)
+        procs[-1].wait(timeout=12)
+        start(b)
+        assert call(b,"session_participation")["admin_network"] is None
+        with sqlite3.connect(b/"network.db") as db:
+            assert not db.execute("SELECT 1 FROM kv WHERE key='team'").fetchone()
+            marker = json.loads(db.execute("SELECT value FROM kv WHERE key=?",("dissolved:"+team_b,)).fetchone()[0])
+            assert marker["dissolved"]["by"] == marker["founder"] and not marker.get("link")
+            assert db.execute("SELECT COUNT(*) FROM workspace_sent WHERE network=?",(team_b,)).fetchone()[0] == history_count
+        assert send(team_a+"::qa/beta","after other network dissolved")["ok"]
+        print("PASS: dissolution is scoped, persists across restart, and preserves history")
     finally:
         for proc in procs:
             if proc.poll() is None:

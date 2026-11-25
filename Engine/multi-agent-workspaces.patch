@@ -1,0 +1,333 @@
+diff --git a/src/agent.rs b/src/agent.rs
+index 390a8cf..b13cee2 100644
+--- a/src/agent.rs
++++ b/src/agent.rs
+@@ -95,6 +95,10 @@ pub fn multiplexed(agent: &str) -> bool {
+ /// The session id an agent exports to its MCP servers, if any. `REASON_NETWORK_SESSION` is set by our own pi extension.
+ /// Claude Code's is read from its session registry first: `/clear` starts a new conversation in the same process, and
+ /// the variable it gave us at start still names the old one.
++pub fn workspace_agent(name: &str) -> bool {
++    matches!(name, "codex" | "claude-code" | "gemini" | "dsh")
++}
++
+ pub fn env_session_id(agent: &str) -> Option<String> {
+     if let Some(id) = crate::paths::env_var("SESSION").ok().filter(|s| !s.is_empty()) {
+         return Some(id);
+@@ -108,6 +112,7 @@ pub fn env_session_id(agent: &str) -> Option<String> {
+         CLAUDE_CODE => "CLAUDE_CODE_SESSION_ID",
+         "copilot" => "COPILOT_AGENT_SESSION_ID",
+         "gemini" => "GEMINI_SESSION_ID",
++        "dsh" => "DSH_SESSION_ID",
+         "codex" => "CODEX_THREAD_ID",
+         "grok" => "GROK_SESSION_ID",
+         "opencode" => "OPENCODE_SESSION_ID",
+diff --git a/src/daemon/mail.rs b/src/daemon/mail.rs
+index 1f025f8..3e3567d 100644
+--- a/src/daemon/mail.rs
++++ b/src/daemon/mail.rs
+@@ -506,7 +506,7 @@ impl Daemon {
+             && has("codex")
+             && l.transcript.as_deref().and_then(codex::turn_running) == Some(true);
+         let channel = match (tier, l.conn, &l.reg.agent_session_id) {
+-            (Tier::Pull, _, _) if l.preferred_mode.is_some() => Channel::Pull,
++            (Tier::Pull, _, _) if l.preferred_mode.is_some() || l.reg.agent == "dsh" => Channel::Pull,
+             // These adapters take Deliver events on this connection. Codex and Reason still
+             // use their native channels below, even when their MCP client registers as push.
+             (Tier::Push, Some(conn), _)
+@@ -533,7 +533,7 @@ impl Daemon {
+         };
+         let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+         let cli = matches!(channel, Channel::ClaudeDirect(_));
+-        let text = render::for_agent_in(&msgs, Some(&l.reg.agent), cli, g.team.as_ref());
++        let text = render::for_agent_in(&msgs, Some(&l.reg.agent), cli, g.team.as_ref(), Some(key));
+         let claude_session = l.reg.agent_session_id.clone();
+         let hook_note = if matches!(l.reg.agent.as_str(), "opencode" | "pi") {
+             "queued: delivered within seconds once the session is idle"
+@@ -964,7 +964,7 @@ impl Daemon {
+             };
+             if !messages.is_empty() || tokio::time::Instant::now() >= deadline {
+                 // A `reason network listen` session replies with the CLI.
+-                let text = render::for_agent_in(&messages, agent.as_deref(), agent.as_deref() == Some("cli"), self.team_state().as_ref());
++                let text = render::for_agent_in(&messages, agent.as_deref(), agent.as_deref() == Some("cli"), self.team_state().as_ref(), Some(&key));
+                 return Ok(Inbox { messages, text });
+             }
+             let _ = tokio::time::timeout_at(deadline, arrived).await;
+diff --git a/src/daemon/mod.rs b/src/daemon/mod.rs
+index 77265e5..76fa812 100644
+--- a/src/daemon/mod.rs
++++ b/src/daemon/mod.rs
+@@ -255,6 +255,22 @@ impl Daemon {
+         Ok(daemon)
+     }
+ 
++    fn preserve_workspace_members(store: &Store, team: &TeamState, paused: &HashSet<String>) -> Result<()> {
++        if store.get("manual-multi-agent")?.as_ref() == Some(&team.id) { return Ok(()); }
++        let first_enable = store.get("manual-network")?.is_none();
++        for session in store.sessions()? {
++            // Older primary daemons also admitted tool sessions that had only fired hooks.
++            let previously_joined = if session.agent == "codex" { first_enable && session.attached }
++                else { session.attached || session.tier != Tier::None };
++            if previously_joined
++                && crate::agent::workspace_agent(&session.agent)
++                && session.key.starts_with(&format!("{}:", session.agent)) && !paused.contains(&session.key) {
++                store.set(&format!("workspace-member:{}", session.key), &team.id)?;
++            }
++        }
++        store.set("manual-multi-agent", &team.id)
++    }
++
+     fn with(cfg: Config, store: Store, key: SecretKey) -> Result<Self> {
+         let paused = store.paused_sessions()?;
+         let team: Option<TeamState> =
+@@ -263,6 +279,9 @@ impl Daemon {
+             Some(t) if store.get(&format!("dissolved:{}",t.id))?.is_some() => { store.delete_prefix("team")?; None }
+             other => other,
+         };
++        if let Some(team) = &team && store.get("manual-network")?.is_some() {
++            Self::preserve_workspace_members(&store, team, &paused)?;
++        }
+         // In a team, who we are is what the signed roster says, whatever the config file says.
+         let member = team.as_ref().and_then(|t| t.member(&key.public()).cloned());
+         Ok(Daemon {
+@@ -389,14 +408,8 @@ impl Daemon {
+         Ok(match req {
+             Request::EnableWorkspaces => {
+                 let g = self.inner.lock().unwrap();
+-                if let Some(t) = &g.team {
+-                    if g.store.get("manual-network")?.is_none() {
+-                        for s in g.store.sessions()? {
+-                            if s.attached && s.agent == "codex" && !g.paused.contains(&s.key) {
+-                                g.store.set(&format!("workspace-member:{}",s.key), &t.id)?;
+-                            }
+-                        }
+-                    }
++                if let Some(team) = &g.team {
++                    Self::preserve_workspace_members(&g.store, team, &g.paused)?;
+                 }
+                 g.store.set("manual-network","1")?;
+                 Value::Null
+@@ -405,7 +418,7 @@ impl Daemon {
+             Request::SessionParticipation => {
+                 let g = self.inner.lock().unwrap();
+                 let pending: Vec<_> = g.live.iter().filter(|(_, l)| l.codex_resume_pending).map(|(key, _)| key).collect();
+-                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true, "workspaces": true, "departure_notices": true, "admin_network": g.team.as_ref().filter(|t| t.founder == self.key.public()).map(|t| &t.id),
++                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true, "workspaces": true, "multi_agent_sessions": true, "departure_notices": true, "admin_network": g.team.as_ref().filter(|t| t.founder == self.key.public()).map(|t| &t.id),
+                         "resume_pending": pending })
+             }
+             Request::SetReceiveMode { key, network, mode } => {
+diff --git a/src/daemon/sessions.rs b/src/daemon/sessions.rs
+index a6fae5e..8b06eea 100644
+--- a/src/daemon/sessions.rs
++++ b/src/daemon/sessions.rs
+@@ -33,6 +33,11 @@ impl Live {
+     }
+ 
+     fn push_problem(&self) -> Option<&'static str> {
++        if self.reg.agent == agent::CLAUDE_CODE {
++            let available = !self.push_failed && (self.mcp_push && self.conn.is_some() ||
++                crate::claude::socket_for(self.reg.agent_session_id.as_deref(), self.reg.pid).is_some());
++            return (!available).then_some("Claude Code push channel is unavailable.");
++        }
+         if self.reg.agent_session_id.as_deref().is_none_or(str::is_empty) {
+             Some("后台没有收到这个 Codex 对话的线程 ID。")
+         } else if self.push_failed {
+@@ -57,7 +62,7 @@ impl Live {
+ impl Daemon {
+     pub(super) async fn set_receive_mode(&self, key: &str, network: &str, mode: Tier) -> Result<Tier> {
+         // Probe outside the daemon lock and never inject a test message into a real thread.
+-        if mode == Tier::Push {
++        if mode == Tier::Push && key.starts_with("codex:") {
+             {
+                 let mut g = self.inner.lock().unwrap();
+                 self.prune(&mut g);
+@@ -82,9 +87,15 @@ impl Daemon {
+         self.prune(&mut g);
+         if g.team.as_ref().map(|t| t.id.as_str()) != Some(network) { bail!("当前 Network 已变化，请刷新。"); }
+         let live = g.live.get(key).ok_or_else(|| anyhow!("本机会话已离线，请重新接入。"))?;
+-        if live.reg.agent != "codex" || mode == Tier::None { bail!("该会话不支持此接收模式。"); }
+-        if mode == Tier::Push && live.reg.agent_session_id.as_deref().is_none_or(str::is_empty) { bail!("后台没有收到这个 Codex 对话的线程 ID。"); }
+-        if mode == Tier::Turn && live.last_hook.is_none() { bail!("该会话尚未建立回合接收通道，请在 Codex 中运行一个回合后重试。"); }
++        if !agent::workspace_agent(&live.reg.agent) || mode == Tier::None || (mode == Tier::Turn && live.reg.agent == "dsh") { bail!("该会话不支持此接收模式。"); }
++        if mode == Tier::Push {
++            match live.reg.agent.as_str() {
++                "codex" if key.starts_with("codex:") && live.reg.agent_session_id.is_some() => {}
++                agent::CLAUDE_CODE if live.push_problem().is_none() => {}
++                _ => bail!("该会话不支持此接收模式。"),
++            }
++        }
++        if mode == Tier::Turn && live.last_hook.is_none() { bail!("该会话尚未建立回合接收通道，请在原工具中运行一个回合后重试。"); }
+         g.store.set(&format!("receive-mode:{key}"), mode.as_str())?;
+         let live = g.live.get_mut(key).expect("validated under lock");
+         if mode == Tier::Push { live.push_failed = false; }
+@@ -131,7 +142,7 @@ impl Daemon {
+     fn hook_tier(&self, agent: &str, push_failed: bool) -> Tier {
+         match agent {
+             // Native Hermes queues push events, otherwise its explicit inbox tool is the reader.
+-            "hermes" => Tier::Pull,
++            "hermes" | "dsh" => Tier::Pull,
+             "codex" if !push_failed && agent::find_bin("codex").is_some() => Tier::Push,
+             // Their plugin or extension delivers into idle sessions; Reason's CLI sends into its sessions.
+             "opencode" | "pi" | "reason" => Tier::Push,
+@@ -166,10 +177,10 @@ impl Daemon {
+         let g = &mut *g;
+         let key = reg.key.clone();
+         // An explicitly joined mailbox remains addressable through the broker even in pull mode.
+-        let manual = crate::paths::managed_workspace() || reg.agent == "codex" && g.store.get("manual-network")?.is_some();
++        let manual = crate::paths::managed_workspace() || agent::workspace_agent(&reg.agent) && key.starts_with(&format!("{}:", reg.agent)) && g.store.get("manual-network")?.is_some();
+         if manual {
+             let member = g.store.get(&format!("workspace-member:{key}"))?;
+-            if reg.agent != "codex" || g.team.as_ref().is_none_or(|t| member.as_ref() != Some(&t.id)) {
++            if !agent::workspace_agent(&reg.agent) || g.team.as_ref().is_none_or(|t| member.as_ref() != Some(&t.id)) {
+                 bail!(SESSION_PAUSED);
+             }
+         }
+@@ -574,7 +585,7 @@ impl Daemon {
+         if !ids.is_empty() {
+             self.reached(g, &key);
+         }
+-        let text = (!msgs.is_empty()).then(|| render::for_agent_in(&msgs, Some(&agent_kind), false, g.team.as_ref()));
++        let text = (!msgs.is_empty()).then(|| render::for_agent_in(&msgs, Some(&agent_kind), false, g.team.as_ref(), Some(&key)));
+         Ok(HookReply { address: Some(address), text, ids })
+     }
+ 
+diff --git a/src/daemon/workspaces.rs b/src/daemon/workspaces.rs
+index b79821f..1964be5 100644
+--- a/src/daemon/workspaces.rs
++++ b/src/daemon/workspaces.rs
+@@ -1,4 +1,4 @@
+-//! Workspace agents share one Codex MCP/hook installation. Route by confirmed team and native thread,
++//! Workspace agents share their native MCP/hook installation. Route by confirmed team and native thread,
+ //! independently of the window's selection. Local socket replies are never retried after a timeout.
+ use super::*;
+ use anyhow::bail;
+@@ -108,7 +108,7 @@ impl Daemon {
+         }
+         let key = match &req {
+             Request::Send { from, .. } | Request::DeliveryStatus { from, .. } => from.clone(),
+-            Request::Hook(h) if h.agent == "codex" => format!("codex:{}", h.session_id),
++            Request::Hook(h) if crate::agent::workspace_agent(&h.agent) => format!("{}:{}", h.agent, h.session_id),
+             Request::Who { me: Some(key), .. }
+             | Request::Inbox { key, .. }
+             | Request::Unread { key }
+@@ -116,7 +116,7 @@ impl Daemon {
+             Request::Register { session } => session.key.clone(),
+             _ => return self.handle(conn, req).await,
+         };
+-        if !key.starts_with("codex:") {
++        if !key.split_once(':').is_some_and(|(agent, id)| crate::agent::workspace_agent(agent) && !id.is_empty()) {
+             return self.handle(conn, req).await;
+         }
+         let peers = joined(&key)?;
+@@ -170,9 +170,17 @@ impl Daemon {
+         match &req {
+             Request::Register { session } => {
+                 let folder_allowed = !self.cfg.off_in(&session.cwd);
++                let mut secondary_registered = session.agent == "codex";
++                if folder_allowed && session.agent != "codex"
++                    && let Some(id) = &session.agent_session_id
++                    && key == format!("{}:{id}", session.agent) {
++                    let refresh: Request = serde_json::from_value(json!({"op":"hook", "agent":session.agent,
++                        "session_id":id, "event":"stop", "cwd":session.cwd, "pid":session.pid, "mail":false}))?;
++                    for ws in &peers { secondary_registered |= ws.call(&refresh).await.is_ok(); }
++                }
+                 let registered = self.handle(conn, req).await;
+                 match registered {
+-                    Err(e) if e.to_string() == crate::config::OFF_HERE && folder_allowed => {
++                    Err(e) if matches!(e.to_string().as_str(), crate::config::OFF_HERE | crate::config::SESSION_PAUSED) && folder_allowed && secondary_registered => {
+                         Ok(json!({"address":"","name":"","unread":0}))
+                     }
+                     other => other,
+diff --git a/src/mcp.rs b/src/mcp.rs
+index 8e98ab0..44a37fd 100644
+--- a/src/mcp.rs
++++ b/src/mcp.rs
+@@ -42,7 +42,7 @@ fn instructions() -> String {
+ 
+ #[derive(Debug, Deserialize, JsonSchema)]
+ pub struct ListArgs {
+-    /// Antigravity: the conversation id supplied by your Reason Network hook. Other agents omit it.
++    /// dsh: use the current DSH_SESSION_ID from your shell tool. Antigravity: use the conversation id from your Reason Network hook. Other agents omit it.
+     #[serde(default)]
+     pub session_id: Option<String>,
+     /// Only sessions matching this text (person, session, agent, repo, branch, directory or what it's doing).
+@@ -55,7 +55,7 @@ pub struct ListArgs {
+ 
+ #[derive(Debug, Deserialize, JsonSchema)]
+ pub struct SendArgs {
+-    /// Antigravity: the conversation id supplied by your Reason Network hook. Other agents omit it.
++    /// dsh: use the current DSH_SESSION_ID from your shell tool. Antigravity: use the conversation id from your Reason Network hook. Other agents omit it.
+     #[serde(default)]
+     pub session_id: Option<String>,
+     /// Reuse this key when retrying the same message after a lost response. A new key sends a new message.
+@@ -81,7 +81,7 @@ pub struct SendArgs {
+ 
+ #[derive(Debug, Deserialize, JsonSchema)]
+ pub struct DeliveryArgs {
+-    /// Antigravity: the conversation id supplied by your Reason Network hook. Other agents omit it.
++    /// dsh: use the current DSH_SESSION_ID from your shell tool. Antigravity: use the conversation id from your Reason Network hook. Other agents omit it.
+     #[serde(default)]
+     pub session_id: Option<String>,
+     /// Message ids returned by send_message. This checks progress without sending again.
+@@ -90,7 +90,7 @@ pub struct DeliveryArgs {
+ 
+ #[derive(Debug, Deserialize, JsonSchema)]
+ pub struct AskArgs {
+-    /// Antigravity: the conversation id supplied by your Reason Network hook. Other agents omit it.
++    /// dsh: use the current DSH_SESSION_ID from your shell tool. Antigravity: use the conversation id from your Reason Network hook. Other agents omit it.
+     #[serde(default)]
+     pub session_id: Option<String>,
+     /// What they need to decide: who asks for what, and why.
+@@ -103,7 +103,7 @@ pub struct AskArgs {
+ 
+ #[derive(Debug, Deserialize, JsonSchema)]
+ pub struct InboxArgs {
+-    /// Antigravity: the conversation id supplied by your Reason Network hook. Other agents omit it.
++    /// dsh: use the current DSH_SESSION_ID from your shell tool. Antigravity: use the conversation id from your Reason Network hook. Other agents omit it.
+     #[serde(default)]
+     pub session_id: Option<String>,
+     /// If nothing is waiting, wait up to this many seconds for a message (max 600). Default 0.
+@@ -383,7 +383,11 @@ impl ReasonNetworkMcp {
+             };
+             return found.ok_or_else(|| anyhow::anyhow!("Antigravity conversation is not identified. Pass the session_id from this conversation's Reason Network hook; if absent, reload the configured hooks and start a new invocation."));
+         }
+-        self.session(agent, agent::meta_session_id(&ctx.meta)).await
++        let mut id = agent::meta_session_id(&ctx.meta);
++        if agent == "dsh" && id.is_none() {
++            id = explicit.filter(|s| !s.is_empty()).map(str::to_string);
++        }
++        self.session(agent, id).await
+     }
+ 
+     /// Registers the session on first use and returns its key.
+diff --git a/src/render.rs b/src/render.rs
+index 7c8e8f6..cb61d41 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -267,11 +267,11 @@ pub fn without_machine(address: &str) -> &str {
+ 
+ #[cfg(test)]
+ pub fn for_agent(msgs: &[Message], agent: Option<&str>, cli: bool) -> String {
+-    for_agent_in(msgs,agent,cli,None)
++    for_agent_in(msgs,agent,cli,None,None)
+ }
+ 
+-pub fn for_agent_in(msgs:&[Message], agent:Option<&str>, cli:bool, team:Option<&crate::team::TeamState>)->String {
+-    let scoped=team.filter(|_| agent==Some("codex") && crate::paths::user_home().join(".reason/workspaces").is_dir());
++pub fn for_agent_in(msgs:&[Message], agent:Option<&str>, cli:bool, team:Option<&crate::team::TeamState>, sender_key:Option<&str>)->String {
++    let scoped=team.filter(|_| agent.is_some_and(crate::agent::workspace_agent) && crate::paths::user_home().join(".reason/workspaces").is_dir());
+     let mut out = String::new();
+     for m in msgs {
+         let mut attrs = format!("from=\"{}\"", attr(&m.from));
+@@ -309,7 +309,11 @@ pub fn for_agent_in(msgs:&[Message], agent:Option<&str>, cli:bool, team:Option<&
+         format!("From {person}'s agent.")
+     };
+     // No Reason Network tools (Reason's agent; a Claude session from before Reason Network), but commands run on this computer.
+-    let reply = if let Some(t)=scoped { format!("Reply with send_message to \"{}::{}\" using reply_to \"{}::{}\".",t.id,last.from,t.id,last.id) } else if cli || agent == Some("reason") {
++    let reply = if let (true, Some(team), Some(key)) = (cli, scoped, sender_key) {
++        let quoted = |arg: &str| format!("'{}'", arg.replace(char::from(39), "'\\''"));
++        let destination = format!("{}::{}", team.id, last.from);
++        format!("Reply if useful: {ENGINE} send {} --from {} \"<reply>\"", quoted(&destination), quoted(key))
++    } else if let Some(t)=scoped { format!("Reply with send_message to \"{}::{}\" using reply_to \"{}::{}\".",t.id,last.from,t.id,last.id) } else if cli || agent == Some("reason") {
+         format!("Reply if useful: {ENGINE} send {} --from {} \"<reply>\"", last.from, last.to)
+     } else if agent == Some("hermes") {
+         // Hermes's plugin names its tools for the toolset.

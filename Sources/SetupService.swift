@@ -168,7 +168,10 @@ actor SetupService: SetupServicing {
         let fm = FileManager.default
         var result = SetupSnapshot()
         result.codex = fm.fileExists(atPath: home.appendingPathComponent(".codex").path) ||
-            fm.fileExists(atPath: "/Applications/Codex.app") || fm.fileExists(atPath: home.appendingPathComponent("Applications/Codex.app").path)
+            [URL(fileURLWithPath: "/Applications"), home.appendingPathComponent("Applications")].contains { apps in
+                fm.fileExists(atPath: apps.appendingPathComponent("Codex.app").path) ||
+                    fm.isExecutableFile(atPath: apps.appendingPathComponent("ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex").path)
+            }
         let config = (try? String(contentsOf: home.appendingPathComponent(".codex/config.toml"), encoding: .utf8)) ?? ""
         result.wired = config.contains("mcp_servers.reason-network") && config.contains("reason-network")
         result.background = fm.fileExists(atPath: home.appendingPathComponent("Library/LaunchAgents/com.reasonmachines.network.plist").path)
@@ -180,7 +183,7 @@ actor SetupService: SetupServicing {
             let directory = try decoder.decode(Directory.self, from: Data(output.utf8))
             result.joined = directory.team?.isEmpty == false
             result.team = directory.team
-            result.sessions = directory.sessions.filter { $0.person == directory.person && $0.agent == "codex" && $0.tier != "none" }.count
+            result.sessions = directory.sessions.filter { $0.person == directory.person && $0.machine == directory.machine && LocalSession.supportedAgents.contains($0.agent ?? "") && $0.tier != "none" }.count
         } catch { result.issue = InterfaceMessage { SetupInput.redacted(error.localizedDescription) } }
         if installer.configured {
             result.needsBackendUpdate = installer.needsPathMigration
@@ -214,6 +217,9 @@ actor SetupService: SetupServicing {
         let arguments = installer.configured ? ["setup", "--no-service"] : ["setup"]
         _ = try await SetupCommand.run(executable, arguments, home: home, timeout: 90).checked()
         try await installer.activate()
+        if let backend = NetworkPaths.workspaceExecutable(home: home) {
+            _ = try await SetupCommand.run(backend, ["setup-native-wake"], home: home, timeout: 30).checked()
+        }
         let result = await inspect()
         guard result.background && result.participation && !result.needsBackendUpdate else { throw NetworkError("后台服务未安装成功，请展开详情或重试配置。") }
         if result.codex && !result.wired { throw NetworkError("Codex 接入未完成，请检查配置文件权限后重试。") }

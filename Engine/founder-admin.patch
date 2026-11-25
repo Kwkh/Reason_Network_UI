@@ -1,0 +1,276 @@
+diff --git a/src/daemon/mod.rs b/src/daemon/mod.rs
+index 432b2d0..eb3924a 100644
+--- a/src/daemon/mod.rs
++++ b/src/daemon/mod.rs
+@@ -66,7 +66,7 @@ pub async fn run(service: bool) -> Result<()> {
+         }
+     }
+     log(&format!("listening on {} as {}@{}", paths::socket().display(), daemon.person, daemon.machine));
+-    if daemon.team_state().is_some()
++    if daemon.listener_state().is_some()
+         && let Err(e) = daemon.start_net().await
+     {
+         log(&format!("network not started: {e:#}"));
+@@ -259,6 +259,10 @@ impl Daemon {
+         let paused = store.paused_sessions()?;
+         let team: Option<TeamState> =
+             store.get("team")?.and_then(|s| serde_json::from_str(&s).ok()).map(TeamState::without_odd_names);
++        let team = match team {
++            Some(t) if store.get(&format!("dissolved:{}",t.id))?.is_some() => { store.delete_prefix("team")?; None }
++            other => other,
++        };
+         // In a team, who we are is what the signed roster says, whatever the config file says.
+         let member = team.as_ref().and_then(|t| t.member(&key.public()).cloned());
+         Ok(Daemon {
+@@ -401,7 +405,7 @@ impl Daemon {
+             Request::SessionParticipation => {
+                 let g = self.inner.lock().unwrap();
+                 let pending: Vec<_> = g.live.iter().filter(|(_, l)| l.codex_resume_pending).map(|(key, _)| key).collect();
+-                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true, "workspaces": true,
++                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true, "workspaces": true, "admin_network": g.team.as_ref().filter(|t| t.founder == self.key.public()).map(|t| &t.id),
+                         "resume_pending": pending })
+             }
+             Request::SetReceiveMode { key, network, mode } => {
+@@ -493,7 +497,9 @@ impl Daemon {
+                 json!(g.live.get(&key).filter(|l| l.last_hook.is_some()).map(|_| key))
+             }
+             Request::Link { new } => json!(self.link(new).await?),
+-            Request::Remove { who } => json!(self.remove(&who)?),
++            Request::Remove { who } => json!(self.remove(&who, None)?),
++            Request::RemoveDevice { network, endpoint } => json!(self.remove(&endpoint, Some(&network))?),
++            Request::DissolveNetwork { network } => json!(self.dissolve(&network)?),
+             Request::Leave { force } => json!(self.leave(force).await?),
+             Request::SetRelay { url } => json!(self.set_relay(url).await?),
+             Request::Held => json!(self.inner.lock().unwrap().store.held()?),
+diff --git a/src/daemon/teamops.rs b/src/daemon/teamops.rs
+index dc8fa67..3491e5d 100644
+--- a/src/daemon/teamops.rs
++++ b/src/daemon/teamops.rs
+@@ -27,6 +27,43 @@ impl Daemon {
+         self.inner.lock().unwrap().team.clone()
+     }
+ 
++    pub(super) fn listener_state(&self) -> Option<TeamState> {
++        let g = self.inner.lock().unwrap();
++        g.team.clone().or_else(|| g.store.prefixed("dissolved:").ok()?.into_iter()
++            .find_map(|(_, v)| serde_json::from_str(&v).ok()))
++    }
++
++    pub(crate) fn archived_state(&self, id: &str, peer: &EndpointId) -> Option<TeamState> {
++        let g = self.inner.lock().unwrap();
++        let state: TeamState = serde_json::from_str(&g.store.get(&format!("dissolved:{id}")).ok()??).ok()?;
++        state.member(peer).map(|_| state.without_secrets())
++    }
++
++    fn archive_dissolution(&self, g: &mut Inner, state: &TeamState) -> Result<()> {
++        g.store.set(&format!("dissolved:{}",state.id), &serde_json::to_string(&state.without_secrets())?)?;
++        g.store.delete_prefix("team")?;
++        g.team = None;
++        g.store.delete_prefix("presence:")?;
++        Ok(())
++    }
++
++    pub(super) fn dissolve(self: &Arc<Self>, id: &str) -> Result<()> {
++        let state = {
++            let mut g = self.inner.lock().unwrap();
++            let mut state = g.team.clone().filter(|t| t.id == id).ok_or_else(|| anyhow!("Network changed"))?;
++            if state.founder != self.key.public() { bail!("Only the founding device can manage this Network"); }
++            for m in state.active().cloned().collect::<Vec<_>>() {
++                state.put_member(&self.key, m.endpoint, &m.person, &m.machine, false);
++            }
++            state.dissolved = Some(team::Signed::new(true, &self.key, id, "dissolved"));
++            self.archive_dissolution(&mut g, &state)?;
++            state
++        };
++        if let Some(net) = self.net() { net.broadcast(&Wire::State { state: Box::new(state.without_secrets()) }); }
++        self.restart_soon();
++        Ok(())
++    }
++
+     pub fn team_id(&self) -> Option<String> {
+         self.inner.lock().unwrap().team.as_ref().map(|t| t.id.clone())
+     }
+@@ -88,7 +125,7 @@ impl Daemon {
+     /// Starts the team's network in place of the one running, if any (with `net_lock` held). Invite codes made here
+     /// that are still good are listened for on it.
+     async fn start_net_now(self: &Arc<Self>) -> Result<()> {
+-        let team = self.team_state().ok_or_else(|| anyhow!("not in a team"))?;
++        let team = self.listener_state().ok_or_else(|| anyhow!("not in a team"))?;
+         self.stop_net_now().await;
+         let relay = team.meta.body.relay.as_deref();
+         let endpoint = net::bind(self.key.clone(), relay, self.cfg.lan(), self.cfg.port()).await?;
+@@ -164,6 +201,13 @@ impl Daemon {
+             }
+             let after: HashSet<EndpointId> = team.active().map(|m| m.endpoint).collect();
+             let state = team.clone();
++            if state.dissolved.is_some() {
++                if let Err(e) = self.archive_dissolution(&mut g, &state) { log(&format!("saving dissolution: {e}")); return; }
++                drop(g);
++                if let Some(net) = self.net() { net.broadcast(&Wire::State { state: Box::new(state.without_secrets()) }); }
++                self.restart_soon();
++                return;
++            }
+             let relay_changed = state.meta.body.relay != relay;
+             let gone = !after.contains(&me);
+             // Removed: what came with the news (a team link that replaced the one this machine knew, from a teammate
+@@ -363,6 +407,9 @@ impl Daemon {
+         endpoint.close().await;
+         let (state, by) = res?;
+         let mut state = TeamState::verified(&state)?;
++        if state.dissolved.is_some() || self.inner.lock().unwrap().store.get(&format!("dissolved:{}",state.id))?.is_some() {
++            bail!("This Network has been dissolved");
++        }
+         let who =
+             state.member(&by).map_or_else(|| by.fmt_short().to_string(), |m| format!("{} on {}", m.person, m.machine));
+         log(&format!("joined team {} as {person}: let in by {who}", state.shown_name()));
+@@ -584,22 +631,24 @@ impl Daemon {
+         out
+     }
+ 
+-    pub(super) fn remove(self: &Arc<Self>, who: &str) -> Result<String> {
++    pub(super) fn remove(self: &Arc<Self>, who: &str, expected: Option<&str>) -> Result<String> {
+         let me = self.key.public();
+         let (state, removed) = {
+             let mut g = self.inner.lock().unwrap();
+             let team = g.team.as_mut().ok_or_else(|| anyhow!("not in a team"))?;
++            if expected.is_some_and(|id| id != team.id) { bail!("Network changed"); }
++            if team.founder != me { bail!("Only the founding device can manage this Network"); }
+             // `person`, `person/machine`, a machine name, or the start of a machine's key.
+             let hits: Vec<(EndpointId, String, String)> = team
+                 .active()
+-                .filter(|m| match who.split_once('/') {
++                .filter(|m| if expected.is_some() { m.endpoint.to_string() == who } else { match who.split_once('/') {
+                     Some((p, mach)) => m.person == p && m.machine == mach,
+                     None => {
+                         m.person == who
+                             || m.machine == who
+                             || (who.len() >= 6 && m.endpoint.to_string().starts_with(who))
+                     }
+-                })
++                }})
+                 .map(|m| (m.endpoint, m.person.clone(), m.machine.clone()))
+                 .collect();
+             if hits.is_empty() {
+@@ -722,6 +771,39 @@ fn sign_in_needs_a_link(invite_text: &str, proof: Option<&str>) -> Result<()> {
+ mod tests {
+     use super::*;
+ 
++    #[tokio::test]
++    async fn founder_management_is_scoped_and_terminal() {
++        use super::super::test_daemon;
++        let founder = Arc::new(test_daemon(Config::default()));
++        let guest = Arc::new(test_daemon(Config::default()));
++        let offline = Arc::new(test_daemon(Config::default()));
++        let mut team = TeamState::found("test", "alice", "one", &founder.key);
++        team.put_member(&founder.key,guest.key.public(),"bob","two",true);
++        team.put_member(&founder.key,offline.key.public(),"bob","three",true);
++        for node in [&founder,&guest,&offline] { node.inner.lock().unwrap().team = Some(team.clone()); }
++        let target = offline.key.public().to_string();
++        assert!(guest.remove(&target,Some(&team.id)).is_err());
++        assert!(guest.dissolve(&team.id).is_err());
++        assert!(founder.remove(&target,Some("other")).is_err());
++        assert!(founder.remove(&founder.key.public().to_string(),Some(&team.id)).is_err());
++        let mut forged = team.clone();
++        forged.put_member(&guest.key,offline.key.public(),"bob","three",false);
++        forged.dissolved = Some(team::Signed::new(true,&guest.key,&team.id,"dissolved"));
++        offline.merge_state(&forged);
++        assert!(offline.is_member(&offline.key.public()));
++        founder.remove(&target,Some(&team.id)).unwrap();
++        assert!(!founder.is_member(&offline.key.public()) && founder.is_member(&guest.key.public()));
++        founder.dissolve(&team.id).unwrap();
++        let final_state = founder.archived_state(&team.id,&guest.key.public()).unwrap();
++        assert!(final_state.link.is_none() && final_state.invites.is_empty());
++        guest.merge_state(&final_state);
++        assert!(guest.team_state().is_none());
++        offline.merge_state(&guest.archived_state(&team.id,&offline.key.public()).unwrap());
++        assert!(offline.team_state().is_none());
++        offline.merge_state(&team);
++        assert!(offline.team_state().is_none());
++    }
++
+     #[test]
+     fn a_sign_in_never_joins_with_a_code() {
+         let code = invite::generate();
+diff --git a/src/net.rs b/src/net.rs
+index c7c7f30..369ea4d 100644
+--- a/src/net.rs
++++ b/src/net.rs
+@@ -714,9 +714,10 @@ impl ProtocolHandler for PeerProto {
+         if !daemon.is_member(&peer) {
+             // A machine that was removed while away: show it the state that says so, then hang up. Strangers
+             // learn nothing.
+-            if daemon.team_state().is_some_and(|t| t.member(&peer).is_some())
+-                && let Some(state) = daemon.team_state()
+-                && let Ok(Ok((mut send, _recv))) = tokio::time::timeout(Duration::from_secs(5), conn.accept_bi()).await
++            if let Ok(Ok((mut send, mut recv))) = tokio::time::timeout(Duration::from_secs(5), conn.accept_bi()).await
++                && let Ok(Ok(Wire::Hello { team, .. })) = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut recv)).await
++                && let Some(state) = daemon.archived_state(&team, &peer).or_else(|| daemon.team_state()
++                    .filter(|t| t.id == team && t.member(&peer).is_some()))
+             {
+                 let _ = write_frame(&mut send, &Wire::State { state: Box::new(state.without_secrets()) }).await;
+                 let _ = send.finish();
+diff --git a/src/proto.rs b/src/proto.rs
+index 048507c..3d080ef 100644
+--- a/src/proto.rs
++++ b/src/proto.rs
+@@ -95,6 +95,8 @@ pub enum Request {
+     EnableWorkspaces,
+     WorkspaceDispatch { network: String, request: Box<Request> },
+     SessionParticipation,
++    RemoveDevice { network: String, endpoint: String },
++    DissolveNetwork { network: String },
+     SetReceiveMode { key: String, network: String, mode: Tier },
+     SetSessionParticipation {
+         key: String,
+diff --git a/src/team.rs b/src/team.rs
+index edc388a..99feff2 100644
+--- a/src/team.rs
++++ b/src/team.rs
+@@ -89,6 +89,8 @@ pub struct Link {
+ pub struct TeamState {
+     pub id: String,
+     pub founder: EndpointId,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub dissolved: Option<Signed<bool>>,
+     pub meta: Signed<Meta>,
+     #[serde(default)]
+     pub admissions: BTreeMap<String, Signed<Member>>,
+@@ -139,6 +141,7 @@ impl TeamState {
+         let mut state = TeamState {
+             id,
+             founder: key.public(),
++            dissolved: None,
+             meta,
+             admissions: BTreeMap::new(),
+             members: BTreeMap::new(),
+@@ -397,7 +400,14 @@ impl TeamState {
+         if other.id != self.id || other.founder != self.founder {
+             bail!("state from a different team");
+         }
++        if self.dissolved.is_some() { return Ok(false); }
+         let mut changed = false;
++        if let Some(seal) = &other.dissolved
++            && seal.body && seal.by == self.founder && seal.verify(&self.id, "dissolved")
++        {
++            self.dissolved = Some(seal.clone());
++            changed = true;
++        }
+         // Proofs check themselves; they come before members, whose names they can vouch for (`may_take`). Only
+         // members' are kept (see the end).
+         let proofs_before = self.attestations.clone();
+@@ -449,6 +459,7 @@ impl TeamState {
+                 continue;
+             }
+             // A machine may sign its own departure, never its own return (the founder's very first entry aside).
++            if !e.body.active && e.by != e.body.endpoint && e.by != self.founder { continue; }
+             let self_admit = e.by == e.body.endpoint && e.body.active;
+             if self_admit && !(e.by == self.founder && cur.is_none()) {
+                 continue;
+@@ -502,6 +513,7 @@ impl TeamState {
+         let mut s = TeamState {
+             id: other.id.clone(),
+             founder: other.founder,
++            dissolved: None,
+             meta: other.meta.clone(),
+             admissions: BTreeMap::new(),
+             members: BTreeMap::new(),

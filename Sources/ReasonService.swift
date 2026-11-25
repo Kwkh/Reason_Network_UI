@@ -7,6 +7,12 @@ actor ReasonService {
     private let mirror: TranscriptMirror
     private var migrated = false
     private var lastCodexTitles: [String: String] = [:]
+    private var otherTitles: [String: String] = [:]
+    private var titleKeys: Set<String> = []
+    private var titlesUpdated = Date.distantPast
+    private func localTitle(_ key: String) -> String? {
+        key.hasPrefix("codex:") ? lastCodexTitles[key.lowercased()] : otherTitles[key]
+    }
     private let networkRoot: URL
     private let expectedTeam: String?
     private let secondary: Bool
@@ -18,6 +24,7 @@ actor ReasonService {
         self.home = home
         mirror = TranscriptMirror(root: home.appendingPathComponent(".codex/sessions"))
     }
+    enum MembershipEnded: Error { case departed }
     func snapshot(local: String, peer: String, readingFrom: Message.RowKey? = nil, readingNetwork: String? = nil) throws -> Snapshot {
         let engineURL = networkRoot.appendingPathComponent("network.db")
         func openEngine() throws -> (SQLiteStore, String?) {
@@ -37,6 +44,16 @@ actor ReasonService {
                 throw NetworkError(localizing: { L10n.text("暂时无法读取本机 Network 的聊天数据，稍后将自动重试。") + (error.errorDescription ?? "") })
             }
         }
+        if expectedNetwork == nil, let previous = readingNetwork ?? expectedTeam {
+            let dissolved = try engine.rows("SELECT 1 FROM kv WHERE key=?", ["dissolved:" + previous]).first != nil
+            let remotelyEnded = try engine.rows("SELECT 1 FROM kv WHERE key GLOB 'departure:*' AND json_extract(value,'$.network')=? LIMIT 1", [previous]).first != nil
+            if dissolved || remotelyEnded || readingNetwork != nil {
+                let cache = try store()
+                try cache.recordInboxOwnership(previous, engine: engine)
+                try selectNetwork("", in: cache)
+                throw MembershipEnded.departed
+            }
+        }
         var directory = try directory()
         _ = try engine.rows("BEGIN")
         guard let network = try teamID(in: engine), directory.team != nil else {
@@ -44,18 +61,27 @@ actor ReasonService {
         }
         guard network == expectedNetwork, expectedTeam == nil || expectedTeam == network else { throw NetworkError("Network 正在切换，稍后将重新同步。") }
         directory.networkID = network
+        directory.managesNetwork = (try? participationState().adminNetwork) == network
         let cache = try store()
         try selectNetwork(network, in: cache)
         let paused = try pausedKeys(in: engine)
-        let codexRecords = try engine.rows("SELECT name,key,doing,attached FROM sessions WHERE agent='codex' ORDER BY last_seen DESC")
+        let localRecords = try engine.rows("SELECT name,key,agent,doing,attached FROM sessions WHERE agent IN ('codex','claude-code','gemini','dsh') AND key LIKE agent || ':%' ORDER BY last_seen DESC")
         let retained = try disconnectedKeys(network)
         for key in retained.subtracting(paused) { try forgetDisconnect(key, network: network) }
-        let registrations = codexRecords.filter { !paused.contains($0["key"] ?? "") }
+        let registrations = localRecords.filter { !paused.contains($0["key"] ?? "") }
         let catalog = PersonalSessionCatalog(home: home)
+        let keys = Set(localRecords.compactMap { $0["key"] }.filter { !$0.hasPrefix("codex:") })
+        if !keys.isEmpty && (keys != titleKeys || Date().timeIntervalSince(titlesUpdated) > 30) {
+            otherTitles = Dictionary(catalog.otherSessions(keys: keys).compactMap { session in
+                session.nativeTitle.map { (session.id, $0) }
+            }, uniquingKeysWith: { first, _ in first })
+            titleKeys = keys
+            titlesUpdated = Date()
+        }
         let attached = registrations.filter { $0["attached"] == "1" }
-        let info = catalog.registeredThreads(codexRecords.compactMap { $0["key"] })
+        let info = catalog.registeredThreads(localRecords.compactMap { $0["key"] })
         var restrictions: [String: LocalThreadRestriction] = [:]
-        for row in codexRecords {
+        for row in localRecords {
             guard let name = row["name"], let key = row["key"]?.lowercased(), let thread = info[key] else { continue }
             if let restriction = thread.restriction { restrictions[name] = restriction }
             if thread.restriction == nil || thread.title != nil { lastCodexTitles[key] = thread.title }
@@ -67,30 +93,30 @@ actor ReasonService {
             }
         }
         var localTitlesByName: [String: String] = [:]
-        for row in codexRecords {
+        for row in localRecords {
             if let name = row["name"], localTitlesByName[name] == nil, let key = row["key"] {
-                localTitlesByName[name] = lastCodexTitles[key.lowercased()] ?? row["doing"]?.nonEmpty
+                localTitlesByName[name] = localTitle(key) ?? row["doing"]?.nonEmpty
             }
         }
         for i in directory.sessions.indices {
             let session = directory.sessions[i]
-            if session.person == directory.person, session.machine == directory.machine, session.agent == "codex",
-               let key = attached.first(where: { $0["name"] == session.name })?["key"],
-               let title = lastCodexTitles[key.lowercased()] {
+            if session.person == directory.person, session.machine == directory.machine,
+               let key = attached.first(where: { $0["name"] == session.name && $0["agent"] == session.agent })?["key"],
+               let title = localTitle(key) {
                 directory.sessions[i].clientTitle = title
             }
         }
         let labels = try cache.sessionLabels(network: network, sessions: &directory.sessions)
-        let disconnected = codexRecords.filter { row in
+        let disconnected = localRecords.filter { row in
             guard let key = row["key"] else { return false }
             return paused.contains(key) && retained.contains(key)
         }
         var locals = (attached + disconnected).compactMap { row -> LocalSession? in
             guard let name = row["name"], let key = row["key"] else { return nil }
             let index = directory.sessions.firstIndex {
-                $0.person == directory.person && $0.machine == directory.machine && $0.name == name && $0.agent == "codex"
+                $0.person == directory.person && $0.machine == directory.machine && $0.name == name && $0.agent == row["agent"]
             }
-            let title = lastCodexTitles[key.lowercased()]
+            let title = localTitle(key)
             let published = index.map { directory.sessions[$0] }
             let remembered = labels[directory.person + "/" + name]
             let displayTitle = title ?? published?.clientTitle ?? remembered?.title
@@ -105,7 +131,7 @@ actor ReasonService {
         let fileColumn = hasFiles ? ",files" : ""
         // A registered mailbox can receive mail just before detaching, between UI polls.
         let cutoff = (try? workspaceFolder.resourceValues(forKeys: [.creationDateKey]).creationDate)?.timeIntervalSince1970
-        for registration in codexRecords {
+        for registration in localRecords {
             guard let name = registration["name"], let key = registration["key"] else { continue }
             let session = LocalSession(name: name, key: key)
             do {
@@ -113,7 +139,7 @@ actor ReasonService {
                     guard let id = row["id"], !otherMail.contains(id) else { continue }
                     try cache.reconcileEnvelope(Message(id: id, at: (Double(row["sent_at"] ?? "") ?? 0) / 1000, local: session.name, peer: row["sender"] ?? "", direction: "in", body: row["body"] ?? "", result: "", replyTo: row["reply_to"], attachments: receivedFiles(row["files"])), network: network, knowsFiles: hasFiles)
                 }
-                guard !secondary else { continue }
+                guard !secondary, session.agent == "codex" else { continue }
                 try mirror.sync(for: session) { batch in
                     try cache.transaction {
                         for event in batch where cutoff.map({ event.at < $0 }) ?? true {
@@ -127,20 +153,20 @@ actor ReasonService {
             } catch { warning = InterfaceMessage { L10n.text("部分历史记录暂未同步：") + error.localizedDescription } }
         }
         try reconcileSent(engine: engine, cache: cache, network: network, person: directory.person, otherMail: otherMail, hasInboxFiles: hasFiles)
-        let pausedNames = Set(codexRecords.filter { paused.contains($0["key"] ?? "") }.compactMap { $0["name"] })
-        let registeredNames = Set(codexRecords.compactMap { $0["name"] })
+        let pausedNames = Set(localRecords.filter { paused.contains($0["key"] ?? "") }.compactMap { $0["name"] })
+        let registeredNames = Set(localRecords.compactMap { $0["name"] })
         let hiddenHistory = Set(try cache.rows("SELECT name FROM hidden_local_history WHERE network=?", [network]).compactMap { $0["name"] })
         let disconnectedNames = Set(disconnected.compactMap { $0["name"] })
         let hiddenNames = pausedNames.subtracting(disconnectedNames).union(hiddenHistory.subtracting(registeredNames))
         directory.sessions.removeAll {
-            $0.person == directory.person && $0.machine == directory.machine && $0.agent == "codex" && (hiddenNames.contains($0.name) || disconnectedNames.contains($0.name))
+            $0.person == directory.person && $0.machine == directory.machine && LocalSession.supportedAgents.contains($0.agent ?? "") && (hiddenNames.contains($0.name) || disconnectedNames.contains($0.name))
         }
         let knownNames = Set(locals.map(\.name)).union(hiddenNames)
         for row in try cache.rows("SELECT DISTINCT local_session FROM network_events WHERE network=? ORDER BY local_session", [network]) {
             if let name = row["local_session"], !knownNames.contains(name) {
                 let key = registrations.first { $0["name"] == name }?["key"] ?? "history:" + name
                 let remembered = labels[directory.person + "/" + name]
-                let title = lastCodexTitles[key.lowercased()] ?? remembered?.title ?? localTitlesByName[name] ?? remembered?.activity
+                let title = localTitle(key) ?? remembered?.title ?? localTitlesByName[name] ?? remembered?.activity
                 locals.append(LocalSession(name: name, key: key, doing: title, historyOnly: true, restriction: restrictions[name]))
             }
         }
@@ -148,13 +174,32 @@ actor ReasonService {
         locals = locals.filter { !$0.historyOnly } + locals.filter { $0.historyOnly }
         let conversations = try cache.rows("SELECT peer,MAX(at) AS recent FROM network_events WHERE network=? AND local_session=? GROUP BY peer ORDER BY recent DESC", [network, local]).compactMap { $0["peer"] }
         let hiddenAddresses = Set(hiddenNames.map { directory.person + "/" + $0 })
+        let origins = try cache.sessionOrigins(network: network, directory: directory)
+        // Protect advertised offline names as well, even if this App never saw the session live.
+        var protectedAddresses = Set(directory.sessions.map(\.address))
+        var unverifiedPeople = Set<String>()
+        for device in directory.machines where !device.isMe {
+            guard device.online, let value = try engine.rows("SELECT value FROM kv WHERE key=?", ["presence:" + device.endpoint]).first?["value"],
+                  let advertisement = try? JSONDecoder().decode(DeviceAdvertisement.self, from: Data(value.utf8)),
+                  advertisement.presence.known.count < 100, (advertisement.presence.kept?.count ?? 0) < 100 else {
+                unverifiedPeople.insert(device.person)
+                continue
+            }
+            let presence = advertisement.presence
+            for name in presence.known + (presence.kept ?? []) + presence.sessions.map(\.name) {
+                protectedAddresses.insert(device.person + "/" + name)
+            }
+        }
+        let registered = Set(try engine.rows("SELECT name FROM sessions").compactMap { $0["name"] })
         let previousPeers = conversations.filter { !hiddenAddresses.contains($0) }.map { address in
             let parts = address.split(separator: "/", maxSplits: 1).map(String.init)
             let person = parts.first ?? "", name = parts.last ?? address
             let remembered = labels[address]
-            return NetworkSession(address: address, name: name, person: person, agent: "离线", doing: remembered?.activity, status: "offline",
+            var history = NetworkSession(address: address, name: name, person: person, agent: "离线", doing: remembered?.activity, status: "offline",
                                   clientTitle: (person == directory.person ? locals.first { $0.name == name }?.doing ?? localTitlesByName[name] : nil) ?? remembered?.title,
                                   restriction: person == directory.person ? restrictions[name] : nil)
+            history.deletableLocalHistory = !unverifiedPeople.contains(person) && directory.isOnlyLocalHistory(address, origins: origins, registered: registered, listed: protectedAddresses)
+            return history
         }
         let page: MessagePage
         if readingNetwork == network, let start = readingFrom, start.local == local {
@@ -164,6 +209,26 @@ actor ReasonService {
         }
         return Snapshot(directory: directory, localSessions: locals, conversations: previousPeers, messages: page.messages,
                         hasEarlier: page.hasEarlier, mirrorWarning: warning)
+    }
+
+    private struct DeviceAdvertisement: Decodable {
+        struct Presence: Decodable {
+            struct Session: Decodable { let name: String }
+            let sessions: [Session]
+            let known: [String]
+            let kept: [String]?
+        }
+        let presence: Presence
+    }
+
+    func deleteLocalHistory(network: String, local: String, peer: String) throws {
+        // Refresh immediately before committing. A peer may have rejoined while the alert was open.
+        let state = try snapshot(local: local, peer: peer)
+        guard state.directory.networkID == network,
+              state.conversations.contains(where: { $0.address == peer && $0.deletableLocalHistory }) else {
+            throw NetworkError("会话状态已变化，请刷新后重试。")
+        }
+        try store().clearHistory(network: network, local: local, peer: peer)
     }
 
     private func reconcileSent(engine: SQLiteStore, cache: SQLiteStore, network: String, person: String,
@@ -212,7 +277,7 @@ actor ReasonService {
                 guard row["sent_body"] != nil || origin.first?["network"] == network else { continue }
                 let local = String(sender.dropFirst(person.count + 1))
                 let scope = [network, id, local]
-                if row["sender_key"]?.hasPrefix("codex:") == true, let body = row["sent_body"] ?? row["body"] ?? row["queued_body"] {
+                if LocalSession.agent(for: row["sender_key"] ?? "") != nil, let body = row["sent_body"] ?? row["body"] ?? row["queued_body"] {
                     let queuedNames = (row["sent_files"] ?? row["queued_files"]).flatMap { try? JSONDecoder().decode([String].self, from: Data($0.utf8)) } ?? []
                     let names = row["sent_body"] == nil && row["body"] != nil ? receivedFiles(row["files"]).map(\.name) : queuedNames
                     let reply = row["sent_reply"] ?? (row["body"] != nil ? row["reply_to"] : row["queued_reply"]) ?? ""
@@ -254,7 +319,10 @@ actor ReasonService {
         }
     }
 
-    func leaveNetwork(expected: String) throws {
+    func removeDevice(_ endpoint: String, network: String) throws {
+        _ = try console.request(["op":"remove_device", "network":network, "endpoint":endpoint])
+    }
+    func leaveNetwork(expected: String, dissolving: Bool = false) throws {
         let engine = try SQLiteStore(networkRoot.appendingPathComponent("network.db"), readOnly: true)
         guard try teamID(in: engine) == expected else { throw NetworkError("当前 Network 已变化，请重新确认。") }
         let cache = try store()
@@ -262,7 +330,10 @@ actor ReasonService {
         // Include held messages and mailboxes not currently selected by the UI.
         try cache.recordInboxOwnership(expected, engine: engine)
         let departure = String(Date().timeIntervalSince1970)
-        do { _ = try run(["leave"], timeout: 35) }
+        do {
+            if dissolving { _ = try console.request(["op":"dissolve_network", "network":expected]) }
+            else { _ = try run(["leave"], timeout: 35) }
+        }
         catch {
             if try teamID(in: engine) != nil {
                 if error.localizedDescription.contains("no teammate is online") {
@@ -320,7 +391,7 @@ actor ReasonService {
         }
     }
 
-    func send(network: String, local: String, to: String, body: String, files: [URL] = [], notify: Bool = false) throws -> InterfaceMessage {
+    func send(network: String, local: String, expectedKey: String? = nil, to: String, body: String, files: [URL] = [], notify: Bool = false) throws -> InterfaceMessage {
         let typed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         let content = typed.isEmpty && !files.isEmpty ? "附件" : typed
         guard !content.isEmpty, content.count <= 10_000 else { throw NetworkError("请输入 1–10000 字的消息") }
@@ -333,11 +404,13 @@ actor ReasonService {
             guard bytes <= 512 * 1024 else { throw NetworkError("附件合计不能超过 512 KiB。") }
         }
         let engine = try SQLiteStore(networkRoot.appendingPathComponent("network.db"), readOnly: true)
-        guard let key = try engine.rows("SELECT key FROM sessions WHERE name=? AND agent='codex' AND attached=1", [local]).first?["key"] else { throw NetworkError("本机 Codex 会话未连接") }
+        guard let sender = try engine.rows("SELECT key,agent FROM sessions WHERE name=? AND attached=1", [local]).first,
+              let key = sender["key"], let agent = LocalSession.agent(for: key), agent == sender["agent"],
+              expectedKey == nil || expectedKey == key else { throw LocalSenderOffline() }
         guard try !pausedKeys(in: engine).contains(key) else { throw NetworkError("本机会话已退出 Network") }
         try verifyLocalThreads([key])
         let directory = try directory()
-        guard directory.liveLocalSession(named: local, agent: "codex") != nil else { throw LocalSenderOffline() }
+        guard directory.liveLocalSession(named: local, agent: agent) != nil else { throw LocalSenderOffline() }
         guard let recipient = directory.sessions.first(where: {
             $0.address == to && $0.available && directory.isRecipient($0, sendingAs: local)
         }) else { throw NetworkError("收件会话暂不可用，请刷新后重新选择。") }
@@ -402,6 +475,10 @@ actor ReasonService {
             item.restriction = info[key.lowercased()]?.restriction
             if item.restriction == .archived || item.restriction == .missing { continue }
             item.id = key
+            if agent != "codex", LocalSession.agent(for: key) == agent {
+                item.nativeID = String(key.dropFirst(agent.count + 1))
+                item.cwd = item.cwd ?? row["cwd"]
+            }
             if agent == "codex", item.nativeID != nil { item.nativeID = String(key.dropFirst("codex:".count)) }
             item.canManageParticipation = participation != nil
             if participation?.paused.contains(key) == true {
@@ -418,18 +495,16 @@ actor ReasonService {
     func reconnectLocal(_ local: LocalSession, network: String) throws {
         let engine = try SQLiteStore(networkRoot.appendingPathComponent("network.db"), readOnly: true)
         guard try teamID(in: engine) == network, expectedTeam == nil || expectedTeam == network, !local.historyOnly,
-              try engine.rows("SELECT key FROM sessions WHERE name=? AND agent='codex' AND attached=1", [local.name]).first?["key"] == local.key else {
+              try engine.rows("SELECT key FROM sessions WHERE name=? AND agent=? AND attached=1", [local.name, local.agent]).first?["key"] == local.key else {
             throw NetworkError("本机会话或 Network 已变化，请刷新后重新选择。")
         }
         let paused = try pausedKeys(in: engine).contains(local.key)
         if paused, try !disconnectedKeys(network).contains(local.key) { throw NetworkError("本机会话已退出 Network。") }
         try verifyLocalThreads([local.key])
-        if !paused, try directory().liveLocalSession(named: local.name, agent: "codex") != nil { return }
-        guard var session = try PersonalSessionCatalog(home: home).discover().sessions.first(where: { $0.agent == "codex" && $0.id.lowercased() == local.key.lowercased() }) else {
-            throw NetworkError("找不到这个本机 Codex 对话，请在 Codex 中打开后重试。")
+        if !paused, try directory().liveLocalSession(named: local.name, agent: local.agent) != nil { return }
+        guard let session = try personalSessions().first(where: { $0.id == local.key && $0.supportsImmediateJoin }) else {
+            throw NetworkError("这个会话需要在原工具中打开。")
         }
-        session.id = local.key
-        session.nativeID = String(local.key.dropFirst("codex:".count))
         if paused {
             _ = try resumePersonalSession(session, address: local.name)
             try forgetDisconnect(local.key, network: network)
@@ -483,7 +558,7 @@ actor ReasonService {
     }
     func removeLocal(_ local: LocalSession, network: String, keepListed: Bool = false) throws {
         let engine = try SQLiteStore(networkRoot.appendingPathComponent("network.db"), readOnly: true)
-        let registrations = try engine.rows("SELECT key,attached FROM sessions WHERE agent='codex' AND name=?", [local.name])
+        let registrations = try engine.rows("SELECT key,attached FROM sessions WHERE agent=? AND name=?", [local.agent, local.name])
         guard try teamID(in: engine) == network, expectedTeam == nil || expectedTeam == network else { throw NetworkError("当前 Network 已变化，请刷新。") }
         if local.hasRegistration {
             guard let registration = registrations.first(where: { $0["key"] == local.key }) else { throw NetworkError("会话注册已变化，请刷新后重试。") }
@@ -555,7 +630,7 @@ actor ReasonService {
         struct Reply: Decodable { let effective: ReceiveMode }
         do {
             return try console.decode(["op": "set_receive_mode", "key": local.key, "network": network, "mode": mode.rawValue],
-                                      as: Reply.self).effective
+                                      as: Reply.self, timeout: mode == .push ? 65 : 5).effective
         } catch let error as NetworkError where error.message.contains("unknown variant") {
             throw NetworkError("当前后台未支持接收模式设置，请在「环境配置」中更新兼容后台。")
         }
@@ -569,8 +644,9 @@ actor ReasonService {
     private struct ParticipationState: Decodable {
         let version: Int
         let paused: Set<String>
+        let adminNetwork: String?
         let resumePending: Set<String>?
-        enum CodingKeys: String, CodingKey { case version, paused, resumePending = "resume_pending" }
+        enum CodingKeys: String, CodingKey { case adminNetwork = "admin_network", version, paused, resumePending = "resume_pending" }
     }
     private func participationState() throws -> ParticipationState {
         let state = try console.decode(["op": "session_participation"], as: ParticipationState.self)
@@ -652,6 +728,7 @@ actor ReasonService {
             }
         }
         _ = try database.rows("CREATE INDEX IF NOT EXISTS network_history ON network_events(network,local_session,peer,at,id)")
+        try database.prepareHistoryDeletion()
         try database.prepareNetworkMetadata()
         _ = try database.rows("""
             CREATE TABLE IF NOT EXISTS session_labels(network TEXT NOT NULL,address TEXT NOT NULL,
@@ -682,7 +759,7 @@ actor ReasonService {
         process.standardInput = stdin; process.standardOutput = output; process.standardError = error
         process.currentDirectoryURL = home
         var env = ProcessInfo.processInfo.environment.filter { key, _ in
-            !["CODEX_", "CLAUDE", "TINCAN_", "REASON_NETWORK_"].contains(where: { key.hasPrefix($0) }) && !["COPILOT_SESSION_ID", "GEMINI_CLI", "CURSOR_TRACE_ID"].contains(key)
+            !["CODEX_", "CLAUDE", "TINCAN_", "REASON_NETWORK_"].contains(where: { key.hasPrefix($0) }) && !["COPILOT_SESSION_ID", "GEMINI_CLI", "GEMINI_SESSION_ID", "DSH_SESSION_ID", "CURSOR_TRACE_ID"].contains(key)
         }
         env["PATH"] = home.appendingPathComponent(".local/bin").path + ":/usr/bin:/bin:/usr/sbin:/sbin"
         env["HOME"] = home.path

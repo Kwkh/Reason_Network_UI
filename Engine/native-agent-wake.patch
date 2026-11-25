@@ -1,0 +1,366 @@
+diff --git a/src/claude.rs b/src/claude.rs
+index 8ae58cb..058eba4 100644
+--- a/src/claude.rs
++++ b/src/claude.rs
+@@ -109,11 +109,22 @@ fn permission_mode(transcript: &std::path::Path) -> Option<String> {
+     })
+ }
+ 
++/// A long-lived MCP client can survive /clear. Refuse its cached socket when its owning
++/// process now advertises another native conversation.
++pub fn changed_thread(id: Option<&str>, pid: Option<u32>) -> bool {
++    let (Some(id), Some(pid)) = (id, pid) else { return false };
++    let file = paths::claude_sessions().join(format!("{pid}.json"));
++    std::fs::read(file).ok().and_then(|bytes| serde_json::from_slice::<ClaudeSession>(&bytes).ok())
++        .is_some_and(|s| s.pid == pid && s.session_id.as_deref().is_some_and(|current| current != id))
++}
++
+ /// The messaging socket of a live session, by its id or process.
+ pub fn socket_for(session_id: Option<&str>, pid: Option<u32>) -> Option<ClaudeSocket> {
+-    let c = scan().into_iter().find(|c| {
+-        (session_id.is_some() && c.session_id.as_deref() == session_id) || (pid.is_some() && Some(c.pid) == pid)
+-    })?;
++    let mut candidates = scan().into_iter().filter(|c| {
++        session_id.map_or_else(|| pid == Some(c.pid), |id| c.session_id.as_deref() == Some(id))
++    });
++    let c = candidates.next()?;
++    if candidates.next().is_some() { return None; }
+     Some(ClaudeSocket { path: c.messaging_socket_path?.into(), token: peer_token(c.pid) })
+ }
+ 
+diff --git a/src/daemon/mail.rs b/src/daemon/mail.rs
+index 3e3567d..4c73eb0 100644
+--- a/src/daemon/mail.rs
++++ b/src/daemon/mail.rs
+@@ -39,6 +39,7 @@ const CODEX_TURN_POLL: Duration = Duration::from_secs(2);
+ enum Channel {
+     /// Its `reason network mcp` posts into Claude Code's session socket.
+     ClaudeSocket(u64),
++    Dsh(String),
+     /// The agent's own CLI: `codex queue --thread <id> --message`, `reason session send <id> --message`.
+     Command(&'static str, Vec<String>),
+     /// Straight into a Claude Code session's messaging socket (one without Reason Network's tools: it replies with the CLI).
+@@ -506,11 +507,13 @@ impl Daemon {
+             && has("codex")
+             && l.transcript.as_deref().and_then(codex::turn_running) == Some(true);
+         let channel = match (tier, l.conn, &l.reg.agent_session_id) {
++            (Tier::Push, _, Some(id)) if l.reg.agent == "dsh" => Channel::Dsh(id.clone()),
+             (Tier::Pull, _, _) if l.preferred_mode.is_some() || l.reg.agent == "dsh" => Channel::Pull,
+             // These adapters take Deliver events on this connection. Codex and Reason still
+             // use their native channels below, even when their MCP client registers as push.
+             (Tier::Push, Some(conn), _)
+-                if l.mcp_push && matches!(l.reg.agent.as_str(), agent::CLAUDE_CODE | "hermes" | "antigravity") =>
++                if l.mcp_push && (l.reg.agent != agent::CLAUDE_CODE || !claude::changed_thread(l.reg.agent_session_id.as_deref(), l.reg.pid))
++                    && matches!(l.reg.agent.as_str(), agent::CLAUDE_CODE | "hermes" | "antigravity") =>
+             {
+                 Channel::ClaudeSocket(conn)
+             }
+@@ -543,6 +546,29 @@ impl Daemon {
+             "queued: it sees it at its next tool call or when its turn ends"
+         };
+         match channel {
++            Channel::Dsh(session) => {
++                let team = g.team.as_ref();
++                for m in msgs {
++                    let text = render::for_agent_in(std::slice::from_ref(&m), Some("dsh"), false, team, Some(key));
++                    let delivery = format!("{}::{}", team.map_or("", |t| t.id.as_str()), m.id);
++                    let session = session.clone();
++                    g.in_flight.insert(m.id.clone(), Instant::now());
++                    let this = self.clone();
++                    tokio::spawn(async move {
++                        let result = tokio::task::spawn_blocking(move || crate::dsh_wake::post(&session, &delivery, &text)).await;
++                        let mut g = this.inner.lock().unwrap();
++                        g.in_flight.remove(&m.id);
++                        match result {
++                            Ok(Ok(())) => {
++                                let changed = g.store.mark_read(&[m.id], util::now_ms()).unwrap_or_default();
++                                let _ = g.store.handoff(&changed, util::now_ms());
++                            }
++                            _ => log("dsh did not acknowledge the wake; message remains unread"),
++                        }
++                    });
++                }
++                ("pushed".into(), "waiting for the original dsh session to accept input".into())
++            }
+             Channel::ClaudeSocket(conn) => {
+                 let Some(tx) = g.conns.get(&conn) else {
+                     return ("queued".into(), "queued: this agent only sees it when it checks its inbox".into());
+@@ -663,7 +689,13 @@ impl Daemon {
+     fn post_direct(self: &Arc<Self>, key: String, sock: agent::ClaudeSocket, ids: Vec<String>, text: String) {
+         let this = self.clone();
+         tokio::spawn(async move {
+-            let res = tokio::task::spawn_blocking(move || agent::post_to_claude(&sock, &text)).await;
++            let native_id = key.strip_prefix("claude-code:").map(str::to_owned);
++            let res = tokio::task::spawn_blocking(move || {
++                if let Some(id) = native_id && !claude::socket_for(Some(&id), None).is_some_and(|s| s.path == sock.path) {
++                    return Err(std::io::Error::other("Claude Code session changed before delivery"));
++                }
++                agent::post_to_claude(&sock, &text)
++            }).await;
+             let mut g = this.inner.lock().unwrap();
+             for id in &ids {
+                 g.in_flight.remove(id);
+diff --git a/src/daemon/mod.rs b/src/daemon/mod.rs
+index 76fa812..f9e77e6 100644
+--- a/src/daemon/mod.rs
++++ b/src/daemon/mod.rs
+@@ -418,7 +418,7 @@ impl Daemon {
+             Request::SessionParticipation => {
+                 let g = self.inner.lock().unwrap();
+                 let pending: Vec<_> = g.live.iter().filter(|(_, l)| l.codex_resume_pending).map(|(key, _)| key).collect();
+-                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true, "workspaces": true, "multi_agent_sessions": true, "departure_notices": true, "admin_network": g.team.as_ref().filter(|t| t.founder == self.key.public()).map(|t| &t.id),
++                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true, "workspaces": true, "native_agent_wake": true, "multi_agent_sessions": true, "departure_notices": true, "admin_network": g.team.as_ref().filter(|t| t.founder == self.key.public()).map(|t| &t.id),
+                         "resume_pending": pending })
+             }
+             Request::SetReceiveMode { key, network, mode } => {
+diff --git a/src/daemon/sessions.rs b/src/daemon/sessions.rs
+index 8b06eea..5e1d7a5 100644
+--- a/src/daemon/sessions.rs
++++ b/src/daemon/sessions.rs
+@@ -29,12 +29,17 @@ const OFF_TURN_MS: i64 = 10 * 60_000;
+ 
+ impl Live {
+     fn hook_mode(&self) -> Tier {
+-        if self.last_hook.is_some() { Tier::Turn } else { Tier::Pull }
++        if self.last_hook.is_some() && self.reg.agent != "dsh" { Tier::Turn } else { Tier::Pull }
+     }
+ 
+     fn push_problem(&self) -> Option<&'static str> {
++        if self.reg.agent == "dsh" {
++            return self.reg.agent_session_id.as_deref().and_then(crate::dsh_wake::endpoint).is_none()
++                .then_some("Open the original dsh session with the Reason Network wake plugin enabled.");
++        }
+         if self.reg.agent == agent::CLAUDE_CODE {
+-            let available = !self.push_failed && (self.mcp_push && self.conn.is_some() ||
++            let available = !self.push_failed && (self.mcp_push && self.conn.is_some() &&
++                !crate::claude::changed_thread(self.reg.agent_session_id.as_deref(), self.reg.pid) ||
+                 crate::claude::socket_for(self.reg.agent_session_id.as_deref(), self.reg.pid).is_some());
+             return (!available).then_some("Claude Code push channel is unavailable.");
+         }
+@@ -91,7 +96,9 @@ impl Daemon {
+         if mode == Tier::Push {
+             match live.reg.agent.as_str() {
+                 "codex" if key.starts_with("codex:") && live.reg.agent_session_id.is_some() => {}
+-                agent::CLAUDE_CODE if live.push_problem().is_none() => {}
++                agent::CLAUDE_CODE | "dsh" => {
++                    if let Some(problem) = live.push_problem() { bail!("{problem}"); }
++                }
+                 _ => bail!("该会话不支持此接收模式。"),
+             }
+         }
+diff --git a/src/dsh-wake.mjs b/src/dsh-wake.mjs
+new file mode 100644
+index 0000000..a213736
+--- /dev/null
++++ b/src/dsh-wake.mjs
+@@ -0,0 +1,59 @@
++// Cordis loads this plugin inside the host that owns the original dsh agent.
++import { createHash, randomUUID } from 'node:crypto'
++import { lstatSync, mkdirSync } from 'node:fs'
++import { createServer } from 'node:net'
++
++export const name = 'reason-network-wake'
++export const inject = ['agents']
++export function apply(ctx) {
++  if (process.platform !== 'darwin') return
++  const root = '/tmp/reason-dsh-' + process.getuid()
++  mkdirSync(root, { recursive: true, mode: 0o700 })
++  const dir = lstatSync(root)
++  if (!dir.isDirectory() || dir.uid !== process.getuid() || (dir.mode & 0o077)) {
++    throw new Error('Reason Network requires a private dsh wake directory')
++  }
++  const servers = new Map()
++  function attach(agent) {
++    if (servers.has(agent) || agent.session.header.origin === 'subagent') return
++    const id = agent.session.header.id
++    const prefix = createHash('sha256').update(id).digest('hex').slice(0, 32)
++    const seen = new Set()
++    const server = createServer(socket => {
++      socket.on('error', () => socket.destroy())
++      socket.setTimeout(5000, () => socket.destroy())
++      let body = Buffer.alloc(0)
++      socket.on('data', chunk => {
++        if (body.length + chunk.length > 1024 * 1024) return socket.destroy()
++        body = Buffer.concat([body, chunk])
++        if (!body.includes(10)) return
++        socket.removeAllListeners('data')
++        try {
++          const req = JSON.parse(body.toString('utf8'))
++          if (req.session !== id || ctx.agents.get(id) !== agent || !servers.has(agent) ||
++              typeof req.text !== 'string' || typeof req.delivery !== 'string') return socket.destroy()
++          if (!seen.has(req.delivery)) {
++            agent.followup(Object.freeze({ id: randomUUID(), role: 'user', source: { kind: 'user' },
++              content: [{ type: 'text', text: req.text }] }))
++            seen.add(req.delivery)
++          }
++          socket.end('accepted\n')
++        } catch { socket.end('rejected\n') }
++      })
++    })
++    servers.set(agent, server)
++    server.on('error', e => ctx.logger.warn('Reason Network wake: ' + e.message))
++    server.listen(root + '/' + prefix + '-' + process.pid + '.sock')
++  }
++  function detach(agent) {
++    const server = servers.get(agent)
++    servers.delete(agent)
++    if (server) server.close()
++  }
++  ctx.effect(() => {
++    ctx.on('agent/created', ({agent}) => attach(agent))
++    ctx.on('agent/disposed', ({agent}) => detach(agent))
++    for (const agent of ctx.agents.list()) attach(agent)
++    return () => { for (const agent of servers.keys()) detach(agent) }
++  })
++}
+diff --git a/src/dsh_wake.rs b/src/dsh_wake.rs
+new file mode 100644
+index 0000000..e4ae3af
+--- /dev/null
++++ b/src/dsh_wake.rs
+@@ -0,0 +1,42 @@
++use std::path::PathBuf;
++
++pub fn endpoint(id: &str) -> Option<PathBuf> {
++    #[cfg(target_os = "macos")]
++    {
++        use std::os::unix::fs::{FileTypeExt, MetadataExt};
++        let uid = unsafe { libc::geteuid() };
++        let dir = PathBuf::from(format!("/tmp/reason-dsh-{uid}"));
++        let meta = dir.symlink_metadata().ok()?;
++        if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 { return None; }
++        let digest = ring::digest::digest(&ring::digest::SHA256, id.as_bytes());
++        let prefix: String = digest.as_ref()[..16].iter().map(|b| format!("{b:02x}")).collect();
++        let mut matches = std::fs::read_dir(dir).ok()?.flatten().filter_map(|entry| {
++            let name = entry.file_name();
++            let pid = name.to_str()?.strip_prefix(&prefix)?.strip_prefix('-')?.strip_suffix(".sock")?.parse().ok()?;
++            (crate::util::pid_alive(pid) && entry.file_type().ok()?.is_socket()).then(|| entry.path())
++        });
++        let path = matches.next()?;
++        matches.next().is_none().then_some(path)
++    }
++    #[cfg(not(target_os = "macos"))]
++    { let _ = id; None }
++}
++
++pub fn post(id: &str, delivery: &str, text: &str) -> anyhow::Result<()> {
++    #[cfg(unix)]
++    {
++        use std::io::{Read, Write};
++        use std::time::Duration;
++        let path = endpoint(id).ok_or_else(|| anyhow::anyhow!("dsh session endpoint unavailable or ambiguous"))?;
++        let mut stream = std::os::unix::net::UnixStream::connect(path)?;
++        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
++        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
++        writeln!(stream, "{}", serde_json::json!({"session":id,"delivery":delivery,"text":text}))?;
++        let mut reply = [0; 9];
++        stream.read_exact(&mut reply)?;
++        anyhow::ensure!(&reply == b"accepted\n", "dsh did not accept the input");
++        Ok(())
++    }
++    #[cfg(not(unix))]
++    { let _ = (id, delivery, text); anyhow::bail!("dsh native wake unavailable") }
++}
+diff --git a/src/main.rs b/src/main.rs
+index 88ee982..3123126 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -2,6 +2,7 @@ mod agent;
+ mod antigravity;
+ mod bridge;
+ mod claude;
++mod dsh_wake;
+ mod client;
+ mod codex;
+ mod config;
+@@ -274,6 +275,8 @@ enum Cmd {
+         #[arg(long)]
+         no_service: bool,
+     },
++    /// Configure the native wake adapter for installed dsh profiles
++    SetupNativeWake,
+     /// Check that everything is working
+     Doctor,
+     /// Update to the latest release (with the Reason CLI, `reason update` does it)
+@@ -690,6 +693,7 @@ async fn cli(cmd: Cmd) -> Result<()> {
+             println!("Dropped {n}.");
+         }
+         Cmd::Setup { dry_run, remove, no_service } => setup::run(dry_run, remove, no_service).await?,
++        Cmd::SetupNativeWake => setup::setup_native_wake()?,
+         Cmd::Doctor => setup::doctor().await?,
+         Cmd::Upgrade => {
+             if managed() {
+diff --git a/src/mcp.rs b/src/mcp.rs
+index 44a37fd..fa04db5 100644
+--- a/src/mcp.rs
++++ b/src/mcp.rs
+@@ -486,7 +486,13 @@ impl ReasonNetworkMcp {
+         let Event::Deliver { key, ids, text } = ev;
+         // No inbox to put it in: the daemon takes it back, and doesn't push here again until there is one. Off this
+         // task, which every push goes through: an older daemon doesn't know the request (its answer is a timeout).
+-        let Some(sock) = self.claude() else {
++        let socket = if let Some(id) = key.strip_prefix("claude-code:") {
++            // /clear can reuse the PID and socket for a different conversation.
++            crate::claude::socket_for(Some(id), None).and_then(|current| {
++                agent::claude_socket().filter(|own| own.path == current.path).map(Arc::new)
++            })
++        } else { self.claude() };
++        let Some(sock) = socket else {
+             let link = self.link.clone();
+             tokio::spawn(async move {
+                 let _ = link.call::<Value>(Request::PushFailed { key, ids }).await;
+diff --git a/src/setup.rs b/src/setup.rs
+index 407485f..5e488a9 100644
+--- a/src/setup.rs
++++ b/src/setup.rs
+@@ -758,10 +758,11 @@ fn dsh_command(exe: &Path) -> String {
+ /// (dsh gives them one minute otherwise).
+ fn dsh_block(exe: &Path) -> String {
+     let command = dsh_command(exe);
++    let plugin = dsh_command(&dsh_home().join("reason-network-wake.mjs"));
+     format!(
+         "{DSH_BEGIN}\n- insert:\n    - id: mcp-{AGENT_NAME}\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        \
+          serverName: {AGENT_NAME}\n        transport: stdio\n        command: '{command}'\n        args:\n          - mcp\n        \
+-         env:\n          REASON_NETWORK_AGENT: dsh\n        toolCallTimeoutMs: 660000\n{DSH_END}\n"
++         env:\n          REASON_NETWORK_AGENT: dsh\n        toolCallTimeoutMs: 660000\n    - id: reason-network-wake\n      name: '{plugin}'\n{DSH_END}\n"
+     )
+ }
+ 
+@@ -837,6 +838,11 @@ fn dsh_patch_text(text: &str, block: &str, remove: bool) -> Result<Option<String
+     Ok((new != text).then_some(new))
+ }
+ 
++pub fn setup_native_wake() -> Result<()> {
++    dsh(&crate::util::current_exe()?, false, false)?;
++    Ok(())
++}
++
+ fn dsh(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
+     if !dsh_home().exists() && agent::find_bin("dsh").is_none() {
+         return Ok(None);
+@@ -848,12 +854,13 @@ fn dsh(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
+         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+         Err(e) => return Err(e.into()),
+     };
+-    match dsh_patch_text(&text, &dsh_block(exe), remove) {
++    let block = dsh_block(exe);
++    match dsh_patch_text(&text, &block, remove) {
+         Ok(Some(new)) => {
+             r.lines.push(changed(&path, write_file(&path, &new, dry)?));
+             if !remove {
+                 r.notes.push(
+-                    "DeepSeek Harness reads Reason Network messages when it checks its inbox; start a new dsh session to load the MCP server."
++                    "Reload dsh to enable native wake, open the original session, then select Push in Reason Network."
+                         .into(),
+                 );
+             }
+@@ -862,6 +869,9 @@ fn dsh(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
+         // Skipped, not set up: `apply` says so, and the wizard doesn't count it among the agents it set up.
+         Err(e) => return Err(anyhow!("{}: {e:#}", crate::util::tilde(&path.display().to_string()))),
+     }
++    if !remove {
++        write_file(&dsh_home().join("reason-network-wake.mjs"), include_str!("dsh-wake.mjs"), dry)?;
++    }
+     Ok(Some(r))
+ }
+ 

@@ -15,6 +15,7 @@ struct WorkspaceChecks {
         precondition(second.id != first.id && hub.items.count == 2)
         do {
             try await verify(hub, first: first, second: second, home: home)
+            try await verifyTools(first: first, second: second, home: home)
         } catch {
             try? await leave(hub, workspace: second, storage: storage)
             throw error
@@ -22,6 +23,155 @@ struct WorkspaceChecks {
         try await leave(hub, workspace: second, storage: storage)
         precondition(hub.items.map(\.id) == [first.id])
         print("PASS: App created a workspace, switched overviews, copied scoped invites, restored selection and independent drafts, left one network")
+        hub.select(first)
+        await hub.current.refresh()
+        let directory = try require(hub.current.directory)
+        precondition(directory.managesNetwork == true)
+        precondition(directory.removableDevices(for: directory.person).allSatisfy { !$0.isMe })
+        // A removed member can still have cached history, but is no longer a recipient or management target.
+        let remote = Device(person: "guest", machine: "laptop", endpoint: "fixture-1", isMe: false, online: false, link: nil, rttMs: nil)
+        let sibling = Device(person: "guest", machine: "desktop", endpoint: "fixture-2", isMe: false, online: true, link: nil, rttMs: nil)
+        var roster = Directory(managesNetwork: true, networkID: first.id, team: first.name, person: directory.person,
+                               machine: directory.machine, sessions: [], machines: directory.machines + [remote, sibling])
+        precondition(Set(roster.removableDevices(for: "guest").map(\.endpoint)) == [remote.endpoint, sibling.endpoint])
+        roster.managesNetwork = false
+        precondition(roster.removableDevices(for: "guest").isEmpty)
+        let former = NetworkSession(address: "guest/chat", name: "chat", person: "guest", agent: "离线", status: "offline")
+        hub.current.conversations = [former]
+        hub.current.selectedPeer = former.address
+        precondition(hub.current.peers.contains(former) && !former.available && !hub.current.canSend)
+        precondition(directory.removableDevices(for: "guest").isEmpty)
+        hub.current.conversations = []
+        precondition(!hub.current.peers.contains(former))
+        print("PASS: offline device management, creator scope and history-only conversations after removal")
+        precondition(!roster.isOnlyLocalHistory(former.address, origins: [:], registered: [], listed: []))
+        precondition(!roster.isOnlyLocalHistory(former.address, origins: [former.address: [remote.endpoint]], registered: [], listed: []))
+        precondition(roster.isOnlyLocalHistory(former.address, origins: [former.address: ["departed-host"]], registered: [], listed: []))
+        precondition(directory.isOnlyLocalHistory(former.address, origins: [:], registered: [], listed: []))
+        try await verifyHistoryDeletion(home: home, network: first, other: second.id)
+        try await hub.current.leaveNetwork(first.id, dissolving: true)
+        await hub.didLeave()
+        precondition(hub.items.isEmpty && hub.archives.map(\.id) == [first.id])
+        let cached = try SQLiteStore(first.root.appendingPathComponent("local-ui/messages.sqlite3"), readOnly: true)
+        let messages = try cached.rows("SELECT body FROM network_events WHERE network=?",[first.id])
+        precondition(messages.contains { $0["body"] == first.name })
+        print("PASS: founder-only App action, self-device exclusion and archived history after dissolution")
+        await hub.refreshDepartureNotices()
+        precondition(hub.departureNotices.isEmpty, "An initiating device must not report a remote departure")
+        try await verifyDepartureNotices(home: home, first: first, second: second)
+
+
+    }
+
+    static func verifyTools(first: NetworkWorkspace, second: NetworkWorkspace, home: URL) async throws {
+        let id = UUID().uuidString.lowercased()
+        func fixture(_ name: String, _ rows: [[String: Any]]) throws {
+            let url = home.appendingPathComponent(name)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try rows.map { String(decoding: try JSONSerialization.data(withJSONObject: $0), as: UTF8.self) }
+                .joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        }
+        try fixture(".claude/projects/qa/" + id + ".jsonl", [["cwd": home.path, "customTitle": "Claude QA"]])
+        try fixture(".gemini/projects.json", [["projects": [home.path: "qa"]]])
+        try fixture(".gemini/tmp/qa/chats/session.jsonl", [["sessionId": id, "title": "Gemini QA"]])
+        try fixture(".dsh/sessions/qa/" + id + "/session.v4.jsonl", [
+            ["id": id, "cwd": home.path, "version": 4], ["type": "session/title", "data": ["title": "dsh QA"]]
+        ])
+        for ws in [first, second] {
+            let service = ReasonService(home: home, workspace: ws.id == first.id ? nil : ws.root, expectedNetwork: ws.id)
+            var senders: [LocalSession] = []
+            for (agent, title) in [("claude-code", "Claude QA"), ("gemini", "Gemini QA"), ("dsh", "dsh QA")] {
+                let key = agent + ":" + id
+                let candidates = try await service.personalSessions()
+                let candidate = try require(candidates.first { $0.id == key })
+                precondition(candidate.title == title && candidate.canJoin)
+                _ = try await service.joinPersonalSession(key)
+                let snap = try await service.snapshot(local: "", peer: "")
+                let sender = try require(snap.localSessions.first { $0.key == key })
+                precondition(sender.title == title && snap.directory.liveLocalSession(named: sender.name, agent: agent) != nil)
+                let mode = try await service.setReceiveMode(.pull, local: sender, network: ws.id)
+                precondition(mode == .pull)
+                senders.append(sender)
+            }
+            for (i, sender) in senders.enumerated() {
+                let next = senders[(i + 1) % senders.count]
+                let peer = "qa/" + next.name, from = "qa/" + sender.name
+                let text = ws.name + "/" + sender.agent
+                _ = try await service.send(network: ws.id, local: sender.name, expectedKey: sender.key, to: peer, body: text)
+                _ = try await service.snapshot(local: sender.name, peer: peer)
+                let sent = try await service.history(network: ws.id, local: sender.name, peer: peer)
+                let got = try await service.history(network: ws.id, local: next.name, peer: from)
+                precondition(sent.messages.map(\.body) == [text] && got.messages.map(\.body) == [text])
+                try await service.removeLocal(sender, network: ws.id, keepListed: true)
+                let offline = try await service.snapshot(local: sender.name, peer: peer)
+                precondition(offline.directory.liveLocalSession(named: sender.name, agent: sender.agent) == nil)
+                try await service.reconnectLocal(sender, network: ws.id)
+            }
+        }
+        print("PASS: three native tools with identical IDs, native titles, sender selection, scoped send/receive history, pull and reconnect in two workspaces")
+    }
+
+    @MainActor
+    static func verifyDepartureNotices(home: URL, first: NetworkWorkspace, second: NetworkWorkspace) async throws {
+        var keys: [String] = []
+        for (workspace, reason) in [(first, "dissolved"), (second, "removed")] {
+            let key = "departure:" + UUID().uuidString
+            keys.append(key)
+            let db = try SQLiteStore(workspace.root.appendingPathComponent("network.db"), readOnly: false)
+            let json = try JSONEncoder().encode(["network": workspace.id, "name": workspace.name, "reason": reason])
+            _ = try db.rows("INSERT INTO kv(key,value) VALUES(?,?)", [key, String(decoding: json, as: UTF8.self)])
+        }
+        let reopened = WorkspaceController(home: home)
+        await reopened.refreshDepartureNotices()
+        await reopened.refreshDepartureNotices()
+        precondition(Set(reopened.departureNotices.map(\.id)) == Set(keys))
+        precondition(reopened.departureNotices.contains { $0.reason == .removed && $0.name == second.name && $0.network == second.id })
+        precondition(reopened.departureNotices.contains { $0.reason == .dissolved && $0.name == first.name && $0.network == first.id })
+        reopened.acknowledgeDeparture(keys[0])
+        let next = WorkspaceController(home: home)
+        await next.refreshDepartureNotices()
+        precondition(next.departureNotices.map(\.id) == [keys[1]])
+        next.acknowledgeDeparture(keys[1])
+        await next.refreshDepartureNotices()
+        precondition(next.departureNotices.isEmpty)
+        print("PASS: pending remote departures retain reason and workspace across launches and acknowledgements")
+    }
+
+    static func verifyHistoryDeletion(home: URL, network: NetworkWorkspace, other: String) async throws {
+        let cache = try SQLiteStore(network.root.appendingPathComponent("local-ui/messages.sqlite3"), readOnly: false)
+        let peer = "departed/chat"
+        let now = Date().timeIntervalSince1970
+        func event(_ id: String, _ time: Double, local: String = "beta", to: String = "departed/chat") -> Message {
+            Message(id: id, at: time, local: local, peer: to, direction: "in", body: id, result: "")
+        }
+        let old = event("history-delete-old", now - 10)
+        try cache.insert(old, network: network.id)
+        try cache.insert(old, network: other)
+        try cache.insert(event(old.id, now, local: "alpha"), network: network.id)
+        try cache.insert(event("other-peer", now, to: "departed/other"), network: network.id)
+        let service = ReasonService(home: home, expectedNetwork: network.id)
+        let engine = try SQLiteStore(network.root.appendingPathComponent("network.db"), readOnly: false)
+        _ = try engine.rows("INSERT INTO workspace_sent(network,id,sender_key,sender,recipient,sent_at,body,files) VALUES(?,?,?,?,?,?,?,?)",
+                            [network.id,"engine-history","codex:test","qa/beta",peer,String(Int64(now * 1000)),"engine copy","[]"])
+        let before = try await service.snapshot(local: "beta", peer: peer)
+        precondition(before.messages.contains { $0.id == "engine-history" })
+        precondition(before.conversations.contains { $0.address == peer && $0.deletableLocalHistory })
+        do {
+            try await service.deleteLocalHistory(network: network.id, local: "alpha", peer: "qa/beta")
+            preconditionFailure("Refused deletion expected for a current member")
+        } catch is NetworkError {}
+        try await service.deleteLocalHistory(network: network.id, local: "beta", peer: peer)
+        let reopened = ReasonService(home: home, expectedNetwork: network.id)
+        try cache.reconcileEnvelope(event(old.id, now + 100), network: network.id, knowsFiles: true)
+        try cache.insertMirrored(event("late-old", now - 20), network: network.id)
+        let after = try await reopened.snapshot(local: "beta", peer: peer)
+        precondition(!after.conversations.contains { $0.address == peer } && after.messages.isEmpty)
+        let remaining = try cache.rows("SELECT id FROM network_events WHERE id IN (?,?)", [old.id, "other-peer"])
+        precondition(remaining.count == 3)
+        try cache.reconcileEnvelope(event("future-new", now + 100), network: network.id, knowsFiles: true)
+        let new = try await reopened.snapshot(local: "beta", peer: peer)
+        precondition(new.messages.map(\.id) == ["future-new"])
+        print("PASS: local history deletion validates membership, survives reopen and replay, isolates workspaces and conversations, and accepts new messages")
     }
 
     @MainActor

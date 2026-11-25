@@ -23,6 +23,7 @@ struct NetworkSession: Decodable, Identifiable, Equatable {
     var target: String?
     var clientTitle: String?
     var restriction: LocalThreadRestriction?
+    var deletableLocalHistory = false
     var overviewID: [String] { [target ?? address, machine ?? ""] }
     var offline: Bool { restriction != nil || status == "offline" }
     var available: Bool { !offline && tier != "none" }
@@ -70,6 +71,11 @@ struct Device: Decodable, Identifiable, Equatable {
     }
 }
 struct Directory: Decodable, Equatable {
+    var managesNetwork: Bool?
+    func removableDevices(for person: String) -> [Device] {
+        guard managesNetwork == true else { return [] }
+        return machines.filter { $0.person == person && !$0.isMe }.sorted { ($0.machine, $0.endpoint) < ($1.machine, $1.endpoint) }
+    }
     var networkID: String?
     let team: String?
     let person: String
@@ -77,8 +83,23 @@ struct Directory: Decodable, Equatable {
     var sessions: [NetworkSession]
     let machines: [Device]
 
+    func isOnlyLocalHistory(_ address: String, origins: [String: Set<String>], registered: Set<String>, listed: Set<String>) -> Bool {
+        let route = address.components(separatedBy: "@")
+        let base = route[0]
+        let parts = base.components(separatedBy: "/")
+        guard parts.count == 2, parts.allSatisfy({ !$0.isEmpty && $0 != "*" }), route.count <= 2,
+              !listed.contains(base), machines.contains(where: { $0.isMe }) else { return false }
+        if parts[0] == person && registered.contains(parts[1]) { return false }
+        let members = machines.filter { $0.person == parts[0] && !$0.isMe }
+        if members.isEmpty { return true }
+        if route.count == 2 { return !members.contains { $0.machine == route[1] } }
+        // A live machine may omit a paused chat. Require evidence that its known hosting devices left.
+        guard let hosts = origins[base], !hosts.isEmpty else { return false }
+        return hosts.isDisjoint(with: members.map(\.endpoint))
+    }
+
     func isRecipient(_ session: NetworkSession, sendingAs local: String) -> Bool {
-        session.person != person || (session.machine == machine && session.agent == "codex" && session.name != local)
+        session.person != person || (session.machine == machine && LocalSession.supportedAgents.contains(session.agent ?? "") && session.name != local)
     }
 
     func liveLocalSession(named name: String, agent: String) -> NetworkSession? {
@@ -106,6 +127,13 @@ struct LocalSession: Identifiable, Equatable {
     let key: String
     var doing: String?
     var historyOnly = false
+    static let supportedAgents = ["codex", "claude-code", "gemini", "dsh"]
+    static func agent(for key: String) -> String? {
+        guard let colon = key.firstIndex(of: ":"), key.index(after: colon) != key.endIndex else { return nil }
+        let agent = String(key[..<colon])
+        return supportedAgents.contains(agent) ? agent : nil
+    }
+    var agent: String { Self.agent(for: key) ?? "" }
     var hasRegistration: Bool { !key.hasPrefix("history:") }
     var restriction: LocalThreadRestriction?
     var id: String { key }

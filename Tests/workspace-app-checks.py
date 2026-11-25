@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import shutil
 import socket
 import subprocess
 import sys
@@ -16,14 +17,15 @@ with tempfile.TemporaryDirectory(prefix="rn-app-", dir="/tmp") as temp:
     root.mkdir(parents=True)
     cli = home/".local/bin/reason-network"
     cli.parent.mkdir(parents=True)
-    cli.symlink_to(binary)
+    # launchd must be able to execute the fixture outside protected project folders.
+    shutil.copy2(binary, cli)
     agents = home/"Library/LaunchAgents"
     agents.mkdir(parents=True)
-    (agents/"com.reasonmachines.network.plist").write_bytes(plistlib.dumps({"ProgramArguments":[str(binary),"daemon","--service"]}))
+    (agents/"com.reasonmachines.network.plist").write_bytes(plistlib.dumps({"ProgramArguments":[str(cli),"daemon","--service"]}))
     env = dict(HOME=temp, PATH="/usr/bin:/bin", REASON_NETWORK_HOME=str(root), REASON_NETWORK_LOCAL_PARTICIPATION="1",
                REASON_NETWORK_NO_SERVICE="1", REASON_NETWORK_NO_TRAY="1")
     codex = home/"codex-probe"
-    codex.write_text("#!/bin/sh\ntest \"$1 $2\" = 'queue --help' || exit 1\necho 'queue --thread --message --resume'\n")
+    codex.write_text("#!/bin/sh\n[ \"$1 $2\" = 'app-server daemon' ] && exit 0\ntest \"$1 $2\" = 'queue --help' || exit 1\necho 'queue --thread --message --resume'\n")
     codex.chmod(0o700)
     env["REASON_NETWORK_CODEX_BIN"] = str(codex)
     processes = []

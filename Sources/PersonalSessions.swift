@@ -32,7 +32,7 @@ struct PersonalSession: Identifiable {
         if let cwd { return URL(fileURLWithPath: cwd).lastPathComponent + " · " + shortID }
         return L10n.text("会话 ") + shortID
     }
-    let cwd: String?
+    var cwd: String?
     let updated: Date
     var project: SessionProject?
     var pinned = false
@@ -274,12 +274,16 @@ struct PersonalSessionCatalog {
         return transcript
     }
 
-    private func claude() -> [PersonalSession] {
+    func otherSessions(keys: Set<String>) -> [PersonalSession] {
+        claude(keys: keys) + otherLocalSessions(keys: keys)
+    }
+
+    private func claude(keys: Set<String>? = nil) -> [PersonalSession] {
         let root = home.appendingPathComponent(".claude/projects", isDirectory: true)
         return contents(root).flatMap { project in
             contents(project).compactMap { url in
                 let id = url.deletingPathExtension().lastPathComponent
-                guard url.pathExtension == "jsonl", UUID(uuidString: id) != nil else { return nil }
+                guard keys?.contains("claude-code:" + id) != false, url.pathExtension == "jsonl", UUID(uuidString: id) != nil else { return nil }
                 let records = metadataRecords(in: url)
                 let cwd = records.compactMap { $0["cwd"] as? String }.first
                 // A later message can repeat the generated slug after the user has renamed the chat.
@@ -293,7 +297,7 @@ struct PersonalSessionCatalog {
         }
     }
 
-    private func otherLocalSessions() -> [PersonalSession] {
+    private func otherLocalSessions(keys: Set<String>? = nil) -> [PersonalSession] {
         let dsh = home.appendingPathComponent(".dsh/sessions", isDirectory: true)
         let gemini = home.appendingPathComponent(".gemini/tmp", isDirectory: true)
         let cursor = home.appendingPathComponent(".cursor/projects", isDirectory: true)
@@ -301,23 +305,42 @@ struct PersonalSessionCatalog {
         let projects = (try? JSONDecoder().decode(GeminiProjects.self, from: Data(contentsOf: projectFile)))?.projects ?? [:]
         let pathsBySlug = Dictionary(grouping: projects.keys.filter { $0.hasPrefix("/") }) { projects[$0] ?? "" }
 
-        let deepseek = contents(dsh).compactMap { url -> PersonalSession? in
-            let id = url.lastPathComponent
-            guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return nil }
-            return PersonalSession(id: "dsh:" + id, agent: "dsh", nativeTitle: nil, cwd: nil, updated: modified(url))
+        let deepseek = contents(dsh).flatMap { project in
+            contents(project).compactMap { directory -> PersonalSession? in
+                guard (try? directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return nil }
+                let logs = contents(directory).filter {
+                    $0.lastPathComponent.range(of: #"^session(?:\.v[0-9]+)?\.jsonl(?:\.zstd)?$"#, options: .regularExpression) != nil
+                }
+                guard let log = logs.max(by: { $0.lastPathComponent.compare($1.lastPathComponent, options: .numeric) == .orderedAscending }) else { return nil }
+                let records = log.pathExtension == "zstd" ? compressedMetadata(log) : metadataRecords(in: log)
+                guard let header = records.first, let id = (header["id"] as? String)?.nonEmpty,
+                      keys?.contains("dsh:" + id) != false else { return nil }
+                let title = records.reversed().first { $0["type"] as? String == "session/title" }
+                return PersonalSession(id: "dsh:" + id, agent: "dsh", nativeTitle: (title?["data"] as? [String: Any])?["title"] as? String,
+                                       cwd: header["cwd"] as? String, updated: modified(log), nativeID: id)
+            }
         }
         let geminiChats = contents(gemini).flatMap { project in
             contents(project.appendingPathComponent("chats", isDirectory: true)).compactMap { url -> PersonalSession? in
-                guard url.pathExtension == "jsonl", let metadata = metadataRecords(in: url, includeTail: false).first,
-                      let id = metadata["sessionId"] as? String, !id.isEmpty else { return nil }
+                let metadata: [String: Any]?
+                switch url.pathExtension {
+                case "jsonl": metadata = metadataRecords(in: url, includeTail: false).first
+                case "json":
+                    guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 8 * 1024 * 1024,
+                          let data = try? Data(contentsOf: url) else { return nil }
+                    metadata = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                default: return nil
+                }
+                guard let metadata,
+                      let id = metadata["sessionId"] as? String, !id.isEmpty, keys?.contains("gemini:" + id) != false else { return nil }
                 let paths = pathsBySlug[project.lastPathComponent] ?? []
                 let cwd = paths.count == 1 ? paths.first : nil
                 return PersonalSession(id: "gemini:" + id, agent: "gemini",
-                                       nativeTitle: (metadata["title"] as? String)?.nonEmpty,
+                                       nativeTitle: (metadata["title"] as? String)?.nonEmpty ?? (metadata["summary"] as? String)?.nonEmpty,
                                        cwd: cwd, updated: modified(url), nativeID: UUID(uuidString: id) == nil ? nil : id)
             }
         }
-        let cursorChats = contents(cursor).flatMap { project in
+        let cursorChats = (keys == nil ? contents(cursor) : []).flatMap { project in
             contents(project.appendingPathComponent("agent-transcripts", isDirectory: true)).compactMap { url -> PersonalSession? in
                 let id = url.deletingPathExtension().lastPathComponent
                 guard UUID(uuidString: id) != nil else { return nil }
@@ -328,6 +351,21 @@ struct PersonalSessionCatalog {
     }
 
     private struct GeminiProjects: Decodable { let projects: [String: String] }
+
+    private func compressedMetadata(_ url: URL) -> [[String: Any]] {
+        guard let tool = ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "/usr/bin/zstd"].first(where: fm.isExecutableFile(atPath:)) else { return [] }
+        let process = Process(), pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: tool)
+        process.arguments = ["-qdc", "--", url.path]
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return [] }
+        let data = pipe.fileHandleForReading.readData(ofLength: 64 * 1024)
+        try? pipe.fileHandleForReading.close()
+        if process.isRunning { process.terminate() }
+        process.waitUntilExit()
+        return data.split(separator: 10).compactMap { (try? JSONSerialization.jsonObject(with: Data($0))) as? [String: Any] }
+    }
 
     private func metadataRecords(in url: URL, includeTail: Bool = true) -> [[String: Any]] {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
@@ -433,8 +471,8 @@ struct SessionSocket {
         throw NetworkError("服务返回的数据过大，已停止读取。")
     }
 
-    func decode<T: Decodable>(_ payload: [String: Any], as type: T.Type) throws -> T {
-        try JSONDecoder().decode(type, from: request(payload))
+    func decode<T: Decodable>(_ payload: [String: Any], as type: T.Type, timeout: Int = 5) throws -> T {
+        try JSONDecoder().decode(type, from: request(payload, timeout: timeout))
     }
 
 }

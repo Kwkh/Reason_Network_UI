@@ -34,22 +34,21 @@ struct ContentView: View {
             let sidebarLimit = min(maximumSidebarWidth, window.size.width - minimumDetailWidth - 1)
             splitView(narrowestDetail: narrowestDetail, sidebarLimit: max(185, sidebarLimit))
         }
-        .frame(minWidth: 540, minHeight: 520)
         .disabled(model.leavingNetwork)
         .overlay {
             if model.leavingNetwork {
-                ProgressView("正在退出 Network…").padding(18)
+                ProgressView(L10n.text("正在退出 Network…")).padding(18)
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
             }
         }
         .task(id: ObjectIdentifier(model)) { await model.start() }
-        .alert("接收模式未切换或未确认", isPresented: Binding(get: { model.receiveModeError != nil },
+        .alert(L10n.text("接收模式未切换或未确认"), isPresented: Binding(get: { model.receiveModeError != nil },
                                                   set: { if !$0 { model.receiveModeError = nil } })) {
-            Button("好", role: .cancel) {}
+            Button(L10n.text("好"), role: .cancel) {}
         } message: { Text(model.receiveModeError?.text ?? "") }
-        .alert("批量连接结果", isPresented: Binding(get: { model.connectionReport != nil },
+        .alert(L10n.text("批量连接结果"), isPresented: Binding(get: { model.connectionReport != nil },
                                               set: { if !$0 { model.connectionReport = nil } })) {
-            Button("好", role: .cancel) {}
+            Button(L10n.text("好"), role: .cancel) {}
         } message: { Text(model.connectionReport?.text ?? "") }
         .fileImporter(isPresented: $pickingFiles, allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
             switch result {
@@ -63,7 +62,7 @@ struct ContentView: View {
                 HStack {
                     Text(item.name).font(.headline).lineLimit(1).truncationMode(.middle)
                     Spacer()
-                    Button("完成") { preview = nil }.keyboardShortcut(.cancelAction)
+                    Button(L10n.text("完成")) { preview = nil }.keyboardShortcut(.cancelAction)
                 }
                 ScrollView {
                     Text(verbatim: item.text.text).font(.system(.body, design: .monospaced))
@@ -79,7 +78,7 @@ struct ContentView: View {
             ConversationSidebar()
                 .background(SidebarSizing())
                 .navigationSplitViewColumnWidth(min: 185, ideal: min(220, sidebarLimit), max: sidebarLimit)
-                .navigationTitle("会话")
+                .navigationTitle(L10n.text("会话"))
         } detail: {
             ZStack(alignment: .bottom) {
                 history.clipped()
@@ -158,7 +157,7 @@ struct ContentView: View {
                         .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("本机会话状态")
+                .accessibilityLabel(L10n.text("本机会话状态"))
                 .accessibilityValue(L10n.text(indicator.rawValue))
                 .help(L10n.text("当前本机会话 · ") + L10n.text(indicator.rawValue) + L10n.text("。点击查看设备状态。"))
                 .popover(isPresented: $showStatus, arrowEdge: .bottom) { StatusView().environmentObject(model) }
@@ -207,7 +206,7 @@ struct ContentView: View {
                     Image(systemName: "exclamationmark.circle")
                     Text(error.text).textSelection(.enabled).lineLimit(3)
                     Spacer()
-                    Button("重试") { Task { await model.refresh() } }
+                    Button(L10n.text("重试")) { Task { await model.refresh() } }
                 }
                 .font(.system(size: 12)).padding(12)
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
@@ -262,11 +261,11 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity)
                     HStack {
                         Menu {
-                            Button("添加文本附件…", systemImage: "paperclip") {
+                            Button(L10n.text("添加文本附件…"), systemImage: "paperclip") {
                                 pickerConversation = model.conversationKey
                                 pickingFiles = true
                             }
-                            Toggle("在对方电脑上弹窗提醒", isOn: $model.options.notify)
+                            Toggle(L10n.text("在对方电脑上弹窗提醒"), isOn: $model.options.notify)
                         } label: {
                             Image(systemName: model.options.notify ? "bell.fill" : "plus")
                                 .font(.system(size: 14, weight: .medium))
@@ -276,7 +275,7 @@ struct ContentView: View {
                         }
                         .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
                         .disabled(model.selectedLocal.isEmpty || model.selectedPeer.isEmpty)
-                        .accessibilityLabel("附件与发送选项").help("附件与发送选项")
+                        .accessibilityLabel(L10n.text("附件与发送选项")).help(L10n.text("附件与发送选项"))
                         Spacer()
                         Button { Task { await model.send() } } label: {
                             ZStack {
@@ -293,7 +292,7 @@ struct ContentView: View {
                         }
                         .buttonStyle(.plain).disabled(!model.canSend)
                         .keyboardShortcut(.return, modifiers: .command)
-                        .help("发送消息（Enter），换行（Shift＋Enter）").accessibilityLabel(model.sending ? L10n.text("发送中") : L10n.text("发送消息"))
+                        .help(L10n.text("发送消息（Enter），换行（Shift＋Enter）")).accessibilityLabel(model.sending ? L10n.text("发送中") : L10n.text("发送消息"))
                     }
                     .padding(.horizontal, 12).padding(.bottom, 9)
                 }
@@ -702,7 +701,7 @@ private struct LocalSessionChoices: View {
         choices(model.locals.filter { !$0.historyOnly })
         let history = model.locals.filter { $0.historyOnly }
         if !history.isEmpty {
-            Menu("历史会话") { choices(history) }
+            Menu(L10n.text("历史会话")) { choices(history) }
         }
     }
 }
@@ -734,6 +733,12 @@ private struct ConversationSidebar: View {
     }
     @State private var page: Page?
     @State private var settingsOpen = false
+    private struct HistoryDeletion { let network, team, local, peer, title: String }
+    @State private var historyDeletion: HistoryDeletion?
+    @State private var historyFailure: InterfaceMessage?
+    private struct DeviceRemoval { let device: Device; let network: String; let team: String }
+    @State private var removal: DeviceRemoval?
+    @State private var removeFailure: InterfaceMessage?
     @State private var confirmingLeave = false
     @State private var leaveTarget: Directory?
     @State private var leaveFailure: InterfaceMessage?
@@ -767,7 +772,7 @@ private struct ConversationSidebar: View {
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.visible)
-            .accessibilityLabel("选择本机会话")
+            .accessibilityLabel(L10n.text("选择本机会话"))
             .accessibilityValue(L10n.format("%@，%@", title, L10n.text(indicator.rawValue)))
             .help(title + "\n" + model.selectedLocal + " · " + L10n.text(indicator.rawValue))
         }
@@ -783,13 +788,18 @@ private struct ConversationSidebar: View {
         })
     }
 
+    // Person and agent groups use one and two components. The root history section uses none.
+    private var historyExpansion: Binding<Bool> { expansion([]) }
+
     private enum SidebarRow: Identifiable {
+        case historySection
         case person(String)
         case agent(person: String, name: String)
         case session(NetworkSession)
 
         var id: [String] {
             switch self {
+            case .historySection: ["historySection"]
             case .person(let person): ["person", person]
             case .agent(let person, let name): ["agent", person, name]
             case .session(let session): ["session", session.person] + session.overviewID
@@ -804,9 +814,15 @@ private struct ConversationSidebar: View {
                             session.address, session.repo ?? "", session.machine ?? ""].joined(separator: " ")
             return tokens.allSatisfy { haystack.localizedCaseInsensitiveContains(String($0)) }
         }
-        let groups = Dictionary(grouping: sessions, by: \.person)
+        let history = sessions.filter(\.deletableLocalHistory)
+        let groups = Dictionary(grouping: sessions.filter { !$0.deletableLocalHistory }, by: \.person)
         var rows: [SidebarRow] = []
-        for person in groups.keys.sorted() {
+        let members = model.directory?.machines.filter { device in
+            model.directory?.managesNetwork == true && !device.isMe && tokens.allSatisfy {
+                (device.person + " " + device.machine).localizedCaseInsensitiveContains(String($0))
+            }
+        } ?? []
+        for person in Set(groups.keys).union(members.map(\.person)).sorted() {
             rows.append(.person(person))
             guard expansion([person]).wrappedValue else { continue }
             let agents = Dictionary(grouping: groups[person] ?? []) {
@@ -817,6 +833,12 @@ private struct ConversationSidebar: View {
                 if expansion([person, name]).wrappedValue {
                     rows.append(contentsOf: (agents[name] ?? []).map(SidebarRow.session))
                 }
+            }
+        }
+        if !history.isEmpty {
+            rows.append(.historySection)
+            if historyExpansion.wrappedValue {
+                rows.append(contentsOf: history.map(SidebarRow.session))
             }
         }
         return rows
@@ -833,34 +855,34 @@ private struct ConversationSidebar: View {
             VStack(spacing: 6) {
                 HStack(spacing: 7) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                    TextField("搜索会话", text: $query).textFieldStyle(.plain)
+                    TextField(L10n.text("搜索会话"), text: $query).textFieldStyle(.plain)
                         .focused($searchFocused)
                     if !query.isEmpty {
                         Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
-                            .buttonStyle(.plain).foregroundStyle(.secondary).accessibilityLabel("清除搜索")
+                            .buttonStyle(.plain).foregroundStyle(.secondary).accessibilityLabel(L10n.text("清除搜索"))
                     }
                 }
                 .padding(.horizontal, 9).frame(height: 28)
                 .background(.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 7))
                 Button { page = .personal } label: {
-                    Label("我的会话", systemImage: "person.crop.rectangle.stack")
+                    Label(L10n.text("我的会话"), systemImage: "person.crop.rectangle.stack")
                         .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 6).contentShape(Rectangle())
                 }.buttonStyle(.plain).keyboardShortcut("5")
             }
             .padding(.horizontal, 14).padding(.bottom, 6)
             .background {
-                Button("搜索会话") { searchFocused = true }.keyboardShortcut("k").hidden()
+                Button(L10n.text("搜索会话")) { searchFocused = true }.keyboardShortcut("k").hidden()
             }
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
                     ForEach(rows) { row in
                         switch row {
-                        case .person(let person):
-                            let people = expansion([person])
-                            GroupHeading(title: person == model.directory?.person ? person + L10n.text(" · 我") : person,
-                                         icon: "person", expanded: people.wrappedValue) {
-                                people.wrappedValue.toggle()
+                        case .historySection:
+                            GroupHeading(title: L10n.text("历史会话"), icon: "clock.arrow.circlepath", expanded: historyExpansion.wrappedValue) {
+                                historyExpansion.wrappedValue.toggle()
                             }
+                        case .person(let person):
+                            personHeading(person)
                         case .agent(let person, let name):
                             let branch = expansion([person, name])
                             GroupHeading(title: NetworkSession.agentDisplayName(name), icon: "terminal", expanded: branch.wrappedValue) {
@@ -868,7 +890,14 @@ private struct ConversationSidebar: View {
                             }
                             .padding(.leading, 13)
                         case .session(let session):
-                            peerButton(session)
+                            if session.deletableLocalHistory, model.error == nil, let directory = model.directory, let network = directory.networkID {
+                                peerButton(session).contextMenu {
+                                    Button(L10n.text("删除本机聊天记录"), role: .destructive) {
+                                        historyDeletion = HistoryDeletion(network: network, team: directory.team ?? network,
+                                            local: model.selectedLocal, peer: session.address, title: session.title)
+                                    }
+                                }
+                            } else { peerButton(session) }
                         }
                     }
                 }
@@ -877,7 +906,10 @@ private struct ConversationSidebar: View {
                 .padding(.bottom, ScrollEdgeMask.depth)
             }
             .mask { ScrollEdgeMask(edge: .bottom) }
-            .accessibilityLabel("会话联系人")
+            .accessibilityLabel(L10n.text("会话联系人"))
+            .onChange(of: model.peer?.deletableLocalHistory) { _, isHistory in
+                if isHistory == true { historyExpansion.wrappedValue = true }
+            }
             .overlay(alignment: .top) {
                 if rows.isEmpty && model.directory != nil {
                     Text(terms.isEmpty ? L10n.text("暂无可查看的会话") : L10n.text("没有匹配的会话"))
@@ -898,7 +930,7 @@ private struct ConversationSidebar: View {
                             settingsOpen = false
                             page = .overview
                         } label: {
-                            Label("概览", systemImage: "square.grid.2x2")
+                            Label(L10n.text("概览"), systemImage: "square.grid.2x2")
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(6).contentShape(Rectangle())
                         }
@@ -906,7 +938,7 @@ private struct ConversationSidebar: View {
                             settingsOpen = false
                             setup.presented = true
                         } label: {
-                            Label("环境配置", systemImage: "slider.horizontal.3")
+                            Label(L10n.text("环境配置"), systemImage: "slider.horizontal.3")
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(6).contentShape(Rectangle())
                         }
@@ -916,7 +948,7 @@ private struct ConversationSidebar: View {
                             leaveTarget = model.directory
                             confirmingLeave = true
                         } label: {
-                            Label("退出当前 Network", systemImage: "rectangle.portrait.and.arrow.right")
+                            Label(L10n.text("退出当前 Network"), systemImage: "rectangle.portrait.and.arrow.right")
                                 .foregroundStyle(.red)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(6).contentShape(Rectangle())
@@ -925,16 +957,42 @@ private struct ConversationSidebar: View {
                     }
                     .buttonStyle(.plain).padding(8).frame(width: 180)
                 }
-                .accessibilityLabel("设置")
-                .help("设置")
+                .accessibilityLabel(L10n.text("设置"))
+                .help(L10n.text("设置"))
                 Spacer()
             }
             .padding(.leading, 10)
             .padding(.vertical, 5)
         }
-        .alert("退出当前 Network？", isPresented: $confirmingLeave, presenting: leaveTarget) { target in
-            Button("取消", role: .cancel) {}
-            Button("退出 Network", role: .destructive) {
+        .alert(L10n.text("删除本机聊天记录？"), isPresented: Binding(get: { historyDeletion != nil }, set: { if !$0 { historyDeletion = nil } }), presenting: historyDeletion) { target in
+            Button(L10n.text("取消"), role: .cancel) {}
+            Button(L10n.text("删除本机聊天记录"), role: .destructive) {
+                Task {
+                    do { try await model.deleteLocalHistory(network: target.network, local: target.local, peer: target.peer) }
+                    catch { historyFailure = InterfaceMessage { error.localizedDescription } }
+                }
+            }
+        } message: { target in
+            Text(L10n.format("将清除这台 Mac 的 Reason Network 中，「%@」内本机会话 %@ 与「%@」(%@) 的聊天记录。此操作无法撤销。", target.team, target.local, target.title, target.peer))
+        }
+        .alert(L10n.text("无法删除本机聊天记录"), isPresented: Binding(get: { historyFailure != nil }, set: { if !$0 { historyFailure = nil } })) {
+            Button(L10n.text("好"), role: .cancel) {}
+        } message: { Text(historyFailure?.text ?? "") }
+        .alert(L10n.text("移除设备？"), isPresented: Binding(get: { removal != nil }, set: { if !$0 { removal = nil } }), presenting: removal) { target in
+            Button(L10n.text("取消"), role: .cancel) {}
+            Button(L10n.text("移除设备"), role: .destructive) {
+                Task { do { try await model.removeDevice(target.device, network: target.network) }
+                       catch { removeFailure = InterfaceMessage { error.localizedDescription } } }
+            }
+        } message: { target in
+            Text(L10n.format("设备 %@（%@）的所有会话都将退出「%@」。邀请链接将更换。", target.device.machine, target.device.person, target.team))
+        }
+        .alert(L10n.text("无法移除设备"), isPresented: Binding(get: { removeFailure != nil }, set: { if !$0 { removeFailure = nil } })) {
+            Button(L10n.text("好"), role: .cancel) {}
+        } message: { Text(removeFailure?.text ?? "") }
+        .alert(L10n.text("退出当前 Network？"), isPresented: $confirmingLeave, presenting: leaveTarget) { target in
+            Button(L10n.text("取消"), role: .cancel) {}
+            Button(L10n.text("退出 Network"), role: .destructive) {
                 guard let id = target.networkID else { return }
                 Task {
                     do { try await model.leaveNetwork(id) }
@@ -944,8 +1002,8 @@ private struct ConversationSidebar: View {
         } message: { target in
             Text(L10n.format("这台 Mac 上的所有会话都会与「%@」断开。本机聊天记录会保留，重新加入同一个 Network 后可以继续查看。", target.team ?? L10n.text("当前 Network")))
         }
-        .alert("无法退出 Network", isPresented: Binding(get: { leaveFailure != nil }, set: { if !$0 { leaveFailure = nil } })) {
-            Button("好", role: .cancel) {}
+        .alert(L10n.text("无法退出 Network"), isPresented: Binding(get: { leaveFailure != nil }, set: { if !$0 { leaveFailure = nil } })) {
+            Button(L10n.text("好"), role: .cancel) {}
         } message: { Text(leaveFailure?.text ?? "") }
         .sheet(item: $page) { destination in
             switch destination {
@@ -956,20 +1014,49 @@ private struct ConversationSidebar: View {
             }
         }
     }
+    @ViewBuilder
+    private func personHeading(_ person: String) -> some View {
+        let expanded = expansion([person])
+        let heading = GroupHeading(title: person == model.directory?.person ? person + L10n.text(" · 我") : person,
+                                   icon: "person", expanded: expanded.wrappedValue) { expanded.wrappedValue.toggle() }
+        if let directory = model.directory, let network = directory.networkID,
+           !directory.removableDevices(for: person).isEmpty {
+            let devices = directory.removableDevices(for: person)
+            heading.contextMenu {
+                if devices.count == 1, let device = devices.first {
+                    Button(L10n.format("移除设备「%@」…", device.machine), role: .destructive) {
+                        removal = DeviceRemoval(device: device, network: network, team: directory.team ?? network)
+                    }
+                } else {
+                    Menu(L10n.text("移除设备")) {
+                        ForEach(devices) { device in
+                            let duplicate = devices.filter { $0.machine == device.machine }.count > 1
+                            let title = duplicate ? device.machine + " · " + device.endpoint.prefix(8) : device.machine
+                            Button(title + " · " + device.state, role: .destructive) {
+                                removal = DeviceRemoval(device: device, network: network, team: directory.team ?? network)
+                            }
+                        }
+                    }
+                }
+            }
+        } else { heading }
+    }
     private func peerButton(_ session: NetworkSession) -> some View {
         let selected = model.selectedPeer == session.address
         return Button { model.selectedPeer = session.address } label: {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(session.title).lineLimit(1)
-                    if session.title != session.name {
+                    if session.deletableLocalHistory {
+                        Text(session.address).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    } else if session.title != session.name {
                         Text(session.name).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     }
                 }
                 Spacer(minLength: 3)
-                if session.offline { Text(session.statusText).font(.caption2).foregroundStyle(.secondary) }
+                if session.offline && !session.deletableLocalHistory { Text(session.statusText).font(.caption2).foregroundStyle(.secondary) }
             }
-            .padding(.leading, 36).padding(.trailing, 5).padding(.vertical, 5)
+            .padding(.leading, session.deletableLocalHistory ? 18 : 36).padding(.trailing, 5).padding(.vertical, 5)
             .background(.primary.opacity(selected ? 0.10 : 0), in: RoundedRectangle(cornerRadius: 7))
             .contentShape(Rectangle())
         }.buttonStyle(.plain).help(session.titleHelp)
@@ -999,13 +1086,13 @@ private struct ConversationHistory: View {
                 .mask { ScrollEdgeMask(edge: .top) }
                 .overlay(alignment: .bottom) {
                     if pending {
-                        Button("查看最新消息", systemImage: "arrow.down") { latestRequest += 1 }
+                        Button(L10n.text("查看最新消息"), systemImage: "arrow.down") { latestRequest += 1 }
                             .buttonStyle(.bordered).padding(.bottom, overlayInset + 8)
                     }
                 }
             if messages.isEmpty && !failed {
                 Group {
-                    if waiting { ProgressView().controlSize(.small).accessibilityLabel("载入会话") }
+                    if waiting { ProgressView().controlSize(.small).accessibilityLabel(L10n.text("载入会话")) }
                     else { Text(hasPeer ? L10n.text("还没有消息") : L10n.text("选择一个会话")).font(.system(size: 14)).foregroundStyle(.secondary) }
                 }.padding(.top, 94)
             }
@@ -1538,7 +1625,7 @@ private struct ReceiveModeMenu: View {
     var body: some View {
         Menu {
             if let actual {
-                Picker("偏好接收模式", selection: Binding(get: { actual }, set: select)) {
+                Picker(L10n.text("偏好接收模式"), selection: Binding(get: { actual }, set: select)) {
                     ForEach(ReceiveMode.allCases, id: \.self) { mode in Text(mode.title).tag(mode) }
                 }
                 .pickerStyle(.inline).labelsHidden()
@@ -1558,7 +1645,7 @@ private struct ReceiveModeMenu: View {
                 .allowsHitTesting(false).accessibilityHidden(true)
         }
         .padding(.bottom, 3)
-        .accessibilityLabel("偏好接收模式").accessibilityValue(actual?.title ?? L10n.text("暂不可用"))
+        .accessibilityLabel(L10n.text("偏好接收模式")).accessibilityValue(actual?.title ?? L10n.text("暂不可用"))
         .help(actual == nil ? L10n.text("接入后可查看和切换接收模式") : L10n.text("切换当前本机会话的接收模式"))
     }
 }
@@ -1588,15 +1675,15 @@ struct StatusView: View {
             VStack(alignment: .leading, spacing: 11) {
                 HStack(spacing: 8) {
                     HStack(spacing: 14) {
-                        Text("本机会话").font(.system(size: 12))
+                        Text(L10n.text("本机会话")).font(.system(size: 12))
                         VStack(alignment: .leading, spacing: 4) {
                             Menu {
                                 LocalSessionChoices()
-                                if model.locals.isEmpty { Text("暂无已连接的本机会话") }
+                                if model.locals.isEmpty { Text(L10n.text("暂无已连接的本机会话")) }
                             } label: {
                                 Text(model.own?.title ?? model.selectedLocal.nonEmpty ?? L10n.text("选择本机会话")).font(.system(size: 13, weight: .semibold))
                             }
-                            .menuStyle(.borderlessButton).accessibilityLabel("选择本机会话")
+                            .menuStyle(.borderlessButton).accessibilityLabel(L10n.text("选择本机会话"))
                             Text((model.directory?.person ?? "") + "/" + model.selectedLocal).font(.system(size: 11, design: .monospaced)).lineLimit(2)
                         }
                     }
@@ -1674,7 +1761,7 @@ struct StatusView: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(refreshing)
-                    .help("刷新会话列表、当前对话消息和设备状态")
+                    .help(L10n.text("刷新会话列表、当前对话消息和设备状态"))
                     Spacer()
                     Text(refreshResult?.text ?? "")
                         .font(.system(size: 11))
@@ -1684,7 +1771,7 @@ struct StatusView: View {
                 .font(.system(size: 12))
                 .foregroundStyle(.primary)
                 CopyInvitationButton()
-                Button("环境配置", systemImage: "slider.horizontal.3") { setup.presented = true }
+                Button(L10n.text("环境配置"), systemImage: "slider.horizontal.3") { setup.presented = true }
                     .buttonStyle(.plain).font(.system(size: 12))
                 VStack(alignment: .leading, spacing: 4) {
                     let exitAvailable = model.own != nil && (model.own?.hasRegistration == false || exitSupported) && !model.sending && !model.leavingNetwork
@@ -1711,16 +1798,16 @@ struct StatusView: View {
                         VStack(alignment: .leading, spacing: 10) {
                             Text(model.doctor.text).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
                             if let warning = model.mirrorWarning { Text(warning.text).font(.system(size: 11)).foregroundStyle(.secondary) }
-                            Button("重新检查", systemImage: "arrow.clockwise") { Task { await model.diagnose() } }
+                            Button(L10n.text("重新检查"), systemImage: "arrow.clockwise") { Task { await model.diagnose() } }
                                 .disabled(model.diagnosing)
                         }.padding(.top, 8)
                     }
                 } label: {
                     HStack(spacing: 6) {
-                        Text("诊断")
+                        Text(L10n.text("诊断"))
                         if diagnostics && model.diagnosing {
                             ProgressView().controlSize(.mini)
-                                .accessibilityLabel("正在检查")
+                                .accessibilityLabel(L10n.text("正在检查"))
                         }
                     }
                     .frame(minHeight: 16)
@@ -1797,28 +1884,28 @@ private struct PersonalSessionsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("我的会话").font(.title2.weight(.semibold))
+                Text(L10n.text("我的会话")).font(.title2.weight(.semibold))
                 Spacer()
-                Button("完成") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button(L10n.text("完成")) { dismiss() }.keyboardShortcut(.cancelAction)
             }.padding(.horizontal, 22).padding(.top, 18)
             HStack(spacing: 12) {
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                    TextField("搜索本机会话或项目", text: $query).textFieldStyle(.plain)
+                    TextField(L10n.text("搜索本机会话或项目"), text: $query).textFieldStyle(.plain)
                 }
                 .padding(8).background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
                 Menu {
-                    Picker("工具", selection: $selectedAgent) {
-                        Text("全部工具").tag("")
+                    Picker(L10n.text("工具"), selection: $selectedAgent) {
+                        Text(L10n.text("全部工具")).tag("")
                         ForEach(agents, id: \.self) { Text(NetworkSession.agentDisplayName($0)).tag($0) }
                     }.pickerStyle(.inline).labelsHidden()
                 } label: {
                     Text(selectedAgent.nonEmpty.map(NetworkSession.agentDisplayName) ?? L10n.text("全部工具")).lineLimit(1)
-                }.menuStyle(.borderlessButton).fixedSize().accessibilityLabel("选择工具")
+                }.menuStyle(.borderlessButton).fixedSize().accessibilityLabel(L10n.text("选择工具"))
                 Button { Task { await model.refreshMySessions() } } label: {
                     Image(systemName: "arrow.clockwise")
                 }
-                .disabled(model.loadingMySessions).help("刷新本机会话").accessibilityLabel("刷新本机会话")
+                .disabled(model.loadingMySessions).help(L10n.text("刷新本机会话")).accessibilityLabel(L10n.text("刷新本机会话"))
             }
             .padding(.horizontal, 22).padding(.top, 16)
 
@@ -1879,21 +1966,21 @@ private struct PersonalSessionsView: View {
             if model.changingSession == session.id {
                 ProgressView().controlSize(.small).frame(width: 56)
             } else if session.canLeave {
-                Button("退出") { Task { await model.leaveMySession(session) } }
+                Button(L10n.text("退出")) { Task { await model.leaveMySession(session) } }
                     .disabled(model.changingSession != nil)
-                    .help("停止该会话接入 Reason Network，直到你重新加入。")
+                    .help(L10n.text("停止该会话接入 Reason Network，直到你重新加入。"))
                     .accessibilityLabel(L10n.format("退出 %@", session.title))
             } else if session.canJoin {
                 Button(joinTitle(session)) {
                     Task { await model.joinMySession(session) }
                 }
                 .disabled(model.changingSession != nil)
-                .help("将这个会话加入当前 Reason Network")
+                .help(L10n.text("将这个会话加入当前 Reason Network"))
                 .accessibilityLabel(L10n.format("加入 %@", session.title))
             } else if session.connection == .notJoined {
-                Text("在原工具打开").font(.system(size: 11)).foregroundStyle(.secondary)
+                Text(L10n.text("在原工具打开")).font(.system(size: 11)).foregroundStyle(.secondary)
             } else if case .online = session.connection, session.restriction == nil {
-                Text("需要新版后台").font(.system(size: 11)).foregroundStyle(.secondary)
+                Text(L10n.text("需要新版后台")).font(.system(size: 11)).foregroundStyle(.secondary)
             }
         }
         .padding(.vertical, 6)

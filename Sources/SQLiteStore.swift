@@ -50,6 +50,44 @@ final class SQLiteStore {
         if (code & 0xff) == SQLITE_CANTOPEN { return OpenFailure(url: url, code: code) }
         return NetworkError(String(cString: sqlite3_errmsg(db)))
     }
+    func sessionOrigins(network: String, directory: Directory) throws -> [String: Set<String>] {
+        var origins: [String: Set<String>] = [:]
+        for row in try rows("SELECT peer,endpoint FROM session_origins WHERE network=?", [network]) {
+            if let peer = row["peer"], let endpoint = row["endpoint"] { origins[peer, default: []].insert(endpoint) }
+        }
+        for session in directory.sessions {
+            for device in directory.machines where device.person == session.person && device.machine == session.machine {
+                if origins[session.address, default: []].insert(device.endpoint).inserted {
+                    _ = try rows("INSERT OR IGNORE INTO session_origins VALUES(?,?,?)", [network, session.address, device.endpoint])
+                }
+            }
+        }
+        return origins
+    }
+
+    func prepareHistoryDeletion() throws {
+        try transaction {
+            _ = try rows("CREATE TABLE IF NOT EXISTS session_origins(network TEXT,peer TEXT,endpoint TEXT,PRIMARY KEY(network,peer,endpoint))")
+            _ = try rows("CREATE TABLE IF NOT EXISTS history_clears(network TEXT,local_session TEXT,peer TEXT,through REAL NOT NULL,PRIMARY KEY(network,local_session,peer))")
+            _ = try rows("CREATE TABLE IF NOT EXISTS cleared_event_ids(network TEXT,local_session TEXT,direction TEXT,id TEXT,PRIMARY KEY(network,local_session,direction,id))")
+            // Also match the immutable event key if a later mirror changes its timestamp or routing alias.
+            let suppressed = """
+                EXISTS(SELECT 1 FROM history_clears WHERE network=NEW.network AND local_session=NEW.local_session AND peer=NEW.peer AND through>=NEW.at)
+                OR EXISTS(SELECT 1 FROM cleared_event_ids WHERE network=NEW.network AND local_session=NEW.local_session AND direction=NEW.direction AND id=NEW.id)
+                """
+            _ = try rows("CREATE TRIGGER IF NOT EXISTS skip_cleared_event BEFORE INSERT ON network_events WHEN " + suppressed + " BEGIN SELECT RAISE(IGNORE); END")
+            _ = try rows("CREATE TRIGGER IF NOT EXISTS prune_cleared_event AFTER UPDATE OF peer,at ON network_events WHEN " + suppressed + " BEGIN DELETE FROM network_events WHERE rowid=NEW.rowid; END")
+        }
+    }
+
+    func clearHistory(network: String, local: String, peer: String) throws {
+        let scope = [network, local, peer]
+        try transaction {
+            _ = try rows("INSERT INTO history_clears VALUES(?,?,?,?) ON CONFLICT(network,local_session,peer) DO UPDATE SET through=MAX(through,excluded.through)", scope + [String(Date().timeIntervalSince1970)])
+            _ = try rows("INSERT OR IGNORE INTO cleared_event_ids SELECT network,local_session,direction,id FROM network_events WHERE network=? AND local_session=? AND peer=?", scope)
+            _ = try rows("DELETE FROM network_events WHERE network=? AND local_session=? AND peer=?", scope)
+        }
+    }
     func insert(_ event: Message, network: String? = nil) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
