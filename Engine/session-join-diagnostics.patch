@@ -1,0 +1,179 @@
+diff --git a/src/bridge.rs b/src/bridge.rs
+--- a/src/bridge.rs
++++ b/src/bridge.rs
+@@ -143,7 +143,7 @@
+ 
+ async fn dispatch(link: &Arc<Link>, sessions: &Sessions, call: Call) -> Result<Value> {
+     let mut request = call.request;
+-    if let Request::Register { session } = request {
++    if let Request::Register { session, .. } = request {
+         if !call.paths.is_empty() {
+             bail!("paths are only accepted when sending a message");
+         }
+diff --git a/src/client.rs b/src/client.rs
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -95,7 +95,7 @@
+     }
+ 
+     pub async fn register(self: &Arc<Self>, reg: SessionReg) -> Result<Registered> {
+-        let r = self.call(Request::Register { session: reg.clone() }).await?;
++        let r = self.call(Request::Register { session: reg.clone(), replay: Some(false) }).await?;
+         remember(&mut self.regs.lock().unwrap(), reg);
+         Ok(r)
+     }
+@@ -144,7 +144,7 @@
+         let c = self.spawn_io(connect_or_start(self.start).await?);
+         let regs: Vec<SessionReg> = self.regs.lock().unwrap().values().cloned().collect();
+         for reg in regs {
+-            if let Err(e) = self.raw(&c, &Request::Register { session: reg.clone() }).await {
++            if let Err(e) = self.raw(&c, &Request::Register { session: reg.clone(), replay: Some(true) }).await {
+                 // Its folder was turned off meanwhile: it stays off, and the rest reconnect.
+                 if !matches!(e.to_string().as_str(), crate::config::OFF_HERE | crate::config::SESSION_PAUSED) {
+                     return Err(e);
+diff --git a/src/daemon/mod.rs b/src/daemon/mod.rs
+--- a/src/daemon/mod.rs
++++ b/src/daemon/mod.rs
+@@ -384,12 +384,23 @@
+             let (this, tx) = (self.clone(), tx.clone());
+             // Each request runs on its own task: an inbox long-poll must not block the connection.
+             let task = async move {
++                // Report membership only after the broker has tried every eligible workspace.
++                let registration = match &f.body {
++                    Request::Register { session, replay } => Some((session.key.clone(), *replay)),
++                    _ => None,
++                };
+                 let reply = match {
+                     #[cfg(unix)] { this.dispatch(conn, f.body).await }
+                     #[cfg(not(unix))] { this.handle(conn, f.body).await }
+                 } {
+                     Ok(v) => Reply::ok(f.id, v),
+-                    Err(e) => Reply::err(f.id, e),
++                    Err(e) => {
++                        let error = match registration {
++                            Some((key, replay)) if e.to_string() == crate::config::SESSION_PAUSED => this.registration_refusal(&key, replay),
++                            _ => e,
++                        };
++                        Reply::err(f.id, error)
++                    }
+                 };
+                 let _ = tx.send(serde_json::to_string(&reply).expect("reply serializes"));
+             };
+@@ -402,6 +413,25 @@
+         waits.abort_all();
+         self.drop_conn(conn);
+         writer.abort();
++    }
++
++    fn registration_refusal(&self, key: &str, replay: Option<bool>) -> anyhow::Error {
++        use crate::config::{OFF_HERE, SESSION_PAUSED};
++        let g = self.inner.lock().unwrap();
++        let paused = g.paused.contains(key);
++        // A legacy client replays successful registrations on reconnect and aborts the entire
++        // connection on an unfamiliar error. Preserve its skip reply for remembered sessions.
++        if replay == Some(true) || replay.is_none() && (paused || g.store.session_by_key(key).ok().flatten().is_some()) {
++            return anyhow!(OFF_HERE);
++        }
++        drop(g);
++        let state = if paused { SESSION_PAUSED } else { "This conversation has not joined a Network here" };
++        let mut msg = format!("{state}. If the user asks to join, call join_network without arguments to list Networks, then with the chosen network ID.");
++        if let Ok(exe) = util::current_exe() {
++            let command = crate::setup::shell_cmd(&exe, "join-session");
++            msg.push_str(&format!(" If join_network is unavailable, run {command} in this conversation's shell to list Networks, then repeat that command with --network and the selected ID."));
++        }
++        anyhow!("{msg} Only this conversation is affected. Leave folder settings as they are.")
+     }
+ 
+     async fn handle(self: &Arc<Self>, conn: u64, req: Request) -> Result<Value> {
+@@ -437,7 +467,7 @@
+             Request::SessionParticipation => {
+                 let g = self.inner.lock().unwrap();
+                 let pending: Vec<_> = g.live.iter().filter(|(_, l)| l.codex_resume_pending).map(|(key, _)| key).collect();
+-                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true, "workspaces": true, "agent_session_join": true, "harness_presence": cfg!(target_os = "macos"), "native_titles": true, "native_agent_wake": true, "multi_agent_sessions": true, "departure_notices": true, "admin_network": g.team.as_ref().filter(|t| t.founder == self.key.public()).map(|t| &t.id),
++                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true, "workspaces": true, "agent_session_join": true, "session_join_diagnostics": true, "harness_presence": cfg!(target_os = "macos"), "native_titles": true, "native_agent_wake": true, "multi_agent_sessions": true, "departure_notices": true, "admin_network": g.team.as_ref().filter(|t| t.founder == self.key.public()).map(|t| &t.id),
+                         "resume_pending": pending })
+             }
+             Request::SetReceiveMode { key, network, mode } => {
+@@ -447,13 +477,9 @@
+                 self.set_session_participation(&key, paused)?;
+                 json!({ "paused": paused })
+             }
+-            Request::Register { session } => {
++            Request::Register { session, .. } => {
+                 let git = self.git(&session.cwd).await;
+-                // Stock MCP clients skip this single registration only for their known opt-out reply.
+-                let registered = self.register(Some(conn), session, git).map_err(|error| {
+-                    if error.to_string() == crate::config::SESSION_PAUSED { anyhow!(crate::config::OFF_HERE) } else { error }
+-                })?;
+-                json!(registered)
++                json!(self.register(Some(conn), session, git)?)
+             }
+             Request::SetStatus { key, doing, name } => json!(self.set_status(&key, doing, name)?),
+             Request::Who { me, filter, all } => json!(self.who(me, filter, all).await?),
+diff --git a/src/daemon/sessions.rs b/src/daemon/sessions.rs
+--- a/src/daemon/sessions.rs
++++ b/src/daemon/sessions.rs
+@@ -193,6 +193,9 @@
+         let mut g = self.inner.lock().unwrap();
+         let g = &mut *g;
+         let key = reg.key.clone();
++        // Shared MCP hosts can report a different cwd from the native conversation's hook.
++        // Pausing also inserts an off entry; that case must use the participation rules below.
++        if g.off.contains_key(&key) && !g.paused.contains(&key) { bail!(OFF_HERE); }
+         // An explicitly joined mailbox remains addressable through the broker even in pull mode.
+         let manual = crate::paths::managed_workspace() || agent::workspace_agent(&reg.agent) && key.starts_with(&format!("{}:", reg.agent)) && g.store.get("manual-network")?.is_some();
+         if let Some(network) = join_network {
+@@ -210,10 +213,6 @@
+             if !allowed {
+                 bail!("Antigravity App binding is unavailable or includes a disabled workspace");
+             }
+-        }
+-        // Its hooks said its folder is off (an MCP server several sessions share can't know its folder).
+-        if g.off.contains_key(&key) && !(join_network.is_some() && g.paused.contains(&key)) {
+-            bail!(OFF_HERE);
+         }
+         // An agent with an MCP server per session is in one conversation at a time: the one its server registers now
+         // ends any other it served (Claude Code's `/clear`, which runs no new server). Also when the new one is known
+diff --git a/src/daemon/workspaces.rs b/src/daemon/workspaces.rs
+--- a/src/daemon/workspaces.rs
++++ b/src/daemon/workspaces.rs
+@@ -163,7 +163,7 @@
+             | Request::Inbox { key, .. }
+             | Request::Unread { key }
+             | Request::Delivered { key, .. } => key.clone(),
+-            Request::Register { session } => session.key.clone(),
++            Request::Register { session, .. } => session.key.clone(),
+             _ => return self.handle(conn, req).await,
+         };
+         if !key.split_once(':').is_some_and(|(agent, id)| crate::agent::workspace_agent(agent) && !id.is_empty()) {
+@@ -218,7 +218,7 @@
+         }
+         let here = self.inner.lock().unwrap().live.contains_key(&key) && local.is_some();
+         match &req {
+-            Request::Register { session } => {
++            Request::Register { session, .. } => {
+                 let folder_allowed = !self.cfg.off_in(&session.cwd);
+                 let mut secondary_registered = session.agent == "codex";
+                 if folder_allowed && session.agent != "codex"
+@@ -230,7 +230,7 @@
+                 }
+                 let registered = self.handle(conn, req).await;
+                 match registered {
+-                    Err(e) if matches!(e.to_string().as_str(), crate::config::OFF_HERE | crate::config::SESSION_PAUSED) && folder_allowed && secondary_registered => {
++                    Err(e) if e.to_string() == crate::config::SESSION_PAUSED && folder_allowed && secondary_registered => {
+                         Ok(json!({"address":"","name":"","unread":0}))
+                     }
+                     other => other,
+diff --git a/src/proto.rs b/src/proto.rs
+--- a/src/proto.rs
++++ b/src/proto.rs
+@@ -108,6 +108,9 @@
+     },
+     Register {
+         session: SessionReg,
++        /// Absent on older clients, which recognize only OFF_HERE when replaying registrations.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        replay: Option<bool>,
+     },
+     SetStatus {
+         key: String,

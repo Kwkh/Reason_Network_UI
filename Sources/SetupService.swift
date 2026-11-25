@@ -175,9 +175,12 @@ actor SetupService: SetupServicing {
     static let engineVersion = "0.12.17"
     private let home: URL
     private let installer: ParticipationInstaller
-    init(home: URL = FileManager.default.homeDirectoryForCurrentUser, installer: ParticipationInstaller? = nil) {
+    private let setupHelper: URL
+    init(home: URL = FileManager.default.homeDirectoryForCurrentUser, installer: ParticipationInstaller? = nil, setupHelper: URL? = nil) {
         self.home = home
-        self.installer = installer ?? ParticipationInstaller(home: home)
+        let installer = installer ?? ParticipationInstaller(home: home)
+        self.installer = installer
+        self.setupHelper = setupHelper ?? installer.binary
     }
 
     func inspect() async -> SetupSnapshot {
@@ -228,10 +231,11 @@ actor SetupService: SetupServicing {
     func configure() async throws {
         guard let executable = NetworkPaths.executable(home: home) else { throw NetworkError("请先安装内置后台。") }
         try await installer.validate(cli: executable)
-        let arguments = installer.configured ? ["setup", "--no-service"] : ["setup"]
-        _ = try await SetupCommand.run(executable, arguments, home: home, timeout: 90).checked()
+        let arguments = ["setup-app-agents", "--cli", executable.path] + (installer.configured ? ["--no-service"] : [])
+        _ = try await SetupCommand.run(setupHelper, arguments, home: home, timeout: 90).checked()
         try await installer.activate()
         if let backend = NetworkPaths.workspaceExecutable(home: home) {
+            _ = try await SetupCommand.run(installer.binary, ["setup-agent-join", "--backend", backend.path], home: home).checked()
             try await DshWakeSetup.shared.configure(home: home, helper: installer.binary, backend: backend)
         }
         let result = await inspect()

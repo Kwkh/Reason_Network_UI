@@ -7,7 +7,7 @@
 
 兼容后台会核对本机原生 Codex 线程。已归档、缺失或暂时无法核实的线程会从在线目录移除，并停止接受新投递和唤醒。恢复同一线程后，后台会按实际连接状态重新公布。App 保留已缓存的 Network 聊天和本次打开期间的草稿。
 
-在侧栏设置的「概览」中点击网络名称，可以切换、新建或通过完整邀请链接加入 Network。进入目标 Network 后，在「我的会话」中选择要接入的 Codex、Claude Code、Gemini CLI 或 dsh 对话。同一对话可以在几个 Network 中接入。切换界面时，各 Network 的后台继续运行。
+在侧栏设置的「概览」中点击网络名称，可以切换、新建或通过完整邀请链接加入 Network。进入目标 Network 后，在「我的会话」中选择要接入的 Codex、Claude Code、Gemini CLI 或 dsh 对话。也可以在原工具中说「把当前对话加入 Ken 的网络」。agent 通过 `join_network` 选择本机已有的 Network；同名时用 Network ID 区分。dsh 的共享连接缺少当前对话身份时，由 agent 在该对话自己的 Shell 中调用内置后台的 `join-session --network <ID>`。同一对话可以在几个 Network 中接入。切换界面时，各 Network 的后台继续运行。
 
 第一个工作区沿用原数据目录。额外的工作区在 `~/.reason/workspaces/` 下各有自己的数据库、收件箱、聊天缓存和登录服务。Codex 的 MCP 与 hooks 继续连接默认后台。它按消息携带的 Network ID 投递回复，跨网重复的联系人地址需要指定 Network。一个 Codex 线程仍共享自己的模型上下文。
 

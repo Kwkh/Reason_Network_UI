@@ -55,7 +55,7 @@ esac
         let installer = ParticipationInstaller(home: home, binary: embedded, launchctl: launchctl, probe: {
             FileManager.default.fileExists(atPath: $0.appendingPathComponent("running").path)
         })
-        let service = SetupService(home: home, installer: installer)
+        let service = SetupService(home: home, installer: installer, setupHelper: home.appendingPathComponent(".local/bin/reason-network"))
         let empty = await service.inspect()
         try expect(!empty.installed && !empty.joined, "missing dependencies detected without creating configuration")
         try expect(!fm.fileExists(atPath: home.appendingPathComponent(".reason").path), "inspection of empty machine writes no state")
@@ -73,7 +73,8 @@ cmd=sys.argv[1]
 if cmd=='--version': print('reason-network 0.12.17')
 elif cmd=='who':
  print(json.dumps({'team':'Fixture' if (h/'joined').exists() else None,'person':'fixture','machine':'test','sessions':[],'machines':[]}))
-elif cmd=='setup':
+elif cmd=='setup-app-agents':
+ assert sys.argv[2:4] == ['--cli', sys.argv[0]]
  (h/'setup-args.json').write_text(json.dumps(sys.argv[2:]))
  (h/'.dsh').mkdir(exist_ok=True)
  folder=h/'Library/LaunchAgents';folder.mkdir(parents=True,exist_ok=True)
@@ -137,7 +138,7 @@ else:
         try await service.configure()
         try expect(try Data(contentsOf: log) == before, "repair does not restart healthy daemon")
         let setupArguments = try JSONDecoder().decode([String].self, from: Data(contentsOf: home.appendingPathComponent("setup-args.json")))
-        try expect(setupArguments == ["--no-service"] && (try Data(contentsOf: plist)) == data, "repair retains participation daemon")
+        try expect(setupArguments == ["--cli", executable.path, "--no-service"] && (try Data(contentsOf: plist)) == data, "repair retains participation daemon")
         try await service.join(invitation: token, name: "fixture")
         let ready = await service.inspect()
         try expect(ready.ready, "complete configuration ready")

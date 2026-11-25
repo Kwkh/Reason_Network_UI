@@ -9,7 +9,7 @@ struct ParticipationInstaller: Sendable {
     var launchctl = URL(fileURLWithPath: "/bin/launchctl")
     var probe: @Sendable (URL) -> Bool = { home in
         guard let executable = NetworkPaths.workspaceExecutable(home: home) else { return false }
-        return capabilities(at: home, onlyFrom: executable)?["harness_presence"] as? Bool == true
+        return capabilities(at: home, onlyFrom: executable)?["agent_join_setup"] as? Bool == true
     }
 
     static func capabilities(at home: URL, onlyFrom executable: URL? = nil) -> [String: Any]? {
@@ -123,7 +123,7 @@ struct ParticipationInstaller: Sendable {
             if isPrimary, configured && probe(home) { return }
             if !isPrimary, let data = try? socket.request(["op": "session_participation"], timeout: 1, onlyFrom: daemon),
                let capabilities = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               capabilities["harness_presence"] as? Bool == true { return }
+               capabilities["agent_join_setup"] as? Bool == true { return }
         }
         updated["ProgramArguments"] = [daemon.path, "daemon", "--service"]
         var env = updated["EnvironmentVariables"] as? [String: String] ?? [:]

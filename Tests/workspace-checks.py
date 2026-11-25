@@ -67,6 +67,119 @@ def mcp_directory(home, root, agent, native_id):
         finally:
             proc.terminate()
 
+
+def check_agent_join(home, a, b, team_a, team_b):
+    def member(root, key):
+        with sqlite3.connect(root/"network.db") as db:
+            row = db.execute("SELECT value FROM kv WHERE key=?", ("workspace-member:"+key,)).fetchone()
+            return row[0] if row else None
+
+    blocked_folder = str(home / "blocked")
+    legacy = dict(agent="codex", key="codex:legacy-new", cwd=str(home), tier="pull")
+    def refused(root, registration, **fields):
+        res = request(root, "register", session=registration, **fields)
+        assert not res["ok"], res
+        return res["error"]
+    hint = refused(a, legacy)
+    assert "has not joined" in hint and str(binary) in hint and "join-session" in hint, hint
+    folder_error = "Your user turned Reason Network off for this folder"
+    assert refused(a, dict(legacy, cwd=blocked_folder), replay=False) == folder_error
+    # A shared MCP host may report the allowed parent while its native hook knows the real cwd.
+    request(a, "hook", agent="codex", session_id="blocked-by-hook", event="start", cwd=blocked_folder, mail=False)
+    assert refused(a, dict(legacy, key="codex:blocked-by-hook"), replay=False) == folder_error
+    session = dict(legacy, agent_session_id="legacy-new", cwd=blocked_folder)
+    for team in (team_a, team_b):
+        blocked = request(a, "join_current_session", network=team, session=session)
+        assert not blocked["ok"] and blocked["error"] == folder_error, blocked
+    assert refused(a, legacy, replay=True) == folder_error
+    assert not member(a, legacy["key"]) and not member(b, legacy["key"])
+
+    for agent in ("codex", "claude-code", "gemini", "dsh"):
+        ident = "agent-request-" + agent
+        key = agent + ":" + ident
+        env = dict(HOME=str(home), PATH="/usr/bin:/bin", REASON_NETWORK_HOME=str(a),
+                   REASON_NETWORK_AGENT=agent, REASON_NETWORK_NO_SERVICE="1", REASON_NETWORK_NO_TRAY="1")
+        with subprocess.Popen([binary, "mcp"], env=env, cwd=home, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0) as proc:
+            def rpc(method, params, number=1):
+                frame = dict(jsonrpc="2.0", method=method, params=params)
+                if number is not None: frame["id"] = number
+                proc.stdin.write(json.dumps(frame).encode()+b"\n")
+                if number is None: return
+                while select.select([proc.stdout], [], [], 12)[0]:
+                    response = json.loads(proc.stdout.readline())
+                    if response.get("id") == number: return response
+                raise TimeoutError(method)
+            def join(args, meta=None):
+                params = dict(name="join_network", arguments=args)
+                if meta is not None: params["_meta"] = meta
+                resp = rpc("tools/call", params)
+                if "error" in resp: return None
+                result = resp["result"]
+                if result.get("isError"): return None
+                return json.loads(result["content"][0]["text"])
+            try:
+                rpc("initialize", dict(protocolVersion="2025-11-25", capabilities={}, clientInfo=dict(name=agent,version="1")))
+                rpc("notifications/initialized", {}, None)
+                assert "join_network" in [t["name"] for t in rpc("tools/list",{})["result"]["tools"]]
+                if agent == "codex":
+                    status = rpc("tools/call", dict(name="list_team", arguments={}, _meta={"sessionId":ident}))["result"]
+                    assert status.get("isError"), status
+                    message = status["content"][0]["text"]
+                    assert "has not joined" in message and "join_network" in message and str(binary) in message, message
+                choices = join({})
+                assert {r["id"] for r in choices} == {team_a, team_b}
+                assert join({"network":"missing"}, {"sessionId":ident}) is None
+                assert join({"network":"Blue","session_id":"another-chat"}, {"sessionId":ident}) is None
+                assert join({"network":"Blue"}) is None
+                assert not member(a,key) and not member(b,key)
+                result = join({"network":"Blue"}, {"sessionId":ident})
+                assert result["network_id"] == team_b and result["address"].startswith("qa/") and isinstance(result["online"],bool)
+                assert not member(a,key) and member(b,key) == team_b
+                assert join({"network":team_b}, {"sessionId":ident})["address"] == result["address"]
+                call(b,"set_session_participation",key=key,paused=True)
+                registration = dict(agent=agent, key=key, agent_session_id=ident, cwd=str(home), tier="pull")
+                assert "disconnected" in refused(b, registration, replay=False)
+                assert refused(b, registration) == folder_error
+                assert join({"network":team_b}, {"sessionId":ident})["address"] == result["address"]
+                assert key not in call(b,"session_participation")["paused"]
+                assert join({"network":team_a}, {"sessionId":ident})["network_id"] == team_a
+                assert member(a,key) == team_a and member(b,key) == team_b
+                if agent == "codex":
+                    # A cached tools/list can still reach this command from the original shell.
+                    shell_env = dict(env, CODEX_THREAD_ID="shell-only")
+                    query = dict(name="list_team", arguments={}, _meta={"sessionId":"shell-only"})
+                    first = rpc("tools/call", query)["result"]
+                    assert first.get("isError") and "join-session" in first["content"][0]["text"]
+                    cli = [str(binary), "join-session"]
+                    choices = json.loads(subprocess.check_output(cli, env=shell_env, cwd=home))
+                    assert {r["id"] for r in choices} == {team_a, team_b}
+                    assert not member(a, "codex:shell-only") and not member(b, "codex:shell-only")
+                    joined = json.loads(subprocess.check_output(cli + ["--network",team_b], env=shell_env, cwd=home))
+                    assert joined["network_id"] == team_b and member(b, "codex:shell-only") == team_b
+                    assert not member(a, "codex:shell-only") and not member(b, legacy["key"])
+                    directory = rpc("tools/call", query)["result"]
+                    assert not directory.get("isError"), directory
+                if agent == "dsh":
+                    shell_id = "shell-dsh"
+                    before = subprocess.run([binary,"join-session","--network",team_b],env=env,cwd=home,capture_output=True)
+                    assert before.returncode and not member(b,"dsh:"+shell_id)
+                    env["DSH_SESSION_ID"] = shell_id
+                    result = json.loads(subprocess.check_output([binary,"join-session","--network",team_b],env=env,cwd=home))
+                    assert result["network_id"] == team_b and member(b,"dsh:"+shell_id) == team_b
+                    assert not member(a,"dsh:"+shell_id)
+                if agent == "gemini":
+                    # Even a previously unjoined session's hook identifies its owner without granting participation.
+                    sid = "gemini-from-hook"
+                    request(a,"hook",agent=agent,event="start",session_id=sid,pid=os.getpid(),cwd=str(home),mail=False)
+                    assert not member(b,agent+":"+sid)
+                    assert join({"network":team_b})["network_id"] == team_b
+                    assert member(b,agent+":"+sid) == team_b
+            finally:
+                proc.stdin.close()
+                if proc.poll() is None: proc.terminate()
+    print("PASS: four real MCP clients self-join only the chosen workspace, preserve address on retry and rejoin, reject unidentified calls, and support the dsh shell")
+
 with tempfile.TemporaryDirectory(prefix="rn-ws-", dir="/tmp") as temp:
     home = Path(temp)
     a = home / ".reason/network"
@@ -103,12 +216,31 @@ with tempfile.TemporaryDirectory(prefix="rn-ws-", dir="/tmp") as temp:
         return request(a,"send",**{"from":"codex:"+sender,"to":to,"body":body,"wake":False},**kwargs)
 
     try:
+        a.mkdir(parents=True, exist_ok=True)
+        (a/"config.toml").write_text(f'[folders]\n{json.dumps(str(home / "blocked"))} = "off"\n')
         team_a = create(a,"Orange")
         for name in ["alpha","beta"]:
             hook(a,name)
         call(a,"enable_workspaces")
         team_b = create(b,"Blue")
         assert team_a != team_b
+        check_agent_join(home, a, b, team_a, team_b)
+        # Simulate two previously joined Networks with the same display name. No worker for
+        # the duplicate is needed: the broker must disambiguate before dispatching anything.
+        with tempfile.TemporaryDirectory(dir=b.parent) as shadow:
+            with sqlite3.connect(Path(shadow)/"network.db") as clone, sqlite3.connect(b/"network.db") as source:
+                clone.execute("CREATE TABLE kv(key TEXT PRIMARY KEY,value TEXT)")
+                team = json.loads(source.execute("SELECT value FROM kv WHERE key='team'").fetchone()[0])
+                team["id"] = "shadow-workspace"
+                clone.execute("INSERT INTO kv VALUES('team',?)", (json.dumps(team),))
+            candidate = dict(agent="codex",agent_session_id="ambiguous-target",key="codex:ambiguous-target",cwd=temp,tier="pull")
+            refused = request(a,"join_current_session",network="Blue",session=candidate)
+            assert not refused["ok"] and "unique ID" in refused["error"]
+            with sqlite3.connect(b/"network.db") as db:
+                assert not db.execute("SELECT 1 FROM kv WHERE key='workspace-member:codex:ambiguous-target'").fetchone()
+            assert call(a,"join_current_session",network=team_b,session=candidate)["network_id"] == team_b
+        print("PASS: duplicate Network names require a unique target ID before membership changes")
+
         assert not request(b,"hook",agent="codex",event="stop", pid=os.getpid(),session_id="gamma",cwd=temp,mail=False)["ok"]
         assert not request(a,"hook",agent="codex",event="stop", pid=os.getpid(),session_id="gamma",cwd=temp,mail=False)["ok"]
         for name in ["alpha","beta"]:
@@ -284,6 +416,40 @@ with tempfile.TemporaryDirectory(prefix="rn-ws-", dir="/tmp") as temp:
             assert db.execute("SELECT COUNT(*) FROM workspace_sent WHERE network=?",(team_b,)).fetchone()[0] == history_count
         assert send(team_a+"::qa/beta","after other network dissolved")["ok"]
         print("PASS: dissolution is scoped, persists across restart, and preserves history")
+        cfg = home/".codex/config.toml"
+        cfg.parent.mkdir(exist_ok=True)
+        old = home/".local/bin/reason-network"
+        cfg.write_text('[mcp_servers.reason-network]\ncommand = '+json.dumps(str(old))+'\nargs = ["mcp"]\ntool_timeout_sec = 123\n')
+        old.parent.mkdir(parents=True, exist_ok=True)
+        old.touch()
+        env = dict(HOME=temp,PATH="/usr/bin:/bin",REASON_NETWORK_HOME=str(a),REASON_NETWORK_NO_SERVICE="1")
+        # Exercise the same setup plus migration sequence the App uses on old installations.
+        cfg.write_text(cfg.read_text()+'default_tools_approval_mode = "prompt"\nenv = { CUSTOM = "keep" }\n')
+        subprocess.run([binary,"setup-app-agents","--cli",old,"--no-service"],env=env,check=True,capture_output=True)
+        assert 'default_tools_approval_mode = "prompt"' in cfg.read_text() and 'CUSTOM = "keep"' in cfg.read_text()
+        previous = home/"Library/Application Support/Reason Network UI/Backend/1234567890abcdef/reason-network"
+        claude = home/".claude.json"
+        generic = {"args":["mcp"],"env":{"EXAMPLE":"keep"}}
+        claude.write_text(json.dumps({"keep":True,"mcpServers":{"reason-network": dict(command=str(previous),**generic)}}))
+        gemini = home/".gemini/settings.json"
+        gemini.parent.mkdir(exist_ok=True)
+        custom = json.dumps({"mcpServers":{"reason-network":dict(command="/custom/agent-launcher",**generic)}})
+        gemini.write_text(custom)
+        env = dict(HOME=temp,PATH="/usr/bin:/bin",REASON_NETWORK_HOME=str(a),REASON_NETWORK_NO_SERVICE="1")
+        setup = [binary,"setup-agent-join","--backend",binary]
+        subprocess.run(setup,env=env,check=True)
+        assert str(binary) in cfg.read_text() and "tool_timeout_sec = 123" in cfg.read_text()
+        assert json.loads(claude.read_text())=={"keep":True,"mcpServers":{"reason-network":dict(command=str(binary),**generic)}}
+        before = cfg.read_bytes(), claude.read_bytes()
+        subprocess.run(setup,env=env,check=True)
+        assert before == (cfg.read_bytes(),claude.read_bytes()) and gemini.read_text()==custom
+        cfg.write_text('[mcp_servers.reason-network]\ncommand = "/custom/launcher"\nargs = ["run"]\n')
+        custom_cfg = cfg.read_bytes()
+        subprocess.run([binary,"setup-app-agents","--cli",old,"--no-service"],env=env,check=True,capture_output=True)
+        subprocess.run(setup,env=env,check=True)
+        assert cfg.read_bytes() == custom_cfg
+        print("PASS: managed MCP commands upgrade without replacing client settings or custom launchers")
+
     finally:
         for proc in procs:
             if proc.poll() is None:
