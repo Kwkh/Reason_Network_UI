@@ -163,11 +163,19 @@ actor ReasonService {
         // Older dsh desktop clients registered their MCP host as a separate local peer.
         // Use registration keys so a real conversation may still be named "desktop-dsh".
         let processNames = Set(try engine.rows("SELECT name FROM sessions WHERE agent='dsh' AND key LIKE 'proc:%' EXCEPT SELECT name FROM sessions WHERE agent!='dsh' OR key NOT LIKE 'proc:%'").compactMap { $0["name"] })
+        let clearedSenders = try cache.rows("""
+            SELECT local_session,native_key FROM sender_history_clears c WHERE network=? AND NOT EXISTS
+            (SELECT 1 FROM network_events e WHERE e.network=c.network AND e.local_session=c.local_session)
+            """, [network])
+        let removed = Set(locals.filter { session in
+            session.canDeleteHistory && clearedSenders.contains { $0["local_session"] == session.name && $0["native_key"] == session.key }
+        }.map(\.name))
+        locals.removeAll { removed.contains($0.name) }
         let hiddenNames = pausedNames.subtracting(disconnectedNames).union(hiddenHistory.subtracting(registeredNames)).union(processNames)
         directory.sessions.removeAll {
             $0.person == directory.person && $0.machine == directory.machine && LocalSession.supportedAgents.contains($0.agent ?? "") && (hiddenNames.contains($0.name) || disconnectedNames.contains($0.name))
         }
-        let knownNames = Set(locals.map(\.name)).union(hiddenNames)
+        let knownNames = Set(locals.map(\.name)).union(hiddenNames).union(removed)
         for row in try cache.rows("SELECT DISTINCT local_session FROM network_events WHERE network=? ORDER BY local_session", [network]) {
             if let name = row["local_session"], !knownNames.contains(name) {
                 let key = registrations.first { $0["name"] == name }?["key"] ?? "history:" + name
@@ -205,6 +213,12 @@ actor ReasonService {
                                   clientTitle: (person == directory.person ? locals.first { $0.name == name }?.doing ?? localTitlesByName[name] : nil) ?? remembered?.title,
                                   restriction: person == directory.person ? restrictions[name] : nil)
             history.deletableLocalHistory = !unverifiedPeople.contains(person) && directory.isOnlyLocalHistory(address, origins: origins, registered: registered, listed: protectedAddresses)
+            if person == directory.person, restrictions[name] == .missing,
+               let key = registrations.first(where: { $0["name"] == name })?["key"],
+               !directory.machines.contains(where: { !$0.isMe && $0.person == person }) {
+                history.deletableLocalHistory = true
+                history.deletedPeerKey = key
+            }
             return history
         }
         let page: MessagePage
@@ -227,11 +241,19 @@ actor ReasonService {
         let presence: Presence
     }
 
-    func deleteLocalHistory(network: String, local: String, peer: String) throws {
+    func deleteSenderHistory(network: String, sender: LocalSession) throws {
+        let state = try snapshot(local: sender.name, peer: "")
+        guard state.directory.networkID == network, state.localSessions.contains(where: {
+            $0.name == sender.name && $0.key == sender.key && $0.canDeleteHistory
+        }) else { throw NetworkError("会话状态已变化，请刷新后重试。") }
+        try store().clearSenderHistory(network: network, sender: sender)
+    }
+
+    func deleteLocalHistory(network: String, local: String, peer: String, deletedPeerKey: String? = nil) throws {
         // Refresh immediately before committing. A peer may have rejoined while the alert was open.
         let state = try snapshot(local: local, peer: peer)
         guard state.directory.networkID == network,
-              state.conversations.contains(where: { $0.address == peer && $0.deletableLocalHistory }) else {
+              state.conversations.contains(where: { $0.address == peer && $0.deletableLocalHistory && $0.deletedPeerKey == deletedPeerKey }) else {
             throw NetworkError("会话状态已变化，请刷新后重试。")
         }
         try store().clearHistory(network: network, local: local, peer: peer)

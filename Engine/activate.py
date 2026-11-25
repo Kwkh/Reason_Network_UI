@@ -112,7 +112,7 @@ def activate(plist, candidate, root, state, primary):
                         pid, = struct.unpack("i", sock.getsockopt(0, 2, struct.calcsize("i")))
                         process = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "comm="], capture_output=True, text=True)
                         peer = Path(process.stdout.strip()).resolve() if process.returncode == 0 else None
-                        if peer == candidate and reply.get("ok") and reply["result"].get("agent_join_setup"):
+                        if peer == candidate and reply.get("ok") and reply["result"].get("compact_reply_addresses"):
                             print(plist.stem, "is running", candidate.name)
                             return
                         if not handed_off and peer in cli_paths:

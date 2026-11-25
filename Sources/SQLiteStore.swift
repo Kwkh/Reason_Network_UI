@@ -82,6 +82,12 @@ final class SQLiteStore {
             _ = try rows("CREATE TABLE IF NOT EXISTS session_origins(network TEXT,peer TEXT,endpoint TEXT,PRIMARY KEY(network,peer,endpoint))")
             _ = try rows("CREATE TABLE IF NOT EXISTS history_clears(network TEXT,local_session TEXT,peer TEXT,through REAL NOT NULL,PRIMARY KEY(network,local_session,peer))")
             _ = try rows("CREATE TABLE IF NOT EXISTS cleared_event_ids(network TEXT,local_session TEXT,direction TEXT,id TEXT,PRIMARY KEY(network,local_session,direction,id))")
+            _ = try rows("CREATE TABLE IF NOT EXISTS sender_history_clears(network TEXT,local_session TEXT,native_key TEXT,through REAL NOT NULL,PRIMARY KEY(network,local_session,native_key))")
+            _ = try rows("""
+                CREATE TRIGGER IF NOT EXISTS skip_cleared_sender BEFORE INSERT ON network_events
+                WHEN EXISTS (SELECT 1 FROM sender_history_clears WHERE network=NEW.network AND local_session=NEW.local_session AND through>=NEW.at)
+                BEGIN SELECT RAISE(IGNORE); END
+                """)
             // Also match the immutable event key if a later mirror changes its timestamp or routing alias.
             let suppressed = """
                 EXISTS(SELECT 1 FROM history_clears WHERE network=NEW.network AND local_session=NEW.local_session AND peer=NEW.peer AND through>=NEW.at)
@@ -100,6 +106,16 @@ final class SQLiteStore {
             _ = try rows("DELETE FROM network_events WHERE network=? AND local_session=? AND peer=?", scope)
         }
     }
+    func clearSenderHistory(network: String, sender: LocalSession) throws {
+        let scope = [network, sender.name]
+        try transaction {
+            _ = try rows("INSERT OR REPLACE INTO sender_history_clears VALUES(?,?,?,?)",
+                         scope + [sender.key, String(Date().timeIntervalSince1970)])
+            _ = try rows("INSERT OR IGNORE INTO cleared_event_ids SELECT network,local_session,direction,id FROM network_events WHERE network=? AND local_session=?", scope)
+            _ = try rows("DELETE FROM network_events WHERE network=? AND local_session=?", scope)
+        }
+    }
+
     func insert(_ event: Message, network: String? = nil) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys

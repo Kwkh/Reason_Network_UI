@@ -24,6 +24,7 @@ struct NetworkSession: Decodable, Identifiable, Equatable {
     var clientTitle: String?
     var restriction: LocalThreadRestriction?
     var deletableLocalHistory = false
+    var deletedPeerKey: String?
     var overviewID: [String] { [target ?? address, machine ?? ""] }
     var offline: Bool { restriction != nil || status == "offline" }
     var available: Bool { !offline && tier != "none" }
@@ -134,6 +135,7 @@ struct LocalSession: Identifiable, Equatable {
         return supportedAgents.contains(agent) ? agent : nil
     }
     var agent: String { Self.agent(for: key) ?? "" }
+    var canDeleteHistory: Bool { historyOnly && (restriction == .missing || (!hasRegistration && restriction == nil)) }
     var hasRegistration: Bool { !key.hasPrefix("history:") }
     var restriction: LocalThreadRestriction?
     var id: String { key }

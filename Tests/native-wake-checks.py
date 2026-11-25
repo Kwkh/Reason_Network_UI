@@ -111,7 +111,7 @@ process.on('SIGTERM',()=>{dispose();process.exit()});""")
             time.sleep(.05)
         else: raise AssertionError("original dsh agent did not accept the wake")
         text=json.loads((home/"received").read_text())["content"][0]["text"]
-        assert "wake" in text and team in text and "fyi" not in text
+        assert "Wake tests · qa/beta" in text and "│ wake" in text and "reply::" in text and team not in text and "fyi" not in text
         digest=hashlib.sha256(sid.encode()).hexdigest()[:32]
         with socket.socket(socket.AF_UNIX) as sock:
             sock.connect(f"/tmp/reason-dsh-{os.getuid()}/{digest}-{host.pid}.sock")

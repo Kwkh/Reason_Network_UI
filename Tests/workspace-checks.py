@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import select
 import shutil
@@ -29,7 +30,7 @@ def call(root, op, **args):
     assert reply["ok"], (op,reply)
     return reply.get("result")
 
-def mcp_directory(home, root, agent, native_id):
+def mcp_directory(home, root, agent, native_id, reply=None):
     env = dict(HOME=str(home), PATH="/usr/bin:/bin", REASON_NETWORK_HOME=str(root),
                REASON_NETWORK_AGENT=agent, REASON_NETWORK_NO_SERVICE="1", REASON_NETWORK_NO_TRAY="1")
     if agent == "gemini":
@@ -61,7 +62,10 @@ def mcp_directory(home, root, agent, native_id):
                 missing = rpc("tools/call", dict(name="list_team", arguments={}), 3)
                 assert missing.get("isError") and "session_id" in missing["content"][0]["text"], missing
             arguments = {"session_id": native_id} if agent == "dsh" else {}
-            result = rpc("tools/call", dict(name="list_team", arguments=arguments), 2)
+            if reply is not None:
+                result = rpc("tools/call", dict(name="send_message", arguments={"to":reply, "message":"native MCP reply"}, _meta={"sessionId":native_id}), 2)
+            else:
+                result = rpc("tools/call", dict(name="list_team", arguments=arguments), 2)
             assert not result.get("isError"), result
             return result["content"][0]["text"]
         finally:
@@ -186,10 +190,12 @@ with tempfile.TemporaryDirectory(prefix="rn-ws-", dir="/tmp") as temp:
     b = home / ".reason/workspaces/b"
     procs = []
 
-    def start(root):
+    def start(root, search_path="/usr/bin:/bin", participation=True):
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        env = dict(HOME=temp, PATH="/usr/bin:/bin", REASON_NETWORK_HOME=str(root),
+        env = dict(HOME=temp, PATH=search_path, REASON_NETWORK_HOME=str(root),
                    REASON_NETWORK_LOCAL_PARTICIPATION="1", REASON_NETWORK_NO_SERVICE="1", REASON_NETWORK_NO_TRAY="1")
+        if not participation:
+            env.pop("REASON_NETWORK_LOCAL_PARTICIPATION")
         proc = subprocess.Popen([binary,"daemon"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         procs.append(proc)
         for _ in range(150):
@@ -272,6 +278,61 @@ with tempfile.TemporaryDirectory(prefix="rn-ws-", dir="/tmp") as temp:
             with sqlite3.connect(root/"network.db") as db:
                 records = db.execute("SELECT network,body FROM workspace_sent ORDER BY rowid").fetchall()
                 assert records == [(team,title),(team,"reply "+title)],records
+        # The same sender and same body in two workspaces. Read the actual native hook prompt,
+        # then reply through the broker, as an existing MCP client would.
+        references = []
+        for root, team in [(a,team_a),(b,team_b)]:
+            sent = send(team+"::qa/beta","same native prompt")
+            parent = sent["result"]["ids"][0].split("::")[-1]
+            hook_req = dict(op="hook",agent="codex",event="stop",pid=os.getpid(),session_id="beta",cwd=temp,mail=True)
+            text = call(root,"workspace_dispatch",network=team,request=hook_req)["text"]
+            ref = re.search(r'│ same native prompt\n\n↩ send_message\(to="(reply::[A-F0-9]{10})"',text).group(1)
+            assert team not in text and parent not in text, text
+            references.append((root,team,parent,ref))
+        assert references[0][3] != references[1][3]
+        for root,team,parent,ref in references:
+            assert not send(ref,"wrong caller","alpha")["ok"]
+            assert not send(ref,"wrong parent","beta",reply_to="other")["ok"]
+            nonce = "compact-test-"+team
+            result = send(ref,"compact reply","beta",idempotency_key=nonce)
+            assert result["ok"],result
+            retry = send(team+"::qa/alpha","compact reply","beta",reply_to=team+"::"+parent,idempotency_key=nonce)
+            assert retry["ok"] and retry["result"]["ids"] == result["result"]["ids"],retry
+            with sqlite3.connect(root/"network.db") as db:
+                assert db.execute("SELECT reply_to,recipient FROM messages WHERE id=?", (result["result"]["ids"][0],)).fetchone() == (parent,"qa/alpha")
+        assert not send("reply::00000","invalid","beta")["ok"]
+        # An unavailable index falls back to the original, fully addressed prompt.
+        index = a/"reply-refs.sqlite3"
+        saved = a/"saved-refs"
+        index.rename(saved)
+        try:
+            index.mkdir()
+            assert send(team_b+"::qa/beta","fallback native prompt")["ok"]
+            text = call(b,"workspace_dispatch",network=team_b,request=hook_req)["text"]
+            assert "fallback native prompt" in text and team_b+"::" in text and "<reason-message" in text
+            assert not send(references[0][3],"missing index","beta")["ok"]
+        finally:
+            index.rmdir()
+            saved.rename(index)
+        worker = next(p for p in procs if p.pid==int((b/"daemon.lock").read_text()))
+        worker.terminate()
+        worker.wait(timeout=12)
+        start(b)
+        for name in ["alpha","beta"]:
+            hook(b,name)
+        delayed = send(references[1][3],"reply after restart","beta")
+        assert delayed["ok"],delayed
+        text = mcp_directory(home, a, "codex", "beta", reply=references[1][3])
+        assert "qa/alpha" in text and "message id " in text,text
+        with sqlite3.connect(b/"network.db") as db:
+            assert db.execute("SELECT reply_to FROM workspace_sent WHERE body='native MCP reply'").fetchone() == (references[1][2],)
+        hook(a,"beta")
+        hook(b,"beta")
+        # Ask's original-message lookup remains bound to the requesting thread and workspace.
+        # The synthetic sender is on the same machine: it must be refused before any dialog opens.
+        ask = request(a,"ask",key="codex:beta",question="fixture",about=references[1][3])
+        assert not ask["ok"] and references[1][2] in ask["error"],ask
+        print("PASS: compact hook replies preserve exact parent across two Networks; wrong thread, conflicting parent and unavailable index are safe")
         call(b,"set_session_participation",key="codex:alpha",paused=True)
         assert not send(team_b+"::qa/beta","after-exit")["ok"]
         assert send(team_a+"::qa/beta","still here")["ok"]
@@ -381,6 +442,97 @@ with tempfile.TemporaryDirectory(prefix="rn-ws-", dir="/tmp") as temp:
                 native.wait(timeout=5)
                 assert status() == "offline"
         print("PASS: native Claude registry and dsh plugin endpoint follow the original host lifetime")
+
+        # Two native conversations share one still-running process. Their sockets can
+        # reopen independently of hooks, the MCP connection and workspace restarts.
+        keys = [str(uuid4()) for _ in range(3)]
+        labels = ["reopen-one", "reopen-two"]
+        for sid, label in zip(keys, labels):
+            for root, team in [(a, team_a), (b, team_b)]:
+                call(root, "set_session_participation", key="dsh:"+sid, paused=False)
+                call(root, "workspace_dispatch", network=team, request=dict(op="hook", event="app-join",
+                     agent="dsh", session_id=sid, name=label, cwd=temp))
+            call(a, "set_session_participation", key="dsh:"+sid, paused=True)
+        def dsh_rows(root):
+            return {row["name"]:row for row in call(root,"who",all=True)["sessions"] if row.get("agent")=="dsh"}
+        def await_online(names):
+            for _ in range(100):
+                rows = dsh_rows(b)
+                if all(label in rows and (rows[label]["status"]!="offline") == (label in names) for label in labels):
+                    return rows
+                time.sleep(.12)
+            raise AssertionError([(n,r["status"]) for n,r in rows.items()])
+        def listen(stack, sid):
+            path = directory / (hashlib.sha256(sid.encode()).hexdigest()[:32] + "-" + str(os.getpid()) + ".sock")
+            listener = stack.enter_context(socket.socket(socket.AF_UNIX))
+            listener.bind(str(path))
+            stack.callback(path.unlink, missing_ok=True)
+            listener.listen(16)
+            return listener
+        with ExitStack() as open_sessions:
+            second_channel = listen(open_sessions, keys[1])
+            listen(open_sessions, keys[2])  # Never joined either Network.
+            with ExitStack() as first:
+                listen(first, keys[0])
+                rows = await_online(labels)
+                call(b,"set_receive_mode",key="dsh:"+keys[0],network=team_b,mode="pull")
+                assert not set(labels).intersection(dsh_rows(a))
+            await_online([labels[1]])
+            message = "queued for the offline dsh conversation"
+            assert send(team_b+"::qa/"+labels[0], message, sender="beta")["ok"]
+            listen(open_sessions, keys[0])
+            assert await_online(labels)[labels[0]]["tier"]=="pull"
+            inbox = call(b, "inbox", key="dsh:"+keys[0], wait_secs=0, peek=True)
+            assert [m["body"] for m in inbox["messages"]].count(message) == 1
+            sibling = call(b, "inbox", key="dsh:"+keys[1], wait_secs=0, peek=True)
+            assert all(m["body"] != message for m in sibling["messages"])
+            worker = next(proc for proc in reversed(procs) if proc.poll() is None and proc.args[1]=="daemon"
+                          and proc.pid==int((b/"daemon.lock").read_text().strip()))
+            worker.terminate()
+            worker.wait(timeout=12)
+            # Folder metadata is optional. Simulate Git waiting for the user on
+            # one original thread's Documents folder during the first restart.
+            bin_dir = home/"git-fixture"
+            bin_dir.mkdir()
+            blocked = home/"private-project"
+            blocked.mkdir()
+            marker = home/"unexpected-git"
+            git = bin_dir/"git"
+            git.write_text(f'#!/bin/sh\nif [ "$2" = "{blocked}" ]; then touch "{marker}"; sleep 4; exit 1; fi\nexec /usr/bin/git "$@"\n')
+            git.chmod(0o700)
+            with sqlite3.connect(b/"network.db") as db:
+                db.execute("UPDATE sessions SET cwd=? WHERE key=?", (str(blocked),"dsh:"+keys[0]))
+            worker = start(b, search_path=str(bin_dir)+":/usr/bin:/bin")
+            assert await_online(labels)[labels[0]]["tier"]=="pull"
+            assert not marker.exists(), "dsh recovery or directory listing tried to read the native workspace"
+            # A CLI may get to the managed workspace before launchd. Recovery also
+            # runs in that process, without depending on its inherited environment.
+            worker.terminate()
+            worker.wait(timeout=12)
+            start(b, participation=False)
+            assert await_online(labels)[labels[0]]["tier"]=="pull"
+            assert not set(labels).intersection(dsh_rows(a))
+            assert call(b,"set_receive_mode",key="dsh:"+keys[1],network=team_b,mode="push")["effective"] == "push"
+            call(b, "hook", agent="codex", event="stop", pid=os.getpid(), session_id="beta", cwd=temp, mail=False)
+            sent = request(a, "send", **{"from":"codex:beta", "to":team_b+"::qa/"+labels[1],
+                                         "body":"push after presence recovery", "wake":True})
+            assert sent["ok"], sent
+            second_channel.settimeout(6)
+            while True:
+                with second_channel.accept()[0] as connection:
+                    data = connection.makefile("rb").readline()
+                    if not data: continue  # Presence probes carry no message.
+                    packet = json.loads(data)
+                    assert packet["session"] == keys[1] and "push after presence recovery" in packet["text"]
+                    short = re.search(r'to="(reply::[A-F0-9]{10})"',packet["text"]).group(1)
+                    connection.sendall(b"accepted\n")
+                    break
+            assert request(a,"send",**{"from":"dsh:"+keys[1],"to":short,"body":"dsh compact reply","wake":False})["ok"]
+            for root in (a,b):
+                with sqlite3.connect(root/"network.db") as db:
+                    assert not db.execute("SELECT 1 FROM sessions WHERE key=?",("dsh:"+keys[2],)).fetchone()
+        await_online([])
+        print("PASS: idle dsh endpoints recover separately after close, reopen and daemon restart; preserve pull and respect paused and never-joined siblings")
 
         # The native wake service survives its launcher. Its PID alone cannot make
         # an archived/closed desktop process appear online in this isolated profile.

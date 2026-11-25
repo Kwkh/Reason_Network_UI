@@ -733,7 +733,9 @@ private struct ConversationSidebar: View {
     }
     @State private var page: Page?
     @State private var settingsOpen = false
-    private struct HistoryDeletion { let network, team, local, peer, title: String }
+    private struct HistoryDeletion { let network, team, local, peer, title: String; let deletedPeerKey: String? }
+    private struct SenderDeletion { let network, team: String; let sender: LocalSession }
+    @State private var senderDeletion: SenderDeletion?
     @State private var historyDeletion: HistoryDeletion?
     @State private var historyFailure: InterfaceMessage?
     private struct DeviceRemoval { let device: Device; let network: String; let team: String }
@@ -762,6 +764,13 @@ private struct ConversationSidebar: View {
                 .accessibilityHidden(true)
             Menu {
                 LocalSessionChoices()
+                if let sender = model.own, sender.canDeleteHistory, model.error == nil,
+                   let directory = model.directory, let network = directory.networkID {
+                    Divider()
+                    Button(role: .destructive) {
+                        senderDeletion = SenderDeletion(network: network, team: directory.team ?? network, sender: sender)
+                    } label: { Label(L10n.text("删除此会话的本机记录"), systemImage: "trash") }
+                }
             } label: {
                 Text(title)
                     .font(.system(size: 18, weight: .semibold))
@@ -894,7 +903,7 @@ private struct ConversationSidebar: View {
                                 peerButton(session).contextMenu {
                                     Button(L10n.text("删除本机聊天记录"), role: .destructive) {
                                         historyDeletion = HistoryDeletion(network: network, team: directory.team ?? network,
-                                            local: model.selectedLocal, peer: session.address, title: session.title)
+                                            local: model.selectedLocal, peer: session.address, title: session.title, deletedPeerKey: session.deletedPeerKey)
                                     }
                                 }
                             } else { peerButton(session) }
@@ -964,11 +973,22 @@ private struct ConversationSidebar: View {
             .padding(.leading, 10)
             .padding(.vertical, 5)
         }
+        .alert(L10n.text("删除此会话的本机记录"), isPresented: Binding(get: { senderDeletion != nil }, set: { if !$0 { senderDeletion = nil } }), presenting: senderDeletion) { target in
+            Button(L10n.text("取消"), role: .cancel) {}
+            Button(L10n.text("删除本机聊天记录"), role: .destructive) {
+                Task {
+                    do { try await model.deleteSenderHistory(network: target.network, sender: target.sender) }
+                    catch { historyFailure = InterfaceMessage { error.localizedDescription } }
+                }
+            }
+        } message: { target in
+            Text(L10n.format("将清除这台 Mac 上「%@」中，会话「%@」与所有联系人的聊天记录。此操作无法撤销。", target.team, target.sender.title))
+        }
         .alert(L10n.text("删除本机聊天记录？"), isPresented: Binding(get: { historyDeletion != nil }, set: { if !$0 { historyDeletion = nil } }), presenting: historyDeletion) { target in
             Button(L10n.text("取消"), role: .cancel) {}
             Button(L10n.text("删除本机聊天记录"), role: .destructive) {
                 Task {
-                    do { try await model.deleteLocalHistory(network: target.network, local: target.local, peer: target.peer) }
+                    do { try await model.deleteLocalHistory(network: target.network, local: target.local, peer: target.peer, deletedPeerKey: target.deletedPeerKey) }
                     catch { historyFailure = InterfaceMessage { error.localizedDescription } }
                 }
             }

@@ -1,0 +1,197 @@
+diff --git a/src/daemon/directory.rs b/src/daemon/directory.rs
+--- a/src/daemon/directory.rs
++++ b/src/daemon/directory.rs
+@@ -65,7 +65,8 @@
+     /// This machine's sessions: running ones, plus (if `unmanaged`) Claude Code sessions without Reason Network.
+     pub(super) async fn local_rows(self: &Arc<Self>, me: Option<&str>, unmanaged: bool) -> Result<Vec<SessionInfo>> {
+         let claude = if crate::paths::managed_workspace() { Vec::new() } else { self.shared(tokio::task::spawn_blocking(claude::scan).await?) };
+-        let mut cwds: Vec<String> = self.inner.lock().unwrap().live.values().map(|l| l.reg.cwd.clone()).collect();
++        let mut cwds: Vec<String> = self.inner.lock().unwrap().live.values()
++            .filter(|l| l.reg.agent != "dsh").map(|l| l.reg.cwd.clone()).collect();
+         cwds.extend(claude.iter().filter_map(|c| c.cwd.clone()));
+         let mut gits: HashMap<String, GitInfo> = HashMap::new();
+         for cwd in cwds {
+diff --git a/src/daemon/dsh_presence.rs b/src/daemon/dsh_presence.rs
+new file mode 100644
+--- /dev/null
++++ b/src/daemon/dsh_presence.rs
+@@ -0,0 +1,59 @@
++//! The desktop plugin opens one socket per loaded native conversation, even when several
++//! conversations share a process. A daemon restart or an idle reopen need not produce a hook.
++use super::*;
++
++impl Daemon {
++    pub(super) async fn dsh_presence_loop(self: Arc<Self>) {
++        loop {
++            if let Err(error) = self.refresh_dsh_presence().await {
++                log(&format!("dsh presence refresh: {error}"));
++            }
++            tokio::time::sleep(Duration::from_secs(4)).await;
++        }
++    }
++
++    async fn refresh_dsh_presence(self: &Arc<Self>) -> Result<()> {
++        let (team, sessions) = {
++            let g = self.inner.lock().unwrap();
++            let Some(team) = &g.team else { return Ok(()) };
++            (team.id.clone(), g.store.joined_dsh_sessions(&team.id)?)
++        };
++        for session in sessions {
++            let key = session.key;
++            let Some(id) = key.strip_prefix("dsh:").filter(|id| !id.is_empty()) else { continue };
++            let endpoint = crate::dsh_wake::endpoint_with_pid(id);
++            {
++                let mut g = self.inner.lock().unwrap();
++                if let Some(live) = g.live.get_mut(&key) {
++                    if endpoint.is_some() {
++                        live.dsh_endpoint_seen = true;
++                    } else if live.dsh_endpoint_seen {
++                        // The native conversation closed while its desktop process stayed alive.
++                        g.live.remove(&key);
++                        g.owners.remove(&key);
++                        self.presence_changed();
++                    }
++                    continue;
++                }
++            }
++            let Some((socket, pid)) = endpoint else { continue };
++            // A pathname can survive an unclean exit. Connect without writing any user input.
++            let Ok(Ok(_probe)) = tokio::time::timeout(Duration::from_millis(250), tokio::net::UnixStream::connect(socket)).await else { continue };
++            // Registration restores an existing identity. Reading its working directory here
++            // would serialize every recovery behind Git and macOS folder access.
++            drop(_probe);
++            let git = GitInfo { root: None, repo: session.repo, branch: session.branch };
++            let reg = SessionReg { key: key.clone(), agent: "dsh".into(), agent_session_id: Some(id.into()),
++                cwd: session.cwd, tier: Tier::Pull, pid: Some(pid), name: None };
++            match self.register_source(None, reg, git, false, None, Some(&team)) {
++                Ok((_, (_, pending))) if !pending.is_empty() => {
++                    let mut g = self.inner.lock().unwrap();
++                    self.deliver(&mut g, &key, pending, true);
++                }
++                Err(error) => log(&format!("dsh presence restore: {error}")),
++                _ => {}
++            }
++        }
++        Ok(())
++    }
++}
+diff --git a/src/daemon/mod.rs b/src/daemon/mod.rs
+--- a/src/daemon/mod.rs
++++ b/src/daemon/mod.rs
+@@ -5,6 +5,8 @@
+ mod antigravity;
+ mod ask;
+ mod diagnostics;
++#[cfg(target_os = "macos")]
++mod dsh_presence;
+ mod directory;
+ mod mail;
+ mod notify;
+@@ -83,6 +85,8 @@
+     }
+     if !paths::managed_workspace() { tokio::spawn(crate::migrate::run(log)); }
+     tokio::spawn(daemon.clone().relays_loop());
++    #[cfg(target_os = "macos")]
++    tokio::spawn(daemon.clone().dsh_presence_loop());
+     if std::env::var_os("REASON_NETWORK_LOCAL_PARTICIPATION").is_none() && update::allowed(daemon.cfg.auto_update) {
+         tokio::spawn(daemon.clone().update_loop());
+     }
+@@ -198,6 +202,8 @@
+ struct Live {
+     #[cfg(target_os = "macos")]
+     requires_owner: bool,
++    #[cfg(target_os = "macos")]
++    dsh_endpoint_seen: bool,
+     through_reason: Option<bool>,
+     reg: SessionReg,
+     preferred_mode: Option<Tier>,
+@@ -467,7 +473,7 @@
+             Request::SessionParticipation => {
+                 let g = self.inner.lock().unwrap();
+                 let pending: Vec<_> = g.live.iter().filter(|(_, l)| l.codex_resume_pending).map(|(key, _)| key).collect();
+-                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true, "workspaces": true, "agent_session_join": true, "session_join_diagnostics": true, "agent_join_setup": true, "harness_presence": cfg!(target_os = "macos"), "native_titles": true, "native_agent_wake": true, "multi_agent_sessions": true, "departure_notices": true, "admin_network": g.team.as_ref().filter(|t| t.founder == self.key.public()).map(|t| &t.id),
++                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true, "workspaces": true, "agent_session_join": true, "session_join_diagnostics": true, "agent_join_setup": true, "dsh_presence_recovery": cfg!(target_os = "macos"), "harness_presence": cfg!(target_os = "macos"), "native_titles": true, "native_agent_wake": true, "multi_agent_sessions": true, "departure_notices": true, "admin_network": g.team.as_ref().filter(|t| t.founder == self.key.public()).map(|t| &t.id),
+                         "resume_pending": pending })
+             }
+             Request::SetReceiveMode { key, network, mode } => {
+diff --git a/src/daemon/sessions.rs b/src/daemon/sessions.rs
+--- a/src/daemon/sessions.rs
++++ b/src/daemon/sessions.rs
+@@ -174,11 +174,11 @@
+         reg: SessionReg,
+         git: GitInfo,
+     ) -> Result<(Registered, (String, Vec<Message>))> {
+-        self.register_source(conn, reg, git, false, None)
++        self.register_source(conn, reg, git, false, None, None)
+     }
+ 
+     pub(super) fn register_source(
+-        &self, conn: Option<u64>, mut reg: SessionReg, git: GitInfo, joining: bool, join_network: Option<&str>,
++        &self, conn: Option<u64>, mut reg: SessionReg, git: GitInfo, joining: bool, join_network: Option<&str>, restore_team: Option<&str>,
+     ) -> Result<(Registered, (String, Vec<Message>))> {
+         // Older desktop MCP clients may reconnect to a newly upgraded daemon.
+         if reg.agent == "dsh" && !reg.key.strip_prefix("dsh:").is_some_and(|id| !id.is_empty()) {
+@@ -193,6 +193,14 @@
+         let mut g = self.inner.lock().unwrap();
+         let g = &mut *g;
+         let key = reg.key.clone();
++        if let Some(team) = restore_team {
++            // A pause, workspace change or real registration may have won the race with the socket probe.
++            if g.live.contains_key(&key) || g.team.as_ref().map(|t| t.id.as_str()) != Some(team)
++                || g.store.get(&format!("workspace-member:{key}"))?.as_deref() != Some(team)
++                || crate::dsh_wake::endpoint_with_pid(reg.agent_session_id.as_deref().unwrap_or_default()).map(|(_, pid)| pid) != reg.pid {
++                bail!("dsh registration changed");
++            }
++        }
+         // Shared MCP hosts can report a different cwd from the native conversation's hook.
+         // Pausing also inserts an off entry; that case must use the participation rules below.
+         if g.off.contains_key(&key) && !g.paused.contains(&key) { bail!(OFF_HERE); }
+@@ -292,6 +300,8 @@
+                 Live {
+                     #[cfg(target_os = "macos")]
+                     requires_owner,
++                    #[cfg(target_os = "macos")]
++                    dsh_endpoint_seen: restore_team.is_some(),
+                     preferred_mode,
+                     through_reason: Some(conn.is_none() && reg.agent == "reason"),
+                     reg,
+@@ -554,7 +564,7 @@
+             let git = self.git(&cwd).await;
+             let reg = SessionReg { key, agent: agent.to_owned(), agent_session_id: Some(session_id),
+                 cwd, pid: None, tier: Tier::Pull, name };
+-            let (registered, _) = self.register_source(None, reg, git, true, None)?;
++            let (registered, _) = self.register_source(None, reg, git, true, None, None)?;
+             return Ok(HookReply { address: Some(registered.address), ..Default::default() });
+         }
+         if event == "end" {
+diff --git a/src/daemon/workspaces.rs b/src/daemon/workspaces.rs
+--- a/src/daemon/workspaces.rs
++++ b/src/daemon/workspaces.rs
+@@ -114,7 +114,7 @@
+         let session = self.resolve_join(session)?;
+         let git = self.git(&session.cwd).await;
+         let key = session.key.clone();
+-        let (r, _) = self.register_source(None, session, git, true, Some(network))?;
++        let (r, _) = self.register_source(None, session, git, true, Some(network), None)?;
+         let mut g = self.inner.lock().unwrap();
+         self.prune(&mut g);
+         let name = g.team.as_ref().filter(|t| t.id == network).map(|t| t.shown_name())
+diff --git a/src/store.rs b/src/store.rs
+--- a/src/store.rs
++++ b/src/store.rs
+@@ -695,6 +695,15 @@
+         Ok(())
+     }
+ 
++    #[cfg(target_os = "macos")]
++    pub fn joined_dsh_sessions(&self, team: &str) -> Result<Vec<Remembered>> {
++        let mut stmt = self.db.prepare_cached(&format!("SELECT {SESSION_COLS} FROM sessions s
++            WHERE EXISTS (SELECT 1 FROM kv m WHERE m.key = 'workspace-member:' || s.key AND m.value = ?1)
++            AND s.agent = 'dsh' AND s.key LIKE 'dsh:%' AND NOT EXISTS
++            (SELECT 1 FROM paused_sessions p WHERE p.key = s.key)"))?;
++        Ok(stmt.query_map([team], remembered)?.collect::<rusqlite::Result<_>>()?)
++    }
++
+     pub fn paused_sessions(&self) -> Result<HashSet<String>> {
+         let mut statement = self.db.prepare("SELECT key FROM paused_sessions")?;
+         let rows = statement.query_map([], |row| row.get(0))?;

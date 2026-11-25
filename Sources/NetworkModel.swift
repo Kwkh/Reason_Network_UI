@@ -110,7 +110,13 @@ final class NetworkModel: ObservableObject {
         for previous in conversations where previous.address != ownAddress && !result.contains(where: { $0.address == previous.address }) {
             result.append(previous)
         }
-        return result
+        // A confirmed missing local thread may still have a stale directory row.
+        // Show the selected sender's actual remaining history in its place.
+        let histories = Dictionary(conversations.map { ($0.address, $0) }, uniquingKeysWith: { first, _ in first })
+        return result.compactMap { session in
+            guard session.restriction == .missing, session.person == directory.person else { return session }
+            return histories[session.address]
+        }
     }
     var peer: NetworkSession? { peers.first { $0.address == selectedPeer } }
     var own: LocalSession? { locals.first { $0.name == selectedLocal } }
@@ -403,11 +409,27 @@ final class NetworkModel: ObservableObject {
             mySessionsError = InterfaceMessage { error.localizedDescription }
         }
     }
-    func deleteLocalHistory(network: String, local: String, peer: String) async throws {
+    func deleteSenderHistory(network: String, sender: LocalSession) async throws {
+        guard directory?.networkID == network, own?.key == sender.key, selectedLocal == sender.name,
+              !leavingNetwork else { throw NetworkError("会话状态已变化，请刷新后重试。") }
+        try await service.deleteSenderHistory(network: network, sender: sender)
+        let prefix = network + "/" + sender.name + "/"
+        messageCache = messageCache.filter { !$0.key.hasPrefix(prefix) }
+        if directory?.networkID == network && own?.key == sender.key {
+            selectionGeneration += 1
+            messages = []
+            conversations = []
+            hasEarlier = false
+            readingFrom = nil
+        }
+        await refresh()
+    }
+
+    func deleteLocalHistory(network: String, local: String, peer: String, deletedPeerKey: String? = nil) async throws {
         guard directory?.networkID == network, selectedLocal == local, !leavingNetwork else {
             throw NetworkError("会话状态已变化，请刷新后重试。")
         }
-        try await service.deleteLocalHistory(network: network, local: local, peer: peer)
+        try await service.deleteLocalHistory(network: network, local: local, peer: peer, deletedPeerKey: deletedPeerKey)
         messageCache.removeValue(forKey: network + "/" + local + "/" + peer)
         if directory?.networkID == network && selectedLocal == local {
             selectionGeneration += 1

@@ -116,7 +116,7 @@ struct CoreChecks {
     }
 
     @MainActor
-    static func checkThreadLifecycle(service: ReasonService, engine: SQLiteStore, catalog: SQLiteStore) async throws {
+    static func checkThreadLifecycle(service: ReasonService, engine: SQLiteStore, catalog: SQLiteStore, cache: SQLiteStore) async throws {
         let uuid = UUID().uuidString.lowercased(), key = "codex:" + uuid
         _ = try engine.rows("UPDATE sessions SET key=? WHERE name='local'", [key])
         _ = try catalog.rows("INSERT INTO threads(id,title,cwd,archived) VALUES(?,'Lifecycle fixture','/tmp',1)", [uuid])
@@ -163,6 +163,51 @@ struct CoreChecks {
         try await service.removeLocal(onlyHistory, network: "team-a")
         let hidden = try await service.snapshot(local: "detached", peer: "peer/remote")
         try expect(!hidden.localSessions.contains { $0.name == "detached" } && hidden.messages.contains { $0.id == "late-in" }, "hiding a history-only identity preserves its events")
+        // Removed sender history is independent of paused and temporarily unverified sessions.
+        _ = try engine.rows("DELETE FROM paused_sessions WHERE key=?", [key])
+        await model.refresh()
+        guard let deleted = model.own, deleted.canDeleteHistory else { throw NetworkError("missing deleted sender") }
+        _ = try catalog.rows("INSERT INTO threads(id,title,cwd,archived) VALUES(?,'Reopened','/tmp',0)", [uuid])
+        do {
+            try await service.deleteSenderHistory(network: "team-a", sender: deleted)
+            throw NetworkError("stale delete accepted")
+        } catch { try expect(error.localizedDescription != "stale delete accepted", "restored sender rejects stale confirmation") }
+        _ = try catalog.rows("DELETE FROM threads WHERE id=?", [uuid])
+        _ = try catalog.rows("ALTER TABLE threads RENAME TO temporarily_unavailable")
+        let uncertain = try await service.snapshot(local: "local", peer: "")
+        try expect(uncertain.localSessions.first(where: { $0.name == "local" })?.canDeleteHistory == false,
+                   "unreadable index protects local history")
+        _ = try catalog.rows("ALTER TABLE temporarily_unavailable RENAME TO threads")
+        let otherCopy = Message(id: "isolated", at: 10, local: "local", peer: "peer/remote", direction: "in", body: "original", result: "")
+        try cache.insert(otherCopy, network: "team-b")
+        let siblingCopy = Message(id: "peer-copy", at: 10, local: "sibling", peer: "me/local", direction: "out", body: "other side", result: "")
+        try cache.insert(siblingCopy, network: "team-a")
+        let stalePeer = try await service.snapshot(local: "sibling", peer: "me/local")
+        try expect(stalePeer.conversations.contains { $0.address == "me/local" && $0.deletedPeerKey == key && $0.deletableLocalHistory },
+                   "a locally deleted peer has a scoped history action")
+        try await model.deleteSenderHistory(network: "team-a", sender: deleted)
+        let cleared = try await service.snapshot(local: "local", peer: "peer/remote")
+        try expect(!cleared.localSessions.contains { $0.name == "local" } && cleared.messages.isEmpty,
+                   "deleted sender stays removed after inbox replay")
+        let otherNetwork = try await service.history(network: "team-b", local: "local", peer: "peer/remote")
+        try expect(otherNetwork.messages.contains { $0.id == "isolated" }, "other Network kept its own copy")
+        let otherSender = try await service.snapshot(local: "sibling", peer: "me/local")
+        try expect(otherSender.messages.contains { $0.id == "peer-copy" } && otherSender.conversations.contains { $0.deletedPeerKey == key },
+                   "deleting the sender leaves other senders' copies accessible and independently deletable")
+        try await service.deleteLocalHistory(network: "team-a", local: "sibling", peer: "me/local", deletedPeerKey: key)
+        let clearedPair = try await service.snapshot(local: "sibling", peer: "me/local")
+        try expect(clearedPair.messages.isEmpty, "cleared missing peer row does not replay")
+        try cache.insert(Message(id: "late-mirror", at: 2, local: "local", peer: "new/alias", direction: "out", body: "old", result: ""), network: "team-a")
+        let late = try await service.history(network: "team-a", local: "local", peer: "new/alias")
+        try expect(late.messages.isEmpty, "an unseen old peer cannot recreate the cleared sender")
+        _ = try catalog.rows("INSERT INTO threads(id,title,cwd,archived) VALUES(?,'Reopened','/tmp',0)", [uuid])
+        let restored = try await service.snapshot(local: "local", peer: "peer/remote")
+        try expect(restored.localSessions.contains { $0.key == key && !$0.historyOnly } && restored.messages.isEmpty,
+                   "restoring the original identity does not restore its cleared history")
+        try cache.insert(Message(id: "fresh-mail", at: Date().timeIntervalSince1970 + 1, local: "local", peer: "peer/remote", direction: "in", body: "fresh", result: ""), network: "team-a")
+        let fresh = try await service.snapshot(local: "local", peer: "peer/remote")
+        try expect(fresh.messages.map(\.id) == ["fresh-mail"], "new messages after a deletion are retained")
+        print("PASS: sender and peer history deletion, stale selection, unreadable index, replay, fresh mail and Network isolation")
         print("PASS: local archive, missing UUID, unavailable index, retained history and draft, restoration, remote isolation")
     }
 
@@ -542,7 +587,7 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         var backfill: [Message] = []
         try reopened.sync(for: local) { backfill += $0 }
         try expect(backfill.map(\.id) == events.map(\.id), "fresh mirror reads records before the former 8 MB cutoff")
-        try await checkThreadLifecycle(service: service, engine: engine, catalog: catalog)
+        try await checkThreadLifecycle(service: service, engine: engine, catalog: catalog, cache: cache)
         print("PASS: native adapter, read-only inbox, held-message exclusion, conversation isolation, sender identity, literal extraction, partial JSONL, and send cache")
     }
 }

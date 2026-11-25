@@ -1,0 +1,205 @@
+diff --git a/src/daemon/mail.rs b/src/daemon/mail.rs
+--- a/src/daemon/mail.rs
++++ b/src/daemon/mail.rs
+@@ -536,7 +536,11 @@
+         };
+         let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+         let cli = matches!(channel, Channel::ClaudeDirect(_));
+-        let text = render::for_agent_in(&msgs, Some(&l.reg.agent), cli, g.team.as_ref(), Some(key));
++        let text = match channel {
++            Channel::Command(..) | Channel::ClaudeSocket(_) => render::for_push(&msgs, &l.reg.agent, g.team.as_ref(), key),
++            Channel::ClaudeDirect(_) => render::for_agent_in(&msgs, Some(&l.reg.agent), cli, g.team.as_ref(), Some(key)),
++            _ => String::new(),
++        };
+         let claude_session = l.reg.agent_session_id.clone();
+         let hook_note = if matches!(l.reg.agent.as_str(), "opencode" | "pi") {
+             "queued: delivered within seconds once the session is idle"
+@@ -549,7 +553,7 @@
+             Channel::Dsh(session) => {
+                 let team = g.team.as_ref();
+                 for m in msgs {
+-                    let text = render::for_agent_in(std::slice::from_ref(&m), Some("dsh"), false, team, Some(key));
++                    let text = render::for_push(std::slice::from_ref(&m), "dsh", team, key);
+                     let delivery = format!("{}::{}", team.map_or("", |t| t.id.as_str()), m.id);
+                     let session = session.clone();
+                     g.in_flight.insert(m.id.clone(), Instant::now());
+diff --git a/src/daemon/mod.rs b/src/daemon/mod.rs
+--- a/src/daemon/mod.rs
++++ b/src/daemon/mod.rs
+@@ -473,7 +473,7 @@
+             Request::SessionParticipation => {
+                 let g = self.inner.lock().unwrap();
+                 let pending: Vec<_> = g.live.iter().filter(|(_, l)| l.codex_resume_pending).map(|(key, _)| key).collect();
+-                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true, "workspaces": true, "agent_session_join": true, "session_join_diagnostics": true, "agent_join_setup": true, "dsh_presence_recovery": cfg!(target_os = "macos"), "harness_presence": cfg!(target_os = "macos"), "native_titles": true, "native_agent_wake": true, "multi_agent_sessions": true, "departure_notices": true, "admin_network": g.team.as_ref().filter(|t| t.founder == self.key.public()).map(|t| &t.id),
++                json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true, "workspaces": true, "agent_session_join": true, "session_join_diagnostics": true, "agent_join_setup": true, "compact_reply_addresses": true, "dsh_presence_recovery": cfg!(target_os = "macos"), "harness_presence": cfg!(target_os = "macos"), "native_titles": true, "native_agent_wake": true, "multi_agent_sessions": true, "departure_notices": true, "admin_network": g.team.as_ref().filter(|t| t.founder == self.key.public()).map(|t| &t.id),
+                         "resume_pending": pending })
+             }
+             Request::SetReceiveMode { key, network, mode } => {
+diff --git a/src/daemon/sessions.rs b/src/daemon/sessions.rs
+--- a/src/daemon/sessions.rs
++++ b/src/daemon/sessions.rs
+@@ -681,7 +681,7 @@
+         if !ids.is_empty() {
+             self.reached(g, &key);
+         }
+-        let text = (!msgs.is_empty()).then(|| render::for_agent_in(&msgs, Some(&agent_kind), false, g.team.as_ref(), Some(&key)));
++        let text = (!msgs.is_empty()).then(|| render::for_push(&msgs, &agent_kind, g.team.as_ref(), &key));
+         Ok(HookReply { address: Some(address), text, ids })
+     }
+ 
+diff --git a/src/daemon/workspaces.rs b/src/daemon/workspaces.rs
+--- a/src/daemon/workspaces.rs
++++ b/src/daemon/workspaces.rs
+@@ -63,7 +63,8 @@
+ impl Workspace {
+     async fn call(&self, request: &Request) -> Result<Value> {
+         let path = paths::socket_in(&self.dir);
+-        let result = tokio::time::timeout(Duration::from_secs(32), async {
++        let wait = if matches!(request, Request::Ask { .. }) { MAX_WAIT + 5 } else { 32 };
++        let result = tokio::time::timeout(Duration::from_secs(wait), async {
+             let stream = tokio::net::UnixStream::connect(path).await?;
+             let (read, mut write) = stream.into_split();
+             let mut frame =
+@@ -124,6 +125,15 @@
+     }
+ 
+     pub(super) async fn dispatch(self: &Arc<Self>, conn: u64, mut req: Request) -> Result<Value> {
++        if let Request::Ask { key, question, about: Some(code) } = &req
++            && let Some((team, _, parent)) = crate::reply_ref::lookup(code, key)? {
++            let resolved = Request::Ask { key: key.clone(), question: question.clone(), about: Some(parent) };
++            if self.team_id().as_ref() == Some(&team) { return self.handle(conn, resolved).await; }
++            let workspace = joined(key)?.into_iter().find(|w| w.team == team)
++                .ok_or_else(|| anyhow!("Session is not joined to that Network"))?;
++            return workspace.call(&resolved).await;
++        }
++        crate::reply_ref::expand(&mut req)?;
+         if let Request::WorkspaceDispatch { network, request } = req {
+             if self.team_id().as_ref() != Some(&network) {
+                 bail!("Network membership changed");
+@@ -136,7 +146,7 @@
+                 Request::Hook(h) => Some(format!("{}:{}", h.agent, h.session_id)),
+                 Request::Who { me, .. } => me.clone(),
+                 Request::Send { from, .. } | Request::DeliveryStatus { from, .. } => Some(from.clone()),
+-                Request::Inbox { key, .. } | Request::Unread { key } | Request::Delivered { key, .. } => {
++                Request::Ask { key, .. } | Request::Inbox { key, .. } | Request::Unread { key } | Request::Delivered { key, .. } => {
+                     Some(key.clone())
+                 }
+                 _ => None,
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -24,6 +24,7 @@
+ mod proof;
+ mod proto;
+ mod relays;
++mod reply_ref;
+ mod render;
+ mod setup;
+ mod store;
+diff --git a/src/mcp.rs b/src/mcp.rs
+--- a/src/mcp.rs
++++ b/src/mcp.rs
+@@ -70,6 +70,7 @@
+     pub idempotency_key: Option<String>,
+     /// "person/session@machine" from list_team; a reply goes to the message's from (with notify, `to` may be your
+     /// user's name).
++    /// For a compact incoming prompt, copy its reply:: address into to; the original message is linked automatically.
+     pub to: String,
+     /// The message, with the point in the first line.
+     pub message: String,
+@@ -105,6 +106,7 @@
+     /// When it's about a teammate's message, its id (the `id="…"` of their `<reason-message>`): your user sees that
+     /// request in the pop-up, and its sender gets the answer signed by this machine.
+     #[serde(default)]
++    /// For a compact incoming prompt, its reply:: address identifies the same original message.
+     pub about: Option<String>,
+ }
+ 
+diff --git a/src/render.rs b/src/render.rs
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -268,6 +268,33 @@
+ #[cfg(test)]
+ pub fn for_agent(msgs: &[Message], agent: Option<&str>, cli: bool) -> String {
+     for_agent_in(msgs,agent,cli,None,None)
++}
++
++/// Compact native prompts keep peer text quoted and put the local tool instruction outside it.
++pub fn for_push(msgs: &[Message], agent: &str, team: Option<&crate::team::TeamState>, key: &str) -> String {
++    let legacy = || for_agent_in(msgs, Some(agent), false, team, Some(key));
++    let Some(t) = team else { return legacy() };
++    if !crate::agent::workspace_agent(agent) || (!crate::paths::user_home().join(".reason/workspaces").is_dir() && std::env::var_os("REASON_NETWORK_LOCAL_PARTICIPATION").is_none())
++        || msgs.iter().any(|m| m.approval.is_some() || !m.files.is_empty() || m.via.is_some() || from_terminal(&m.from)) {
++        return legacy();
++    }
++    let mut parts = Vec::new();
++    for m in msgs {
++        let Ok(address) = crate::reply_ref::remember(&t.id, key, m) else { return legacy() };
++        let label = |s: &str| defang(&util::one_line(s, 200));
++        let mut out = format!("{} · {}", label(&t.shown_name()), label(&m.from));
++        for context in [&m.from_agent, &m.from_repo].into_iter().flatten() {
++            let _ = write!(out, " · {}", label(context));
++        }
++        if let Some(parent) = &m.reply_to { let _ = write!(out, " (↩ {})", label(parent)); }
++        out.push_str("\n\n");
++        for line in defang(&util::printable(m.body.trim())).split('\n') {
++            let _ = writeln!(out, "│ {line}");
++        }
++        let _ = write!(out, "\n↩ send_message(to=\"{address}\", message=…)");
++        parts.push(out);
++    }
++    parts.join("\n\n")
+ }
+ 
+ pub fn for_agent_in(msgs:&[Message], agent:Option<&str>, cli:bool, team:Option<&crate::team::TeamState>, sender_key:Option<&str>)->String {
+diff --git a/src/reply_ref.rs b/src/reply_ref.rs
+new file mode 100644
+--- /dev/null
++++ b/src/reply_ref.rs
+@@ -0,0 +1,46 @@
++//! Local reply addresses for native agent prompts. Only the original thread can resolve one.
++//! Never recycle a code; a missing index or expired parent must fail closed.
++use anyhow::{Context, Result, ensure};
++use rusqlite::{Connection, OpenFlags, params};
++use std::time::Duration;
++
++const PREFIX: &str = "reply::";
++
++fn index(write: bool) -> Result<Connection> {
++    let path = crate::paths::user_home().join(".reason/network/reply-refs.sqlite3");
++    let flags = if write { OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE }
++        else { OpenFlags::SQLITE_OPEN_READ_ONLY };
++    let db = Connection::open_with_flags(path, flags)?;
++    db.busy_timeout(Duration::from_millis(80))?;
++    Ok(db)
++}
++
++pub fn remember(team: &str, key: &str, msg: &crate::proto::Message) -> Result<String> {
++    let db = index(true)?;
++    db.execute_batch("CREATE TABLE IF NOT EXISTS refs(code TEXT PRIMARY KEY,team TEXT NOT NULL,
++        thread TEXT NOT NULL,parent TEXT NOT NULL,peer TEXT NOT NULL,UNIQUE(team,thread,parent,peer))")?;
++    let args = params![team,key,msg.id,msg.from];
++    db.execute("INSERT OR IGNORE INTO refs VALUES(hex(randomblob(5)),?1,?2,?3,?4)", args)?;
++    let code: String = db.query_row("SELECT code FROM refs WHERE team=?1 AND thread=?2 AND parent=?3 AND peer=?4",
++        args, |r| r.get(0))?;
++    Ok(format!("{PREFIX}{code}"))
++}
++
++pub fn lookup(address: &str, key: &str) -> Result<Option<(String,String,String)>> {
++    let Some(code) = address.strip_prefix(PREFIX) else { return Ok(None) };
++    ensure!(code.len() == 10 && code.bytes().all(|b| b.is_ascii_hexdigit()), "Invalid reply address");
++    let db = index(false).context("Local reply index unavailable; check the original message")?;
++    db.query_row("SELECT team,peer,parent FROM refs WHERE code=?1 AND thread=?2",
++        params![code.to_ascii_uppercase(),key], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))
++        .map(Some).context("Unknown reply address for this conversation; check the original message")
++}
++
++pub fn expand(req: &mut crate::proto::Request) -> Result<()> {
++    let crate::proto::Request::Send { from, to, reply_to, .. } = req else { return Ok(()) };
++    let Some((team, peer, parent)) = lookup(to, from)? else { return Ok(()) };
++    let qualified = format!("{team}::{parent}");
++    ensure!(reply_to.as_ref().is_none_or(|id| id == &qualified || id == &parent), "Conflicting reply address and parent");
++    *to = format!("{team}::{peer}");
++    *reply_to = Some(qualified);
++    Ok(())
++}
