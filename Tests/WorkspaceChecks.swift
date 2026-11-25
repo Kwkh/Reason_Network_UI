@@ -5,6 +5,20 @@ struct WorkspaceChecks {
     @MainActor
     static func main() async throws {
         let home = URL(fileURLWithPath: CommandLine.arguments[1])
+        if CommandLine.arguments.count == 6 && CommandLine.arguments[2] == "dsh-push" {
+            let helper = URL(fileURLWithPath: CommandLine.arguments[3])
+            let network = CommandLine.arguments[4]
+            let session = LocalSession(name: "deepseek", key: "dsh:" + CommandLine.arguments[5])
+            let service = ReasonService(home: home, expectedNetwork: network, wakeSetupHelper: helper)
+            do {
+                let mode = try await service.setReceiveMode(.push, local: session, network: network)
+                guard mode == .push else { throw NetworkError("Unexpected effective mode") }
+            } catch {
+                print(error.localizedDescription)
+                exit(1)
+            }
+            return
+        }
         let storage = WorkspaceStore(home: home)
         let hub = WorkspaceController(home: home)
         let first = try require(hub.selection)

@@ -191,11 +191,12 @@ struct SetupView: View {
         VStack(alignment: .leading, spacing: 18) {
             checkRow(L10n.text("Reason 命令行工具"), complete: model.snapshot.installed)
             checkRow(L10n.text("逐会话管理后台"), complete: model.snapshot.background && model.snapshot.participation)
-            checkRow(L10n.text("Codex 接入"), complete: model.snapshot.wired)
-            if !model.snapshot.codex {
-                Text(L10n.text("请先安装并打开 Codex，再回来继续配置。"))
+            checkRow(model.snapshot.wired
+                     ? L10n.format("已接入：%@", model.snapshot.wiredAgents.map { NetworkSession.agentDisplayName($0) }.formatted(.list(type: .and).locale(L10n.shared.locale)))
+                     : L10n.text("会话工具接入"), complete: model.snapshot.wired)
+            if !model.snapshot.wired {
+                Text(L10n.text("支持 Codex、Claude Code、Gemini CLI 和 dsh，配置其中一种即可继续。"))
                     .font(.system(size: 12)).foregroundStyle(.secondary)
-                Link(L10n.text("获取 Codex"), destination: URL(string: "https://chatgpt.com/download/")!)
             }
             if model.snapshot.installed {
                 action(L10n.text("配置后台与会话")) { await model.configure() }
@@ -238,7 +239,7 @@ struct SetupView: View {
                 .font(.system(size: 15, weight: .medium))
             Text(sessions > 0 ? L10n.text("本机会话已在线。") : L10n.text("在「我的会话」里选择要接入这个 Network 的本机对话。"))
                 .font(.system(size: 13)).foregroundStyle(.secondary)
-            if sessions == 0 {
+            if sessions == 0 && model.snapshot.wiredAgents.contains("codex") {
                 Button(L10n.text("打开 Codex"), systemImage: "arrow.up.forward.app") {
                     if let url = ["com.openai.codex", "com.openai.chat"].compactMap({
                         NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0)

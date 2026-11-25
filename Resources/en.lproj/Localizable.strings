@@ -357,3 +357,10 @@
 "Open the original dsh session with the Reason Network wake plugin enabled." = "Open the original dsh session with the Reason Network wake plugin enabled.";
 
 "Claude Code push channel is unavailable." = "Claude Code push channel is unavailable.";
+"正在配置后台与会话…" = "Configuring the background service and sessions…";
+"已接入：%@" = "Connected: %@";
+"会话工具接入" = "Agent tool integration";
+"支持 Codex、Claude Code、Gemini CLI 和 dsh，配置其中一种即可继续。" = "Set up Codex, Claude Code, Gemini CLI, or dsh to continue.";
+"尚无已接入的工具。请先安装并打开一种支持的工具，再点击「配置后台与会话」。" = "No tools are connected yet. Install and open a supported tool, then choose Configure backend and sessions.";
+"请先在「环境配置」中配置后台与会话。" = "Configure the service and sessions in Environment Setup first.";
+"尚未确认这个 dsh 原对话的推送通道。请在 DeepSeek Harness 中重新打开该对话，再选择即时推送。" = "Push is still unavailable for this dsh session. Reopen the same conversation in DeepSeek Harness, then select Push again.";

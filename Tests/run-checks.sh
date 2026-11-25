@@ -19,6 +19,7 @@ if [[ "${1:-}" == "--workspaces" ]]; then
     xcrun swiftc -parse-as-library -swift-version 5 -module-cache-path "$checks_dir/cache" \
       "$project_dir"/Sources/{AppLanguage,ParticipationInstaller,SetupService,Models,SQLiteStore,TranscriptMirror,PersonalSessions,ReasonService,NetworkModel,NetworkWorkspaces}.swift \
       "$project_dir/Tests/WorkspaceChecks.swift" -lsqlite3 -o "$checks_dir/WorkspaceChecks"
+    python3 "$project_dir/Tests/native-wake-checks.py" "$backend" "$checks_dir/WorkspaceChecks"
     python3 "$project_dir/Tests/workspace-checks.py" "$backend"
     python3 "$project_dir/Tests/workspace-app-checks.py" "$backend" "$checks_dir/WorkspaceChecks"
 fi

@@ -56,8 +56,8 @@ struct SetupSnapshot: Equatable {
     var needsBackendUpdate = false
     var participation = false
     var background = false
-    var codex = false
-    var wired = false
+    var wiredAgents: [String] = []
+    var wired: Bool { !wiredAgents.isEmpty }
     var joined = false
     var sessions = 0
     var team: String?
@@ -148,6 +148,22 @@ struct SetupCommand {
     }
 }
 
+/// All workspaces in this app share the same dsh profile files.
+actor DshWakeSetup {
+    static let shared = DshWakeSetup()
+    private var pending: [URL: Task<Void, Error>] = [:]
+
+    func configure(home: URL, helper: URL, backend: URL) async throws {
+        if let task = pending[home] { return try await task.value }
+        let task = Task {
+            _ = try await SetupCommand.run(helper, ["setup-native-wake", "--backend", backend.path], home: home).checked()
+        }
+        pending[home] = task
+        defer { pending[home] = nil }
+        try await task.value
+    }
+}
+
 protocol SetupServicing: Sendable {
     func inspect() async -> SetupSnapshot
     func install() async throws
@@ -167,16 +183,14 @@ actor SetupService: SetupServicing {
     func inspect() async -> SetupSnapshot {
         let fm = FileManager.default
         var result = SetupSnapshot()
-        result.codex = fm.fileExists(atPath: home.appendingPathComponent(".codex").path) ||
-            [URL(fileURLWithPath: "/Applications"), home.appendingPathComponent("Applications")].contains { apps in
-                fm.fileExists(atPath: apps.appendingPathComponent("Codex.app").path) ||
-                    fm.isExecutableFile(atPath: apps.appendingPathComponent("ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex").path)
-            }
-        let config = (try? String(contentsOf: home.appendingPathComponent(".codex/config.toml"), encoding: .utf8)) ?? ""
-        result.wired = config.contains("mcp_servers.reason-network") && config.contains("reason-network")
         result.background = fm.fileExists(atPath: home.appendingPathComponent("Library/LaunchAgents/com.reasonmachines.network.plist").path)
         guard let executable = NetworkPaths.executable(home: home) else { return result }
         result.installed = true
+        do {
+            let candidates = [executable, NetworkPaths.workspaceExecutable(home: home)].compactMap { $0?.path }
+            let report = try await SetupCommand.run(installer.binary, ["app-integrations"] + candidates, home: home).checked()
+            result.wiredAgents = try JSONDecoder().decode([String].self, from: Data(report.utf8))
+        } catch { result.issue = InterfaceMessage { SetupInput.redacted(error.localizedDescription) } }
         do {
             let output = try await SetupCommand.run(executable, ["who", "--json"], home: home, timeout: 18).checked()
             let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -218,11 +232,14 @@ actor SetupService: SetupServicing {
         _ = try await SetupCommand.run(executable, arguments, home: home, timeout: 90).checked()
         try await installer.activate()
         if let backend = NetworkPaths.workspaceExecutable(home: home) {
-            _ = try await SetupCommand.run(backend, ["setup-native-wake"], home: home, timeout: 30).checked()
+            try await DshWakeSetup.shared.configure(home: home, helper: installer.binary, backend: backend)
         }
         let result = await inspect()
         guard result.background && result.participation && !result.needsBackendUpdate else { throw NetworkError("后台服务未安装成功，请展开详情或重试配置。") }
-        if result.codex && !result.wired { throw NetworkError("Codex 接入未完成，请检查配置文件权限后重试。") }
+        guard result.wired else {
+            if let issue = result.issue { throw NetworkError(localizing: { issue.text }) }
+            throw NetworkError("尚无已接入的工具。请先安装并打开一种支持的工具，再点击「配置后台与会话」。")
+        }
     }
     func join(invitation: String, name: String) async throws {
         let ticket = try SetupInput.invitation(invitation), person = try SetupInput.name(name)

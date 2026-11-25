@@ -18,6 +18,7 @@ git apply "$engine_dir/founder-admin.patch"
 git apply "$engine_dir/departure-notices.patch"
 git apply "$engine_dir/multi-agent-workspaces.patch"
 git apply "$engine_dir/native-agent-wake.patch"
+git apply "$engine_dir/app-integrations.patch"
 export MACOSX_DEPLOYMENT_TARGET=14.0
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 cargo test --locked --release founder_management_is_scoped_and_terminal

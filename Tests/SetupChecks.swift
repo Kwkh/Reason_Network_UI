@@ -75,8 +75,7 @@ elif cmd=='who':
  print(json.dumps({'team':'Fixture' if (h/'joined').exists() else None,'person':'fixture','machine':'test','sessions':[],'machines':[]}))
 elif cmd=='setup':
  (h/'setup-args.json').write_text(json.dumps(sys.argv[2:]))
- (h/'.codex').mkdir(exist_ok=True)
- (h/'.codex/config.toml').write_text('[mcp_servers.reason-network]\ncommand="reason-network"')
+ (h/'.dsh').mkdir(exist_ok=True)
  folder=h/'Library/LaunchAgents';folder.mkdir(parents=True,exist_ok=True)
  if '--no-service' not in sys.argv:
   (folder/'com.reasonmachines.network.plist').write_bytes(plistlib.dumps({'Label':'com.reasonmachines.network','ProgramArguments':[sys.argv[0],'daemon','--service'],'KeepAlive':True}))
@@ -100,6 +99,24 @@ else:
         try await service.configure()
         let configured = await service.inspect()
         try expect(configured.installed && configured.background && configured.wired && !configured.joined, "verified configuration remains distinct from membership")
+        try expect(configured.wiredAgents == ["dsh"] && !fm.fileExists(atPath: home.appendingPathComponent(".codex").path), "dsh alone passes first-run setup")
+        // A Codex config which merely mentions the server must not count.
+        let codex = home.appendingPathComponent(".codex")
+        try fm.createDirectory(at: codex, withIntermediateDirectories: true)
+        let config = codex.appendingPathComponent("config.toml")
+        try "# [mcp_servers.reason-network]".write(to: config, atomically: true, encoding: .utf8)
+        let commented = await service.inspect()
+        try expect(commented.wiredAgents == ["dsh"], "commented-out servers do not satisfy setup")
+        let quotedPath = String(decoding: try JSONEncoder().encode(executable.path), as: UTF8.self)
+            .replacingOccurrences(of: "\\/", with: "/")
+        try ("[mcp_servers.reason-network]\ncommand = " + quotedPath + "\nargs = [\"mcp\"]\n")
+            .write(to: config, atomically: true, encoding: .utf8)
+        let hook = ["hooks": ["SessionStart": [["hooks": [["command": executable.path + " hook codex session-start"]]]]]]
+        try JSONSerialization.data(withJSONObject: hook, options: [.withoutEscapingSlashes])
+            .write(to: codex.appendingPathComponent("hooks.json"))
+        let multiple = await service.inspect()
+        try expect(multiple.wiredAgents == ["codex", "dsh"], "configured Codex and dsh are both recognized")
+        try fm.removeItem(at: codex)
         let plist = home.appendingPathComponent("Library/LaunchAgents/com.reasonmachines.network.plist")
         let data = try Data(contentsOf: plist)
         guard let installed = NetworkPaths.workspaceExecutable(home: home) else { throw NetworkError("Missing installed backend") }
@@ -144,7 +161,7 @@ actor SimulatedSetup: SetupServicing {
     var state = SetupSnapshot()
     func inspect() -> SetupSnapshot { state }
     func install() { state.installed = true }
-    func configure() { state.participation = true; state.background = true; state.wired = true; state.codex = true }
+    func configure() { state.participation = true; state.background = true; state.wiredAgents = ["dsh"] }
     func join(invitation: String, name: String) throws {
         state.joined = true; state.team = "Fixture"
         throw NetworkError("response timed out")

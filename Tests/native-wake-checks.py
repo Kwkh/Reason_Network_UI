@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import plistlib
 from pathlib import Path
 import shutil
 import socket
@@ -62,7 +63,20 @@ with tempfile.TemporaryDirectory(dir="/tmp", prefix="rn-wake-") as tmp:
         assert not request("set_receive_mode", key=key, network=team, mode="push")["ok"]
         dsh = home/".dsh"
         dsh.mkdir()
-        subprocess.run([binary, "setup-native-wake"], env=env, check=True)
+        app_check = None
+        if len(sys.argv) > 2:
+            plist = home/"Library/LaunchAgents/com.reasonmachines.network.plist"
+            plist.parent.mkdir(parents=True)
+            plist.write_bytes(plistlib.dumps({"ProgramArguments":[str(binary),"daemon","--service"]}))
+            app_command = [sys.argv[2], home, "dsh-push", binary, team, sid]
+            app_check = subprocess.Popen(app_command, env=env)
+            processes.append(app_check)
+            for _ in range(100):
+                if (dsh/"cordis.patch.yml").exists(): break
+                time.sleep(.04)
+            assert (dsh/"reason-network-wake.mjs").is_file()
+        else:
+            subprocess.run([binary, "setup-native-wake"], env=env, check=True)
         assert "reason-network-wake.mjs" in (dsh/"cordis.patch.yml").read_text()
         # Use the plugin installed by setup; the stand-in records the actual followup invocation.
         fixture = home/"host.mjs"
@@ -73,10 +87,23 @@ let dispose;apply({agents:{get:k=>k===id?agent:null,list:()=>[agent]},on(){},log
 process.on('SIGTERM',()=>{dispose();process.exit()});""")
         host = subprocess.Popen([shutil.which("node"),fixture,sid], cwd=home, env=env)
         processes.append(host)
-        for _ in range(100):
-            if request("set_receive_mode", key=key, network=team, mode="push")["ok"]: break
-            time.sleep(.05)
-        else: raise TimeoutError("dsh adapter discovery")
+        if app_check is not None:
+            assert app_check.wait(timeout=10) == 0
+            with sqlite3.connect(state/"network.db") as db:
+                assert db.execute("SELECT value FROM kv WHERE key=?", ("receive-mode:"+key,)).fetchone() == ("push",)
+            # Another registered thread has no listener. This open host must not satisfy it.
+            other = str(uuid4())
+            hook("dsh", other, "other")
+            call("set_receive_mode", key="dsh:"+other, network=team, mode="pull")
+            refused = subprocess.run([*app_command[:-1], other], env=env, capture_output=True, text=True, timeout=12)
+            assert refused.returncode == 1 and "dsh" in refused.stdout
+            with sqlite3.connect(state/"network.db") as db:
+                assert db.execute("SELECT value FROM kv WHERE key=?", ("receive-mode:dsh:"+other,)).fetchone() == ("pull",)
+        else:
+            for _ in range(100):
+                if request("set_receive_mode", key=key, network=team, mode="push")["ok"]: break
+                time.sleep(.05)
+            else: raise TimeoutError("dsh adapter discovery")
         send(addr,"fyi",False)
         receipt=send(addr,"wake")
         for _ in range(100):
@@ -97,6 +124,17 @@ process.on('SIGTERM',()=>{dispose();process.exit()});""")
         assert "manual" in pending(key)
         host.terminate();host.wait(timeout=5)
         assert not request("set_receive_mode", key=key, network=team, mode="push")["ok"]
+        if app_check is not None:
+            # A user-managed server gets only the wake row, and retains its own settings.
+            patch = dsh/"cordis.patch.yml"
+            custom = ("- insert:\n    - id: custom-mcp\n      name: '@deepseek-ai/dsh-mcp-client'\n"
+                      "      config:\n        serverName: reason-network\n        command: '/custom/server'\n")
+            patch.write_text(custom)
+            for _ in range(2):
+                subprocess.run([binary,"setup-native-wake","--backend",binary], env=env, check=True)
+            contents = patch.read_text()
+            assert contents.startswith(custom) and contents.count("serverName: reason-network") == 1
+            assert contents.count("id: reason-network-wake") == 1
         registry=home/".claude/sessions"
         registry.mkdir(parents=True)
         file=registry/(str(os.getpid())+".json")

@@ -4,17 +4,17 @@ SwiftUI 原生消息控制台。界面不使用 WebView，不启动浏览器、H
 
 ## 安装与首次配置
 
-从 [GitHub Releases](https://github.com/Kwkh/Reason_Network_UI/releases) 下载 Universal DMG，将 App 拖入 Applications。GitHub 上的 1.2.0 发行包内含 Developer ID 签名并通过 Apple 公证的 App。已有安装请打开「环境配置」，点击「更新兼容后台」启用多工具会话和原对话唤醒。
+从 [GitHub Releases](https://github.com/Kwkh/Reason_Network_UI/releases) 下载 Universal DMG，将 App 拖入 Applications。GitHub 上的 1.2.1 发行包内含 Developer ID 签名并通过 Apple 公证的 App。已有 1.2.0 后台可直接使用本次首次配置和 dsh 推送修复。
 
-首次启动自动检查内置兼容后台、登录服务、Codex 接入与 Network 状态；已配置的机器直接进入聊天。新机流程：
+首次启动自动检查内置兼容后台、登录服务、会话工具接入与 Network 状态；已配置的机器直接进入聊天。新机流程：
 
 1. **安装并配置**：从 App 内安装双架构 `reason-network 0.12.17`，接入代理 MCP / hooks 并启动支持逐会话退出的登录服务。普通用户无需 Rust、Python 或终端。
 2. **加入 Network**：在 App 内粘贴邀请链接、完整邀请行或四词一次性代码，填写名称。邀请方需要在线；同一身份的新机器请向原机器获取一次性代码。已有团队不会被替换；状态不明时先重新检查。
-3. **进入聊天**：重启 Codex 并在目标对话中发一条消息，会话即可出现。已配置但尚无在线会话时也可进入 UI。
+3. **进入聊天**：在「我的会话」中选择已配置工具的原对话。已配置但尚无在线会话时也可进入 UI。
 
 可从右上角状态面板的「环境配置」重新打开引导。安装失败可重试；加入超时后会重新检查成员状态，不自动重发。邀请凭证不保存到偏好设置，错误输出会隐藏完整邀请。
 
-同时支持 `~/.local/bin/reason-network` 和官方 Reason CLI 的 `~/.reason/bin/reason-network`；配置时保留已有同版本 CLI，并备份原登录服务。App 不创建 UI 专属会话，不迁移旧机器的会话或聊天缓存。当前主要面向 Codex，会话本身的即时推送仍由官方接入负责。
+同时支持 `~/.local/bin/reason-network` 和官方 Reason CLI 的 `~/.reason/bin/reason-network`；配置时保留已有同版本 CLI，并备份原登录服务。App 不创建 UI 专属会话，不迁移旧机器的会话或聊天缓存。dsh 会话首次切换即时推送时，App 会在需要时补装唤醒插件并向后台确认该对话的生效模式。
 
 ## 从源码运行
 

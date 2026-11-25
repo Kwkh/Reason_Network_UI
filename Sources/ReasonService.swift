@@ -15,9 +15,11 @@ actor ReasonService {
     }
     private let networkRoot: URL
     private let expectedTeam: String?
+    private let wakeSetupHelper: URL
     private let secondary: Bool
     private var workspaceFolder: URL { home.appendingPathComponent(".reason/workspaces") }
-    init(home: URL = FileManager.default.homeDirectoryForCurrentUser, workspace: URL? = nil, expectedNetwork: String? = nil) {
+    init(home: URL = FileManager.default.homeDirectoryForCurrentUser, workspace: URL? = nil, expectedNetwork: String? = nil, wakeSetupHelper: URL? = nil) {
+        self.wakeSetupHelper = wakeSetupHelper ?? ParticipationInstaller(home: home).binary
         expectedTeam = expectedNetwork
         networkRoot = workspace ?? home.appendingPathComponent(".reason/network")
         secondary = workspace != nil
@@ -625,14 +627,37 @@ actor ReasonService {
         return Set(try database.rows("SELECT key FROM paused_sessions").compactMap { $0["key"] })
     }
 
-    func setReceiveMode(_ mode: ReceiveMode, local: LocalSession, network: String) throws -> ReceiveMode {
+    func setReceiveMode(_ mode: ReceiveMode, local: LocalSession, network: String) async throws -> ReceiveMode {
         try verifyLocalThreads([local.key])
         struct Reply: Decodable { let effective: ReceiveMode }
-        do {
-            return try console.decode(["op": "set_receive_mode", "key": local.key, "network": network, "mode": mode.rawValue],
-                                      as: Reply.self, timeout: mode == .push ? 65 : 5).effective
-        } catch let error as NetworkError where error.message.contains("unknown variant") {
+        func apply() throws -> ReceiveMode {
+            try console.decode(["op": "set_receive_mode", "key": local.key, "network": network, "mode": mode.rawValue],
+                               as: Reply.self, timeout: mode == .push ? 65 : 5).effective
+        }
+        // This response from the 1.2.0 daemon specifically means the native
+        // endpoint for this session is missing or ambiguous.
+        let missingWake = "Open the original dsh session with the Reason Network wake plugin enabled."
+        do { return try apply() }
+        catch let error as NetworkError where error.message.contains("unknown variant") {
             throw NetworkError("当前后台未支持接收模式设置，请在「环境配置」中更新兼容后台。")
+        } catch let error as NetworkError where mode == .push && local.agent == "dsh" && error.message == missingWake {
+            guard let backend = NetworkPaths.workspaceExecutable(home: home) else {
+                throw NetworkError("请先在「环境配置」中配置后台与会话。")
+            }
+            try await DshWakeSetup.shared.configure(home: home, helper: wakeSetupHelper, backend: backend)
+            // Every attempt is scoped to the original Network and registration key.
+            // Offline, removed and switched-Network errors should surface immediately.
+            let deadline = ContinuousClock.now + .seconds(5)
+            while true {
+                try Task.checkCancellation()
+                do { return try apply() }
+                catch let error as NetworkError where error.message == missingWake {
+                    guard ContinuousClock.now < deadline else {
+                        throw NetworkError("尚未确认这个 dsh 原对话的推送通道。请在 DeepSeek Harness 中重新打开该对话，再选择即时推送。")
+                    }
+                    try await Task.sleep(for: .milliseconds(250))
+                }
+            }
         }
     }
 

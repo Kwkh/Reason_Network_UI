@@ -36,7 +36,7 @@ final class SetupModel: ObservableObject {
     func install() async {
         await perform("正在安装内置后台…") {
             try await self.service.install()
-            self.activity = "正在接入后台与 Codex…"
+            self.activity = "正在配置后台与会话…"
             try await self.service.configure()
         }
     }

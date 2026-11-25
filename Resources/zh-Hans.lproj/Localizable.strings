@@ -357,3 +357,10 @@
 "Open the original dsh session with the Reason Network wake plugin enabled." = "请在环境配置中配置唤醒插件，然后在 dsh 中重新打开原对话。";
 
 "Claude Code push channel is unavailable." = "原 Claude Code 对话的推送通道尚未就绪，请在 Claude Code 中打开该对话。";
+"正在配置后台与会话…" = "正在配置后台与会话…";
+"已接入：%@" = "已接入：%@";
+"会话工具接入" = "会话工具接入";
+"支持 Codex、Claude Code、Gemini CLI 和 dsh，配置其中一种即可继续。" = "支持 Codex、Claude Code、Gemini CLI 和 dsh，配置其中一种即可继续。";
+"尚无已接入的工具。请先安装并打开一种支持的工具，再点击「配置后台与会话」。" = "尚无已接入的工具。请先安装并打开一种支持的工具，再点击「配置后台与会话」。";
+"请先在「环境配置」中配置后台与会话。" = "请先在「环境配置」中配置后台与会话。";
+"尚未确认这个 dsh 原对话的推送通道。请在 DeepSeek Harness 中重新打开该对话，再选择即时推送。" = "尚未确认这个 dsh 原对话的推送通道。请在 DeepSeek Harness 中重新打开该对话，再选择即时推送。";

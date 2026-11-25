@@ -1,0 +1,152 @@
+diff --git a/src/main.rs b/src/main.rs
+index 3123126..bd21302 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -276,7 +276,13 @@ enum Cmd {
+         no_service: bool,
+     },
+     /// Configure the native wake adapter for installed dsh profiles
+-    SetupNativeWake,
++    SetupNativeWake {
++        /// Stable installed executable used by dsh's MCP connection
++        #[arg(long)]
++        backend: Option<std::path::PathBuf>,
++    },
++    /// Report configured chat tools without changing their settings
++    AppIntegrations { executables: Vec<std::path::PathBuf> },
+     /// Check that everything is working
+     Doctor,
+     /// Update to the latest release (with the Reason CLI, `reason update` does it)
+@@ -327,6 +333,10 @@ enum Cmd {
+ async fn main() -> Result<()> {
+     migrate::as_ours();
+     let cmd = Cli::parse().cmd;
++    if let Some(Cmd::AppIntegrations { executables }) = &cmd {
++        println!("{}", setup::app_integrations(executables));
++        return Ok(());
++    }
+     paths::migrate();
+     match cmd {
+         Some(Cmd::Daemon { service }) => {
+@@ -693,7 +703,8 @@ async fn cli(cmd: Cmd) -> Result<()> {
+             println!("Dropped {n}.");
+         }
+         Cmd::Setup { dry_run, remove, no_service } => setup::run(dry_run, remove, no_service).await?,
+-        Cmd::SetupNativeWake => setup::setup_native_wake()?,
++        Cmd::SetupNativeWake { backend } => setup::setup_native_wake(backend)?,
++        Cmd::AppIntegrations { .. } => unreachable!("handled before state migration"),
+         Cmd::Doctor => setup::doctor().await?,
+         Cmd::Upgrade => {
+             if managed() {
+diff --git a/src/setup.rs b/src/setup.rs
+index 5e488a9..1f412cb 100644
+--- a/src/setup.rs
++++ b/src/setup.rs
+@@ -812,7 +812,7 @@ fn dsh_patch_text(text: &str, block: &str, remove: bool) -> Result<Option<String
+         Some((b, e)) => format!("{}{block}{}", &text[..b], &text[e..]),
+         None if remove => return Ok(None),
+         None => {
+-            if dsh_has_server(text) {
++            if dsh_has_server(text) && dsh_has_server(&block) {
+                 return Err(anyhow!("it already has a {AGENT_NAME} MCP server of your own; left as is"));
+             }
+             let entries = dsh_entries(text);
+@@ -838,8 +838,10 @@ fn dsh_patch_text(text: &str, block: &str, remove: bool) -> Result<Option<String
+     Ok((new != text).then_some(new))
+ }
+ 
+-pub fn setup_native_wake() -> Result<()> {
+-    dsh(&crate::util::current_exe()?, false, false)?;
++pub fn setup_native_wake(backend: Option<PathBuf>) -> Result<()> {
++    let exe = backend.unwrap_or(crate::util::current_exe()?);
++    anyhow::ensure!(exe.is_absolute() && exe.is_file(), "Installed Reason backend is missing");
++    dsh(&exe, false, false)?;
+     Ok(())
+ }
+ 
+@@ -854,9 +856,24 @@ fn dsh(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
+         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+         Err(e) => return Err(e.into()),
+     };
+-    let block = dsh_block(exe);
+-    match dsh_patch_text(&text, &block, remove) {
+-        Ok(Some(new)) => {
++    // A manually configured MCP server can coexist with a managed wake-only
++    // block. On removal or a later refresh, only our marked rows are replaced.
++    let outside = dsh_patch_text(&text, "", true)?.unwrap_or_else(|| text.clone());
++    let block = if dsh_has_server(&outside) {
++        let plugin = dsh_command(&dsh_home().join("reason-network-wake.mjs"));
++        if !remove && dsh_entries(&outside).iter().any(|row| row.trim() == "- id: reason-network-wake") {
++            anyhow::bail!("{} already defines a custom reason-network-wake entry", path.display());
++        }
++        format!("{DSH_BEGIN}\n- insert:\n    - id: reason-network-wake\n      name: '{plugin}'\n{DSH_END}\n")
++    } else { dsh_block(exe) };
++    let change = dsh_patch_text(&text, &block, remove)
++        .with_context(|| path.display().to_string())?;
++    // A running Cordis host may reload immediately upon seeing the patch.
++    if !remove {
++        write_file(&dsh_home().join("reason-network-wake.mjs"), include_str!("dsh-wake.mjs"), dry)?;
++    }
++    match change {
++        Some(new) => {
+             r.lines.push(changed(&path, write_file(&path, &new, dry)?));
+             if !remove {
+                 r.notes.push(
+@@ -865,12 +882,7 @@ fn dsh(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
+                 );
+             }
+         }
+-        Ok(None) => r.lines.push(changed(&path, false)),
+-        // Skipped, not set up: `apply` says so, and the wizard doesn't count it among the agents it set up.
+-        Err(e) => return Err(anyhow!("{}: {e:#}", crate::util::tilde(&path.display().to_string()))),
+-    }
+-    if !remove {
+-        write_file(&dsh_home().join("reason-network-wake.mjs"), include_str!("dsh-wake.mjs"), dry)?;
++        None => r.lines.push(changed(&path, false)),
+     }
+     Ok(Some(r))
+ }
+@@ -1403,6 +1415,43 @@ const AGENTS: [Agent; 14] = [
+     },
+ ];
+ 
++/// The GUI can coexist with a stock CLI: hooks usually point at that CLI,
++/// while managed dsh profiles point at the separately installed backend.
++pub fn app_integrations(executables: &[PathBuf]) -> Value {
++    let mut paths: Vec<_> = executables.iter().filter(|p| p.is_file()).cloned().collect();
++    paths.extend(executables.iter().filter_map(|p| p.canonicalize().ok()));
++    paths.sort();
++    paths.dedup();
++    let configured = |command: Option<&str>| command.is_some_and(|c| paths.iter().any(|p| p == Path::new(c)));
++    let mut wired = Vec::new();
++    let hooks = std::fs::read_to_string(codex_home().join("hooks.json")).unwrap_or_default();
++    if let Ok(text) = std::fs::read_to_string(codex_home().join("config.toml"))
++        && let Ok(doc) = toml::from_str::<toml::Table>(&text)
++        && let Some(entry) = doc.get("mcp_servers").and_then(|s| s.get(AGENT_NAME))
++        && configured(entry.get("command").and_then(toml::Value::as_str))
++        && entry.get("enabled").and_then(toml::Value::as_bool) != Some(false)
++        && entry.get("args").and_then(toml::Value::as_array).is_some_and(|a| a.iter().any(|v| v.as_str() == Some("mcp")))
++        && hooks.contains("hook codex") && paths.iter().any(|p| contains(&hooks, &me(p)))
++    {
++        wired.push("codex");
++    }
++    // Claude setup adds a user-scoped MCP server. Read that scope directly;
++    // launching the interactive client to probe it can stall unrelated tools.
++    if let Ok(v) = read_json(&home().join(".claude.json"))
++        && configured(v["mcpServers"][AGENT_NAME]["command"].as_str())
++        && v["mcpServers"][AGENT_NAME]["args"].as_array().is_some_and(|a| a.iter().any(|v| v == "mcp"))
++    {
++        wired.push("claude-code");
++    }
++    if paths.iter().any(|p| gemini::wired(p)) { wired.push("gemini"); }
++    if let Ok(text) = std::fs::read_to_string(dsh_patch())
++        && paths.iter().any(|p| dsh_wired(&text, p))
++    {
++        wired.push("dsh");
++    }
++    json!(wired)
++}
++
+ /// The agents wired to the tincan binary beside `exe`, which move over to it.
+ pub fn legacy_wiring(exe: &Path) -> Vec<&'static str> {
+     let old = legacy_exe(exe);

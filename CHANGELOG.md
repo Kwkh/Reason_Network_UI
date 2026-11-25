@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.1 (20)
+
+- 首次配置会识别已接入的 Codex、Claude Code、Gemini CLI 和 dsh。配置任意一种即可加入或新建 Network，只用 dsh 的设备也能完成向导。
+- 后安装 dsh 的设备首次选择「即时推送」时，App 会按需补装唤醒插件，并向当前 Network 的后台确认所选原对话的生效模式。原对话仍未就绪时，App 会提示重新打开该对话后重试。
+
 ## 1.2.0 (19)
 
 - Codex、Claude Code、Gemini CLI 和 dsh 对话均可作为本机发送方。各 Network 独立保存接入状态、收发记录与回复地址。
