@@ -31,9 +31,9 @@ struct AppRootView: View {
             }
         }
         .task {
-            await setup.check()
+            await setup.start()
             workspaces.reload()
-            entered = !workspaces.items.isEmpty || setup.snapshot.ready || (setup.snapshot.installed && setup.snapshot.background && setup.snapshot.wired && setup.snapshot.issue != nil)
+            entered = setup.error == nil && (!workspaces.items.isEmpty || setup.snapshot.ready || (setup.snapshot.installed && setup.snapshot.background && setup.snapshot.wired && setup.snapshot.issue != nil))
         }
         .onChange(of: network.departureCount) {
             guard network.departureCount > 0, network.directory == nil else { return }

@@ -341,12 +341,13 @@ struct PersonalSessionCatalog {
 
 struct SessionSocket {
     let socketURL: URL
-    func request(_ payload: [String: Any], timeout: Int = 5, onlyFrom executable: URL? = nil) throws -> Data {
+    private func connectedSocket(timeout: Int) throws -> Int32 {
         let path = socketURL.path
         guard path.utf8.count < 104 else { throw NetworkError("数据目录路径过长，无法连接本机服务。") }
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw NetworkError("无法创建本机连接。") }
-        defer { Darwin.close(fd) }
+        var connectedSocket = false
+        defer { if !connectedSocket { Darwin.close(fd) } }
         var time = timeval(tv_sec: timeout, tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &time, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &time, socklen_t(MemoryLayout<timeval>.size))
@@ -365,16 +366,30 @@ struct SessionSocket {
             }
         }
         guard connected == 0 else { throw NetworkError("本机网络服务尚未就绪，请检查本机服务。") }
-        if let executable {
-            // Verify the server on this very socket before asking a fallback CLI daemon to exit.
-            var pid: pid_t = 0
-            var length = socklen_t(MemoryLayout<pid_t>.size)
-            var bytes = [CChar](repeating: 0, count: 4096)
-            guard getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &length) == 0, pid > 0,
-                  proc_pidpath(pid, &bytes, UInt32(bytes.count)) > 0,
-                  URL(fileURLWithPath: String(cString: bytes)).resolvingSymlinksInPath().path == executable.resolvingSymlinksInPath().path else {
-                throw NetworkError("本机连接由其他后台处理。")
-            }
+        connectedSocket = true
+        return fd
+    }
+
+    private func peerExecutable(_ fd: Int32) throws -> URL {
+        var pid: pid_t = 0
+        var length = socklen_t(MemoryLayout<pid_t>.size)
+        var bytes = [CChar](repeating: 0, count: 4096)
+        guard getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &length) == 0, pid > 0,
+              proc_pidpath(pid, &bytes, UInt32(bytes.count)) > 0 else { throw NetworkError("本机连接由其他后台处理。") }
+        return URL(fileURLWithPath: String(cString: bytes)).resolvingSymlinksInPath()
+    }
+
+    func peerExecutable() throws -> URL {
+        let fd = try connectedSocket(timeout: 1)
+        defer { Darwin.close(fd) }
+        return try peerExecutable(fd)
+    }
+
+    func request(_ payload: [String: Any], timeout: Int = 5, onlyFrom executable: URL? = nil) throws -> Data {
+        let fd = try connectedSocket(timeout: timeout)
+        defer { Darwin.close(fd) }
+        if let executable, try peerExecutable(fd).path != executable.resolvingSymlinksInPath().path {
+            throw NetworkError("本机连接由其他后台处理。")
         }
         var body = payload
         body["id"] = 1

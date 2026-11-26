@@ -129,9 +129,7 @@ struct WorkspaceStore: Sendable {
         let domain = "gui/" + String(getuid())
         let ctl = URL(fileURLWithPath: "/bin/launchctl")
         let plist = home.appendingPathComponent("Library/LaunchAgents").appendingPathComponent(label + ".plist")
-        let environment = NetworkPaths.workspaceEnvironment(root).merging(["HOME": home.path, "PATH": NetworkPaths.environment(home: home)["PATH"] ?? "/usr/bin:/bin"]) { _, new in new }
-        let job: [String: Any] = ["Label": label, "ProgramArguments": [binary.path,"daemon","--service"],
-                                 "EnvironmentVariables": environment, "RunAtLoad": true, "KeepAlive": true, "ThrottleInterval": 1]
+        let job = ParticipationInstaller.workspaceJob(home: home, root: root, binary: binary)
         let data = try PropertyListSerialization.data(fromPropertyList: job, format: .xml, options: 0)
         let old = try? Data(contentsOf: plist)
         if old != data { try data.write(to: plist, options: .atomic) }

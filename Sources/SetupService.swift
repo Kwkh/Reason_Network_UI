@@ -62,7 +62,7 @@ struct SetupSnapshot: Equatable {
     var sessions = 0
     var team: String?
     var issue: InterfaceMessage?
-    var ready: Bool { installed && background && participation && wired && joined }
+    var ready: Bool { installed && background && participation && wired && joined && !needsBackendUpdate }
 }
 
 enum SetupInput {
@@ -165,6 +165,7 @@ actor DshWakeSetup {
 }
 
 protocol SetupServicing: Sendable {
+    func updateAtLaunch() async throws
     func inspect() async -> SetupSnapshot
     func install() async throws
     func configure() async throws
@@ -181,6 +182,11 @@ actor SetupService: SetupServicing {
         let installer = installer ?? ParticipationInstaller(home: home)
         self.installer = installer
         self.setupHelper = setupHelper ?? installer.binary
+    }
+
+    func updateAtLaunch() async throws {
+        guard installer.managed else { return }
+        try await installer.activate()
     }
 
     func inspect() async -> SetupSnapshot {
@@ -203,8 +209,8 @@ actor SetupService: SetupServicing {
             result.sessions = directory.sessions.filter { $0.person == directory.person && $0.machine == directory.machine && LocalSession.supportedAgents.contains($0.agent ?? "") && $0.tier != "none" }.count
         } catch { result.issue = InterfaceMessage { SetupInput.redacted(error.localizedDescription) } }
         if installer.configured {
-            result.needsBackendUpdate = installer.needsPathMigration
-            result.participation = installer.probe(home)
+            result.needsBackendUpdate = (try? await installer.needsUpdate()) ?? true
+            result.participation = NetworkPaths.workspaceExecutable(home: home).map { installer.probe(home.appendingPathComponent(".reason/network"), $0) } ?? false
             if !result.participation && ParticipationInstaller.capabilities(at: home) != nil {
                 result.participation = true
                 result.needsBackendUpdate = true
@@ -233,11 +239,7 @@ actor SetupService: SetupServicing {
         try await installer.validate(cli: executable)
         let arguments = ["setup-app-agents", "--cli", executable.path] + (installer.configured ? ["--no-service"] : [])
         _ = try await SetupCommand.run(setupHelper, arguments, home: home, timeout: 90).checked()
-        try await installer.activate()
-        if let backend = NetworkPaths.workspaceExecutable(home: home) {
-            _ = try await SetupCommand.run(installer.binary, ["setup-agent-join", "--backend", backend.path], home: home).checked()
-            try await DshWakeSetup.shared.configure(home: home, helper: installer.binary, backend: backend)
-        }
+        try await installer.activate(refreshBindings: true)
         let result = await inspect()
         guard result.background && result.participation && !result.needsBackendUpdate else { throw NetworkError("后台服务未安装成功，请展开详情或重试配置。") }
         guard result.wired else {

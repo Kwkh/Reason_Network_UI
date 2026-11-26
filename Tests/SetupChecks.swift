@@ -13,7 +13,10 @@ struct SetupChecks {
     @MainActor static func checkModel() async throws {
         let service = SimulatedSetup()
         let model = SetupModel(service: service)
-        await model.check()
+        await model.start()
+        await model.start()
+        let launchCount = await service.launchCount
+        try expect(launchCount == 1, "check services once on first presentation")
         try expect(model.checked && !model.snapshot.installed, "new machine opens setup")
         await model.install()
         try expect(model.step == 1 && !model.busy, "installation progresses to network entry")
@@ -44,7 +47,7 @@ struct SetupChecks {
 #!/bin/sh
 echo "$1" >> "$HOME/control.log"
 case "$1" in
-  bootstrap) if [ -f "$HOME/fail-next" ]; then /bin/rm "$HOME/fail-next"; exit 1; fi; touch "$HOME/running";;
+  bootstrap) if [ -f "$HOME/fail-next" ]; then /bin/rm "$HOME/fail-next"; exit 1; fi; touch "$HOME/running"; /bin/rm -f "$HOME/stale-worker";;
   bootout) /bin/rm -f "$HOME/running";;
   print) test -e "$HOME/running";;
 esac
@@ -52,8 +55,9 @@ esac
         try control.write(to: launchctl, atomically: true, encoding: .utf8)
         try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: launchctl.path)
         let embedded = URL(fileURLWithPath: CommandLine.arguments[1])
-        let installer = ParticipationInstaller(home: home, binary: embedded, launchctl: launchctl, probe: {
-            FileManager.default.fileExists(atPath: $0.appendingPathComponent("running").path)
+        let installer = ParticipationInstaller(home: home, binary: embedded, launchctl: launchctl, probe: { root, _ in
+            let running = FileManager.default.fileExists(atPath: home.appendingPathComponent("running").path)
+            return running && (root.lastPathComponent == "network" || !FileManager.default.fileExists(atPath: home.appendingPathComponent("stale-worker").path))
         })
         let service = SetupService(home: home, installer: installer, setupHelper: home.appendingPathComponent(".local/bin/reason-network"))
         let empty = await service.inspect()
@@ -96,7 +100,7 @@ else:
         do { try await service.configure(); throw NetworkError("FAIL: activation unexpectedly succeeded") }
         catch let e as NetworkError where e.message.hasPrefix("FAIL:") { throw e }
         catch { }
-        try expect(!installer.configured && installer.probe(home), "failed migration restores original job and reloads service")
+        try expect(!installer.configured && installer.probe(home, embedded), "failed migration restores original job and reloads service")
         try await service.configure()
         let configured = await service.inspect()
         try expect(configured.installed && configured.background && configured.wired && !configured.joined, "verified configuration remains distinct from membership")
@@ -130,13 +134,35 @@ else:
         try PropertyListSerialization.data(fromPropertyList: oldJob, format: .xml, options: 0).write(to: plist)
         let legacyState = await service.inspect()
         try expect(legacyState.needsBackendUpdate && legacyState.participation, "healthy legacy install offers name migration")
-        try await installer.activate()
+        try await service.updateAtLaunch()
         try expect(try Data(contentsOf: plist) == data && fm.fileExists(atPath: legacy.path), "name migration keeps rollback binary")
         let log = home.appendingPathComponent("control.log")
         let before = try Data(contentsOf: log)
         try expect(configured.participation && installer.configured, "compatible background installed and probed")
         try await service.configure()
         try expect(try Data(contentsOf: log) == before, "repair does not restart healthy daemon")
+        // Disk already names the new binary. The old workspace socket is still serving.
+        let root = home.appendingPathComponent(".reason/workspaces").appendingPathComponent(UUID().uuidString)
+        let workspaceJob = ParticipationInstaller.workspaceJob(home: home, root: root, binary: installed)
+        let worker = plist.deletingLastPathComponent().appendingPathComponent((workspaceJob["Label"] as! String) + ".plist")
+        try PropertyListSerialization.data(fromPropertyList: workspaceJob, format: .xml, options: 0).write(to: worker)
+        try Data().write(to: home.appendingPathComponent("stale-worker"))
+        let mixed = await service.inspect()
+        try expect(mixed.needsBackendUpdate, "workspace actually serving the wrong build is detected")
+        let controls = try String(contentsOf: log, encoding: .utf8)
+        try await service.updateAtLaunch()
+        let changes = try String(contentsOf: log, encoding: .utf8).dropFirst(controls.count).split(separator: "\n")
+        try expect(changes.filter { $0 == "bootout" }.count == 1, "only the stale workspace restarts")
+        let repaired = await service.inspect()
+        try expect(!repaired.needsBackendUpdate, "all processes and configurations match the bundled build")
+        let repairedLog = try Data(contentsOf: log)
+        try await service.updateAtLaunch()
+        try expect(try Data(contentsOf: log) == repairedLog, "next launch leaves healthy workers running")
+        var olderApp = installer
+        olderApp.appBuild = installer.appBuild - 1
+        olderApp.binary = executable // different bundled bytes, as in an older disk image
+        try await olderApp.activate()
+        try expect(try Data(contentsOf: log) == repairedLog, "opening an older app cannot roll back the newer backend")
         let setupArguments = try JSONDecoder().decode([String].self, from: Data(contentsOf: home.appendingPathComponent("setup-args.json")))
         try expect(setupArguments == ["--cli", executable.path, "--no-service"] && (try Data(contentsOf: plist)) == data, "repair retains participation daemon")
         try await service.join(invitation: token, name: "fixture")
@@ -160,6 +186,8 @@ else:
 
 actor SimulatedSetup: SetupServicing {
     var state = SetupSnapshot()
+    private(set) var launchCount = 0
+    func updateAtLaunch() { launchCount += 1 }
     func inspect() -> SetupSnapshot { state }
     func install() { state.installed = true }
     func configure() { state.participation = true; state.background = true; state.wiredAgents = ["dsh"] }

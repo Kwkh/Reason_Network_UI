@@ -27,6 +27,12 @@ final class SetupModel: ObservableObject {
         invitation = ""
         error = nil
     }
+    func start() async {
+        guard !checked && !busy else { return }
+        await perform("正在检查环境…") { try await self.service.updateAtLaunch() }
+        if error != nil { snapshot.needsBackendUpdate = true }
+    }
+
     func check() async {
         guard !busy else { return }
         busy = true; activity = "正在检查…"
