@@ -1,0 +1,312 @@
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2773,6 +2773,7 @@
+ dependencies = [
+  "anyhow",
+  "blake3",
++ "chrono",
+  "clap",
+  "cliclack",
+  "console",
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -13,6 +13,7 @@
+ 
+ [dependencies]
+ anyhow = "1"
++chrono = { version = "0.4", default-features = false, features = ["std"] }
+ blake3 = "1"
+ clap = { version = "4", features = ["derive"] }
+ cliclack = "0.5"
+--- a/src/codex.rs
++++ b/src/codex.rs
+@@ -94,7 +94,7 @@
+     db.query_row("SELECT cwd FROM threads WHERE id=? COLLATE NOCASE LIMIT 1", [id], |row| row.get(0)).ok()
+ }
+ 
+-pub(crate) fn display_title(id: &str) -> Option<String> {
++pub(crate) fn directory_metadata(id: &str) -> Option<(Option<String>, Option<PathBuf>)> {
+     use rusqlite::{Connection, OpenFlags};
+     let root = std::env::var_os("CODEX_HOME").map(PathBuf::from)
+         .unwrap_or_else(|| crate::paths::user_home().join(".codex"));
+@@ -102,8 +102,10 @@
+     db.busy_timeout(std::time::Duration::ZERO).ok()?;
+     db.query_row("SELECT * FROM threads WHERE id=? COLLATE NOCASE LIMIT 1", [id], |row| {
+         let name = row.get::<_,String>("name").ok().filter(|s| !s.trim().is_empty());
+-        Ok(name.or_else(|| row.get::<_,String>("title").ok()))
+-    }).ok().flatten()
++        let title = name.or_else(|| row.get::<_,String>("title").ok());
++        let rollout = row.get::<_,String>("rollout_path").ok().map(PathBuf::from).filter(|p| p.is_absolute());
++        Ok((title, rollout))
++    }).ok()
+ }
+ 
+ fn indexed_active(root: &Path, id: &str) -> Option<bool> {
+@@ -128,28 +130,43 @@
+ /// Whether the turn the rollout at `path` records last is still running. A rollout without a turn yet is idle.
+ /// `None` when it can't be read. Remembers how far it read, so later calls read only what was appended.
+ pub fn turn_running(path: &Path) -> Option<bool> {
+-    static SEEN: OnceLock<Mutex<HashMap<PathBuf, (u64, bool)>>> = OnceLock::new();
+-    // Only a regular file: opening a pipe a hook named would wait for a writer.
+-    if !std::fs::metadata(path).ok()?.is_file() {
+-        return None;
+-    }
++    Some(last_activity(path)?.is_some_and(|state| state.running))
++}
++
++/// None on a read failure; an empty result means no lifecycle event has been recorded.
++pub(crate) fn last_activity(path: &Path) -> Option<Option<crate::doing::TurnActivity>> {
++    use crate::doing::TurnActivity;
++    use std::time::SystemTime;
++    struct Cursor {
++        end: u64,
++        len: u64,
++        modified: Option<SystemTime>,
++        identity: (u64, u64),
++        activity: Option<TurnActivity>,
++    }
++    static SEEN: OnceLock<Mutex<HashMap<PathBuf, Cursor>>> = OnceLock::new();
++    if !std::fs::metadata(path).ok()?.is_file() { return None; }
++    let mut file = File::open(path).ok()?;
++    let meta = file.metadata().ok()?;
++    let len = meta.len();
++    let modified = meta.modified().ok();
++    #[cfg(unix)]
++    let identity = { use std::os::unix::fs::MetadataExt; (meta.dev(), meta.ino()) };
++    #[cfg(not(unix))]
++    let identity = (0, 0);
+     let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
+-    let mut file = File::open(path).ok()?;
+-    let len = file.metadata().ok()?.len();
+-    // Rollouts only grow: a shorter one was rewritten, and is read again.
+-    let (from, before) = match seen.get(path) {
+-        Some(&(at, running)) if at <= len => (at, running),
+-        _ => (0, false),
+-    };
++    let previous = seen.get(path).filter(|c| c.identity == identity &&
++        (c.len < len || (c.len == len && c.modified == modified)));
++    let (from, before) = previous.map_or((0, None), |c| (c.end, c.activity));
+     let (end, last) = last_turn_event(&mut file, from, len).ok()?;
+-    let running = last.unwrap_or(before);
+-    seen.insert(path.to_path_buf(), (end, running));
+-    Some(running)
++    let activity = last.or(before);
++    seen.insert(path.to_owned(), Cursor { end, len, modified, identity, activity });
++    Some(activity)
+ }
+ 
+ /// The last turn event in `from..to` (whole lines from `from`, which starts one), and where the last whole line in it
+ /// ends: a line still being written is read next time.
+-fn last_turn_event(file: &mut File, from: u64, to: u64) -> std::io::Result<(u64, Option<bool>)> {
++fn last_turn_event(file: &mut File, from: u64, to: u64) -> std::io::Result<(u64, Option<crate::doing::TurnActivity>)> {
+     // `rest`: the pieces of a line that begins in a chunk before, last piece first.
+     let (mut end, mut whole_to, mut rest) = (to, None, Vec::<Vec<u8>>::new());
+     while end > from {
+@@ -187,7 +204,7 @@
+ }
+ 
+ /// Some(true) for a line recording a turn's start, Some(false) for one recording its end.
+-fn turn_event(line: &[u8]) -> Option<bool> {
++fn turn_event(line: &[u8]) -> Option<crate::doing::TurnActivity> {
+     // Most lines are something else: parse only those that may be one.
+     let text = std::str::from_utf8(line).ok()?;
+     if !text.contains("event_msg") || !["task_", "turn_"].iter().any(|k| text.contains(k)) {
+@@ -197,11 +214,14 @@
+     if v["type"] != "event_msg" {
+         return None;
+     }
+-    match v["payload"]["type"].as_str()? {
+-        "task_started" | "turn_started" => Some(true),
+-        "task_complete" | "turn_complete" | "turn_aborted" => Some(false),
+-        _ => None,
+-    }
++    let running = match v["payload"]["type"].as_str()? {
++        "task_started" | "turn_started" => true,
++        "task_complete" | "turn_complete" | "turn_aborted" => false,
++        _ => return None,
++    };
++    let at = v["timestamp"].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
++        .map_or(0, |t| t.timestamp_millis());
++    Some(crate::doing::TurnActivity { running, at })
+ }
+ 
+ #[cfg(test)]
+--- a/src/doing.rs
++++ b/src/doing.rs
+@@ -16,6 +16,13 @@
+ /// How much of a transcript we read the first time we see it; after that, only what was appended.
+ const FIRST_READ: u64 = 2 << 20;
+ const MAX_LEN: usize = 120;
++
++/// A lifecycle observation from the original conversation. Times are Unix milliseconds.
++#[derive(Copy, Clone, Debug)]
++pub struct TurnActivity {
++    pub running: bool,
++    pub at: i64,
++}
+ 
+ /// Where to look for one session.
+ pub struct Source {
+--- a/src/dsh-wake.mjs
++++ b/src/dsh-wake.mjs
+@@ -1,6 +1,6 @@
+ // Cordis loads this plugin inside the host that owns the original dsh agent.
+ import { createHash, randomUUID } from 'node:crypto'
+-import { lstatSync, mkdirSync } from 'node:fs'
++import { lstatSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+ import { createServer } from 'node:net'
+ 
+ export const name = 'reason-network-wake'
+@@ -14,6 +14,16 @@
+     throw new Error('Reason Network requires a private dsh wake directory')
+   }
+   const servers = new Map()
++  function publish(agent, status) {
++    const server = servers.get(agent)
++    const socket = server?.address()
++    if (typeof socket !== 'string' || !['idle', 'running'].includes(status)) return
++    const path = socket + '.activity'
++    try {
++      writeFileSync(path + '.tmp', status, { mode: 0o600 })
++      renameSync(path + '.tmp', path)
++    } catch (e) { ctx.logger.warn('Reason Network activity: ' + e.message) }
++  }
+   function attach(agent) {
+     if (servers.has(agent) || agent.session.header.origin === 'subagent') return
+     const id = agent.session.header.id
+@@ -43,15 +53,23 @@
+     })
+     servers.set(agent, server)
+     server.on('error', e => ctx.logger.warn('Reason Network wake: ' + e.message))
+-    server.listen(root + '/' + prefix + '-' + process.pid + '.sock')
++    server.listen(root + '/' + prefix + '-' + process.pid + '.sock', () => publish(agent, agent.status))
+   }
+   function detach(agent) {
+     const server = servers.get(agent)
+     servers.delete(agent)
+-    if (server) server.close()
++    if (server) {
++      const socket = server.address()
++      if (typeof socket === 'string') {
++        try { rmSync(socket + '.activity', { force: true }) }
++        catch (e) { ctx.logger.warn('Reason Network activity: ' + e.message) }
++      }
++      server.close()
++    }
+   }
+   ctx.effect(() => {
+     ctx.on('agent/created', ({agent}) => attach(agent))
++    ctx.on('agent/status', ({agent, status}) => publish(agent, status))
+     ctx.on('agent/disposed', ({agent}) => detach(agent))
+     for (const agent of ctx.agents.list()) attach(agent)
+     return () => { for (const agent of servers.keys()) detach(agent) }
+--- a/src/dsh_wake.rs
++++ b/src/dsh_wake.rs
+@@ -26,6 +26,22 @@
+     { let _ = id; None }
+ }
+ 
++/// Only the live, unambiguous host of this native conversation can supply its state.
++pub fn activity(id: &str) -> Option<crate::doing::TurnActivity> {
++    let socket = endpoint(id)?;
++    let path = socket.with_extension("sock.activity");
++    let meta = path.symlink_metadata().ok()?;
++    if !meta.is_file() || meta.len() > 8 { return None; }
++    let updated = meta.modified().ok()?;
++    if socket.metadata().ok()?.created().is_ok_and(|created| updated < created) { return None; }
++    let running = match std::fs::read_to_string(path).ok()?.as_str() {
++        "running" => true,
++        "idle" => false,
++        _ => return None,
++    };
++    Some(crate::doing::TurnActivity { running, at: updated.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64 })
++}
++
+ pub fn post(id: &str, delivery: &str, text: &str) -> anyhow::Result<()> {
+     #[cfg(unix)]
+     {
+--- a/src/native_titles.rs
++++ b/src/native_titles.rs
+@@ -18,6 +18,8 @@
+     pub cwd: Option<String>,
+     pub project: Option<String>,
+     pub updated: f64,
++    #[serde(skip)]
++    pub activity: Option<crate::doing::TurnActivity>,
+ }
+ 
+ #[derive(Deserialize, Default)]
+@@ -33,6 +35,7 @@
+     session_id: Option<String>,
+     cwd: Option<String>,
+     r#type: Option<String>,
++    time: Option<serde_json::Value>,
+     ai_title: Option<String>,
+     custom_title: Option<String>,
+     summary: Option<String>,
+@@ -91,6 +94,13 @@
+             update_text(r.slug, &mut slug);
+         }
+         "dsh" => {
++            if let Some(running) = match r.r#type.as_deref() {
++                Some("turn/start") => Some(true),
++                Some("turn/end") => Some(false),
++                _ => None,
++            } {
++                e.activity = Some(crate::doing::TurnActivity { running, at: r.time.and_then(|t| t.as_i64()).unwrap_or(0) });
++            }
+             if e.id.is_empty()
+                 && let Some(id) = r.id
+             {
+--- a/src/daemon/directory.rs
++++ b/src/daemon/directory.rs
+@@ -112,21 +112,31 @@
+             });
+             live.chain(unmanaged).collect()
+         };
+-        let (doings, titles) = tokio::task::spawn_blocking(move || {
++        let (doings, titles, activities) = tokio::task::spawn_blocking(move || {
+             let mut titles = HashMap::new();
++            let mut activities = HashMap::new();
+             if sources.iter().any(|(_,s)| matches!(s.agent.as_str(),"claude-code"|"dsh"|"gemini")) {
+                 for e in crate::native_titles::catalog() {
+-                    if let Some(title)=e.title { titles.insert(format!("{}:{}",e.agent,e.id),title); }
++                    let key = format!("{}:{}", e.agent, e.id);
++                    if let Some(activity) = e.activity { activities.insert(key.clone(), activity); }
++                    if let Some(title) = e.title { titles.insert(key, title); }
+                 }
+             }
+             for (key, source) in &sources {
+-                if source.agent == "codex"
+-                    && let Some(title) = source.session.as_deref().and_then(crate::codex::display_title) {
+-                    titles.insert(key.clone(), title);
++                let Some(id) = source.session.as_deref() else { continue };
++                if source.agent == "codex" {
++                    let (title, path) = crate::codex::directory_metadata(id).unwrap_or_default();
++                    if let Some(title) = title { titles.insert(key.clone(), title); }
++                    if let Some(activity) = path.as_deref().or(source.transcript.as_deref())
++                        .and_then(crate::codex::last_activity).flatten() {
++                        activities.insert(key.clone(), activity);
++                    }
++                } else if source.agent == "dsh" && let Some(activity) = crate::dsh_wake::activity(id) {
++                    activities.insert(key.clone(), activity);
+                 }
+             }
+             let doings: HashMap<_,_> = sources.into_iter().filter_map(|(k,s)| Some((k,doing::of(&s)?))).collect();
+-            (doings,titles)
++            (doings, titles, activities)
+         })
+         .await?;
+ 
+@@ -146,6 +156,11 @@
+             if let Some((st, at)) = &l.status {
+                 row.status = st.clone();
+                 row.since = Some(*at);
++            }
++            if let Some(activity) = activities.get(&l.reg.key)
++                && (l.reg.agent == "dsh" || l.status.as_ref().is_none_or(|(_, at)| activity.at >= *at)) {
++                row.status = if activity.running { "busy" } else { "idle" }.into();
++                if activity.at > 0 { row.since = Some(activity.at); }
+             }
+             // Claude Code's registry knows whether the session is busy or idle.
+             if let Some(c) = claude.iter().find(|c| claude_match(c, &l.reg)) {

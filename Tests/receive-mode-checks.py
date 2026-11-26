@@ -1,4 +1,5 @@
 """Exercise the bundled daemon's receive modes on isolated mailboxes and a stub Codex CLI."""
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -102,6 +103,37 @@ fi
             addr = call("hook", agent="codex", event="stop", session_id=native, name="archive-test", cwd=root, mail=False)["address"]
             name = addr.split("/")[1]
             assert name in tiers()
+            rollout = home / "activity.jsonl"
+            catalog.execute("UPDATE threads SET rollout_path=? WHERE id=?", (str(rollout), native))
+            catalog.commit()
+            def record(kind):
+                with rollout.open("a") as f:
+                    stamp = datetime.now(timezone.utc).isoformat()
+                    f.write(json.dumps(dict(type="event_msg", timestamp=stamp, payload=dict(type=kind))) + "\n")
+            def status():
+                return next(s["status"] for s in call("who", all=False)["sessions"] if s["name"] == name)
+            record("task_started")
+            assert status() == "busy"
+            with rollout.open("a") as f:
+                f.write('{"type":"response_item","payload":{"type":"turn_aborted"}}\n')
+            assert status() == "busy"
+            record("turn_aborted")
+            assert status() == "idle"
+            time.sleep(.01)
+            call("hook", agent="codex", event="prompt", session_id=native, cwd=root, mail=False)
+            assert status() == "busy", "an older completed turn must not hide a new prompt"
+            record("task_complete")
+            assert status() == "idle"
+            # Re-register after a daemon restart, without an activity hook for this thread.
+            stop()
+            start()
+            hook("alpha")
+            hook("beta")
+            call("hook",agent="codex",event="app-join",session_id=native,name=name,cwd=root,mail=False)
+            # Give the native fixture a live owner, as a real desktop conversation would have.
+            instance = request("register", session=dict(key="codex:"+native,agent="codex",
+                agent_session_id=native,cwd=root,pid=os.getpid(),tier="pull"))
+            assert instance["ok"] and status() == "idle"
             for change in ["UPDATE threads SET archived=1", "DELETE FROM threads"]:
                 catalog.execute(change)
                 catalog.commit()
@@ -113,6 +145,7 @@ fi
             assert name in tiers()
             call("send", **{"from": "codex:" + native, "to": "qa/beta", "body": "restored fixture", "wake": False})
         print("PASS: native lifecycle hides archived and missing UUIDs, denies both send directions and restores original identity")
+        assert tiers()["alpha"] == "push", "a new Codex thread should default to push"
         before = tiers()["beta"]
         assert mode("pull") == "pull"
         send("manual sample")

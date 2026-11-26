@@ -1,46 +1,81 @@
 import AppKit
 import SwiftUI
 
+@MainActor @Observable
+final class InvitationCopyFeedback {
+    enum Phase: Int {
+        case ready, fetching, copied
+
+        var title: String {
+            switch self {
+            case .ready: L10n.text("复制邀请链接")
+            case .fetching: L10n.text("获取中…")
+            case .copied: L10n.text("已复制")
+            }
+        }
+    }
+
+    private(set) var phase = Phase.ready
+    private(set) var error: InterfaceMessage?
+    private var busy = false
+    private var reset: Task<Void, Never>?
+
+    func copy(link: () async throws -> String, isCurrent: () -> Bool, write: (String) -> Bool) async {
+        guard !busy else { return }
+        busy = true
+        error = nil
+        reset?.cancel()
+        let progress = Task {
+            do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
+            phase = .fetching
+        }
+        defer {
+            progress.cancel()
+            busy = false
+        }
+        do {
+            let value = try await link()
+            guard isCurrent() else { phase = .ready; return }
+            guard write(value) else {
+                phase = .ready
+                error = "复制失败"
+                return
+            }
+            phase = .copied
+            reset = Task { [weak self] in
+                do { try await Task.sleep(for: .seconds(2)) } catch { return }
+                self?.phase = .ready
+            }
+        } catch {
+            phase = .ready
+            if isCurrent() { self.error = "获取失败，请检查连接" }
+        }
+    }
+}
+
 struct CopyInvitationButton: View {
     @EnvironmentObject private var workspaces: WorkspaceController
     @EnvironmentObject private var model: NetworkModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var copyingInvite = false
-    @State private var copiedAt: ContinuousClock.Instant?
-    @State private var copyError: InterfaceMessage?
+    @State private var feedback = InvitationCopyFeedback()
 
     var body: some View {
-        let copied = copiedAt != nil
         HStack {
             Button {
-                guard !copyingInvite else { return }
-                copyingInvite = true
-                copyError = nil
+                let source = model
                 Task {
-                    defer { copyingInvite = false }
-                    do {
-                        let link = try await model.invitation()
-                        guard model === workspaces.current else { return }
+                    await feedback.copy(link: source.invitation, isCurrent: { source === workspaces.current }) { value in
                         NSPasteboard.general.clearContents()
-                        if NSPasteboard.general.setString(link, forType: .string) {
-                            copiedAt = .now
-                        } else {
-                            copiedAt = nil
-                            copyError = "复制失败"
-                        }
-                    } catch {
-                        guard model === workspaces.current else { return }
-                        copiedAt = nil
-                        copyError = "获取失败，请检查连接"
+                        return NSPasteboard.general.setString(value, forType: .string)
                     }
                 }
             } label: {
                 Label {
                     ZStack(alignment: .leading) {
-                        Text(L10n.text("复制邀请链接")).hidden().accessibilityHidden(true)
-                        Text(copied ? L10n.text("已复制") : L10n.text("复制邀请链接"))
-                            .contentTransition(reduceMotion ? .identity : .numericText(value: copied ? 1 : 0))
-                            .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: copied)
+                        Text(InvitationCopyFeedback.Phase.ready.title).hidden().accessibilityHidden(true)
+                        Text(feedback.phase.title)
+                            .contentTransition(reduceMotion ? .identity : .numericText(value: Double(feedback.phase.rawValue)))
+                            .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: feedback.phase)
                     }
                 } icon: {
                     Image(systemName: "link")
@@ -48,19 +83,12 @@ struct CopyInvitationButton: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityValue(copyingInvite ? L10n.text("获取中…") : "")
             Spacer()
-            if let copyError {
-                Text(copyError.text).foregroundStyle(.secondary).accessibilityAddTraits(.updatesFrequently)
+            if let error = feedback.error {
+                Text(error.text).foregroundStyle(.secondary).accessibilityAddTraits(.updatesFrequently)
             }
         }
         .font(.system(size: 12))
-        .task(id: copiedAt) {
-            guard let copiedAt else { return }
-            do { try await Task.sleep(until: copiedAt.advanced(by: .seconds(2)), clock: .continuous) }
-            catch { return }
-            if self.copiedAt == copiedAt { self.copiedAt = nil }
-        }
     }
 }
 

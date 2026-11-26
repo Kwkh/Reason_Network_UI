@@ -1,0 +1,17 @@
+--- a/src/daemon/sessions.rs
++++ b/src/daemon/sessions.rs
+@@ -59,6 +59,14 @@
+             Some(Tier::Push) if self.push_problem().is_some() => self.hook_mode(),
+             Some(Tier::Turn) => self.hook_mode(),
+             Some(mode) => mode,
++            // An automatic mode follows the original conversation's native channel.
++            // Do not persist it: only a user's explicit choice overrides later discovery.
++            None if matches!(self.reg.agent.as_str(), "dsh" | agent::CLAUDE_CODE)
++                && self.reg.agent_session_id.as_deref().is_some_and(|id| !id.is_empty()) => {
++                if self.push_problem().is_none() { Tier::Push }
++                else if self.reg.tier == Tier::Push { self.hook_mode() }
++                else { self.reg.tier }
++            }
+             None => self.reg.tier,
+         }
+     }

@@ -27,6 +27,8 @@ git apply "$engine_dir/session-join-diagnostics.patch"
 git apply "$engine_dir/agent-join-setup.patch"
 git apply "$engine_dir/dsh-presence.patch"
 git apply "$engine_dir/compact-replies.patch"
+git apply "$engine_dir/default-native-push.patch"
+git apply "$engine_dir/native-activity.patch"
 export MACOSX_DEPLOYMENT_TARGET=14.0
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 cargo test --locked --release native_rename_after_long_records_and_compression

@@ -5,6 +5,7 @@ import os
 import plistlib
 from pathlib import Path
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -44,6 +45,8 @@ with tempfile.TemporaryDirectory(dir="/tmp", prefix="rn-wake-") as tmp:
         raise TimeoutError("daemon")
     def hook(agent, sid, name):
         return call("hook", agent=agent, session_id=sid, name=name, event="stop", pid=os.getpid(), cwd=tmp, mail=False)["address"]
+    def tier(addr):
+        return next(row["tier"] for row in call("who", all=False)["sessions"] if row["address"] == addr)
     def send(to, body, wake=True):
         return call("send", **{"from":"codex:beta", "to":to, "body":body, "wake":wake})
     def pending(key):
@@ -82,8 +85,11 @@ with tempfile.TemporaryDirectory(dir="/tmp", prefix="rn-wake-") as tmp:
         fixture = home/"host.mjs"
         fixture.write_text("""import {apply} from './.dsh/reason-network-wake.mjs';
 import { appendFileSync } from 'node:fs';
-const id=process.argv[2], agent={id,session:{header:{id}},followup:m=>appendFileSync('received',JSON.stringify(m)+'\\n')};
-let dispose;apply({agents:{get:k=>k===id?agent:null,list:()=>[agent]},on(){},logger:console,effect:f=>{dispose=f()}});
+const id=process.argv[2], agent={id,status:'idle',session:{header:{id}},followup:m=>appendFileSync('received',JSON.stringify(m)+'\\n')};
+const handlers={};
+function report(status){agent.status=status;handlers['agent/status']({agent,status})}
+process.on('SIGUSR1',()=>report('running'));process.on('SIGUSR2',()=>report('idle'));
+let dispose;apply({agents:{get:k=>k===id?agent:null,list:()=>[agent]},on(event,fn){handlers[event]=fn},logger:console,effect:f=>{dispose=f()}});
 process.on('SIGTERM',()=>{dispose();process.exit()});""")
         host = subprocess.Popen([shutil.which("node"),fixture,sid], cwd=home, env=env)
         processes.append(host)
@@ -101,9 +107,26 @@ process.on('SIGTERM',()=>{dispose();process.exit()});""")
                 assert db.execute("SELECT value FROM kv WHERE key=?", ("receive-mode:dsh:"+other,)).fetchone() == ("pull",)
         else:
             for _ in range(100):
-                if request("set_receive_mode", key=key, network=team, mode="push")["ok"]: break
+                if tier(addr) == "push": break
                 time.sleep(.05)
             else: raise TimeoutError("dsh adapter discovery")
+        def expect_activity(status):
+            for _ in range(50):
+                rows = call("who", all=False)["sessions"]
+                if any(row["address"] == addr and row["status"] == status for row in rows): return
+                time.sleep(.05)
+            raise AssertionError(("missing dsh activity", status))
+        # Older plugin already running: native turn records can still supply activity.
+        log = dsh/"sessions"/"project"/sid/"session.v4.jsonl"
+        log.parent.mkdir(parents=True)
+        stamp = int(time.time() * 1000)
+        log.write_text(json.dumps(dict(type="session",id=sid,cwd=tmp))+"\n"+
+                       json.dumps(dict(type="turn/start",time=stamp))+"\n")
+        expect_activity("idle")  # Live runtime takes precedence over unfinished history.
+        host.send_signal(signal.SIGUSR1)
+        expect_activity("busy")
+        host.send_signal(signal.SIGUSR2)
+        expect_activity("idle")
         send(addr,"fyi",False)
         receipt=send(addr,"wake")
         for _ in range(100):
@@ -122,6 +145,12 @@ process.on('SIGTERM',()=>{dispose();process.exit()});""")
         call("set_receive_mode", key=key, network=team, mode="pull")
         send(addr,"manual")
         assert "manual" in pending(key)
+        # Simulate a legacy plugin that has an endpoint but publishes no activity.
+        activity = Path(f"/tmp/reason-dsh-{os.getuid()}/{digest}-{host.pid}.sock.activity")
+        activity.unlink()
+        expect_activity("busy")
+        with log.open("a") as f: f.write(json.dumps(dict(type="turn/end",time=stamp+1))+"\n")
+        expect_activity("idle")
         host.terminate();host.wait(timeout=5)
         assert not request("set_receive_mode", key=key, network=team, mode="push")["ok"]
         if app_check is not None:
@@ -145,7 +174,7 @@ process.on('SIGTERM',()=>{dispose();process.exit()});""")
                 file.write_text(json.dumps(dict(pid=os.getpid(),sessionId=session,cwd=tmp,messagingSocketPath=path)))
             register(sid)
             peer=hook("claude-code",sid,"claude")
-            call("set_receive_mode", key="claude-code:"+sid, network=team, mode="push")
+            assert tier(peer) == "push"
             send(peer,"claude wake")
             conn,_=server.accept()
             with conn: assert "claude wake" in json.loads(conn.makefile("rb").readline())["message"]["content"]

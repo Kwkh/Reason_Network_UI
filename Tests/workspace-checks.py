@@ -438,6 +438,11 @@ with tempfile.TemporaryDirectory(prefix="rn-ws-", dir="/tmp") as temp:
                 def status():
                     return next(row["status"] for row in call(a, "who", all=True)["sessions"] if row["name"] == name)
                 assert status() != "offline"
+                registered = next(row for row in call(a, "who", all=True)["sessions"] if row["name"] == name)
+                if agent == "dsh":
+                    assert registered["tier"] == "push"
+                else:  # This fixture's Claude registry entry has no messaging socket.
+                    assert registered["tier"] != "push"
                 native.terminate()
                 native.wait(timeout=5)
                 assert status() == "offline"
@@ -475,6 +480,7 @@ with tempfile.TemporaryDirectory(prefix="rn-ws-", dir="/tmp") as temp:
             with ExitStack() as first:
                 listen(first, keys[0])
                 rows = await_online(labels)
+                assert all(rows[label]["tier"] == "push" for label in labels)
                 call(b,"set_receive_mode",key="dsh:"+keys[0],network=team_b,mode="pull")
                 assert not set(labels).intersection(dsh_rows(a))
             await_online([labels[1]])
@@ -512,7 +518,7 @@ with tempfile.TemporaryDirectory(prefix="rn-ws-", dir="/tmp") as temp:
             start(b, participation=False)
             assert await_online(labels)[labels[0]]["tier"]=="pull"
             assert not set(labels).intersection(dsh_rows(a))
-            assert call(b,"set_receive_mode",key="dsh:"+keys[1],network=team_b,mode="push")["effective"] == "push"
+            assert dsh_rows(b)[labels[1]]["tier"] == "push"
             call(b, "hook", agent="codex", event="stop", pid=os.getpid(), session_id="beta", cwd=temp, mail=False)
             sent = request(a, "send", **{"from":"codex:beta", "to":team_b+"::qa/"+labels[1],
                                          "body":"push after presence recovery", "wake":True})

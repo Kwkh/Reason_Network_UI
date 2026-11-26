@@ -1690,10 +1690,23 @@ struct StatusView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var refreshing = false
     @State private var refreshResult: InterfaceMessage?
+    private static let horizontalInset: CGFloat = 16
+    private static let minimumActionWidth: CGFloat = 48
+
+    private var actionWidth: CGFloat {
+        let font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        let titles = ["断开", "断开中…", "重新接入", "接入中…"]
+        return titles.reduce(Self.minimumActionWidth) { width, key in
+            let title = L10n.text(key) as NSString
+            return max(width, ceil(title.size(withAttributes: [.font: font]).width))
+        }
+    }
+
     var body: some View {
+        let actionWidth = self.actionWidth
         ScrollView {
             VStack(alignment: .leading, spacing: 11) {
-                HStack(spacing: 8) {
+                HStack(spacing: Self.horizontalInset) {
                     HStack(spacing: 14) {
                         Text(L10n.text("本机会话")).font(.system(size: 12))
                         VStack(alignment: .leading, spacing: 4) {
@@ -1701,17 +1714,17 @@ struct StatusView: View {
                                 LocalSessionChoices()
                                 if model.locals.isEmpty { Text(L10n.text("暂无已连接的本机会话")) }
                             } label: {
-                                Text(model.own?.title ?? model.selectedLocal.nonEmpty ?? L10n.text("选择本机会话")).font(.system(size: 13, weight: .semibold))
+                                Text(model.own?.title ?? model.selectedLocal.nonEmpty ?? L10n.text("选择本机会话")).font(.system(size: 13, weight: .semibold)).lineLimit(1)
                             }
                             .menuStyle(.borderlessButton).accessibilityLabel(L10n.text("选择本机会话"))
                             Text((model.directory?.person ?? "") + "/" + model.selectedLocal).font(.system(size: 11, design: .monospaced)).lineLimit(2)
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .foregroundStyle(.primary).padding(10)
                     .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
-                    .layoutPriority(1)
                     Color.clear
-                        .frame(minWidth: 48, maxWidth: .infinity)
+                        .frame(width: actionWidth)
                         .overlay {
                             if let restriction = model.own?.restriction {
                                 Text(restriction.title).font(.system(size: 10)).foregroundStyle(.secondary)
@@ -1727,8 +1740,8 @@ struct StatusView: View {
                                     Text(title)
                                         .font(.system(size: 11, weight: .medium)).lineLimit(1)
                                         .contentTransition(reduceMotion ? .identity : .numericText(value: transitionValue))
-                                        .frame(minWidth: 48)
-                                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+                                        .fixedSize(horizontal: true, vertical: false)
+                                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                                         .contentShape(Rectangle())
                                 }
                                 .buttonStyle(StatusActionStyle(color: disconnect ? .disabledControlTextColor : .secondaryLabelColor))
@@ -1836,7 +1849,7 @@ struct StatusView: View {
                 .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: diagnostics)
                 .onChange(of: diagnostics) { _, expanded in if expanded { Task { await model.diagnose() } } }
             }
-            .padding(.horizontal, 16)
+            .padding(.horizontal, Self.horizontalInset)
             .padding(.vertical, 14)
             .onGeometryChange(for: CGFloat.self) { ceil($0.size.height) } action: { height in
                 let target = min(height, StatusViewport.maximumHeight)
@@ -1847,7 +1860,7 @@ struct StatusView: View {
             }
         }
         .scrollBounceBehavior(.basedOnSize)
-        .frame(width: 340)
+        .frame(width: 340 + actionWidth - Self.minimumActionWidth)
         .modifier(StatusViewport(height: viewportHeight))
         .fixedSize(horizontal: false, vertical: true)
         .background(Color(nsColor: .windowBackgroundColor))
