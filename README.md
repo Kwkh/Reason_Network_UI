@@ -1,5 +1,7 @@
 # Reason Network · macOS
 
+本分支用于 Windows 开发。[查看 Windows 开发与联调说明](WINDOWS.md)。下方保留 macOS v1.2.4 的项目说明，供移植时参考。
+
 SwiftUI 原生消息控制台。界面不使用 WebView，不启动浏览器、HTTP 服务或 Python。系统要求 macOS 14+，工程使用 Xcode 26.5 验证。
 
 ## 安装与首次配置
