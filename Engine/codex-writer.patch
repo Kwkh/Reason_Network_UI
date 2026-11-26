@@ -1,0 +1,141 @@
+--- a/src/codex.rs
++++ b/src/codex.rs
+@@ -29,9 +29,9 @@
+     Ok(())
+ }
+ 
+-/// A queue warning means the message already exists. Retry only the native
+-/// thread/resume request, with no message body or turn/start request.
+-pub(crate) async fn resume_queued(thread: &str) -> anyhow::Result<()> {
++/// Keep the subscription until the native queue command returns. Codex owns both
++/// the active turn and the idle timer after this connection goes away.
++pub(crate) async fn resume_for_wake(thread: &str) -> anyhow::Result<tokio_websockets::WebSocketStream<tokio::net::UnixStream>> {
+     use futures_util::{SinkExt, StreamExt};
+     use serde_json::{Value, json};
+     use tokio_websockets::{ClientBuilder, Message};
+@@ -43,7 +43,7 @@
+         let (mut ws, _) = ClientBuilder::from_uri("ws://localhost".parse()?).connect_on(socket).await?;
+         for (id,method,params) in [
+             (1, "initialize", json!({"clientInfo":{"name":"reason_network","version":"1","title":"Reason Network"}})),
+-            (2, "thread/resume", json!({"threadId":thread})),
++            (2, "thread/resume", json!({"threadId":thread,"config":{"thread_unload_delay_secs":1}})),
+         ] {
+             if id == 2 { ws.send(Message::text(r#"{"method":"initialized"}"#)).await?; }
+             let request = json!({"id":id,"method":method,"params":params});
+@@ -59,7 +59,7 @@
+                 break;
+             }
+         }
+-        Ok::<(),anyhow::Error>(())
++        Ok::<_,anyhow::Error>(ws)
+     }).await?
+ }
+ 
+@@ -67,15 +67,41 @@
+ /// agent identities and legacy process-based registrations follow the usual routing.
+ pub(crate) fn unavailable(key: &str) -> bool {
+     let Some(id) = key.strip_prefix("codex:") else { return false };
+-    if id.len() != 36 || !id.bytes().enumerate().all(|(i, b)| {
++    if !native_id(id) { return false; }
++    let root = std::env::var_os("CODEX_HOME").map(PathBuf::from)
++        .unwrap_or_else(|| crate::paths::user_home().join(".codex"));
++    indexed_active(&root, id) != Some(true)
++}
++
++fn native_id(id: &str) -> bool {
++    id.len() == 36 && id.bytes().enumerate().all(|(i, b)| {
+         if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_hexdigit() }
+-    }) {
+-        return false;
+-    }
+-    let root = std::env::var_os("CODEX_HOME").map(PathBuf::from)
+-        .unwrap_or_else(|| crate::paths::user_home().join(".codex"));
+-    indexed_active(&root, id) != Some(true)
+-}
++    })
++}
++
++/// Darwin reports native flock writers through F_GETLK. This query never obtains
++/// a lock, so observing a desktop thread cannot make the desktop lose a lease.
++#[cfg(target_os = "macos")]
++pub(crate) fn has_writer(id: &str) -> Option<bool> {
++    use std::os::fd::AsRawFd;
++    if !native_id(id) { return None; }
++    let root = std::env::var_os("CODEX_HOME").map(PathBuf::from)
++        .unwrap_or_else(|| crate::paths::user_home().join(".codex"));
++    let dir = root.join("thread-writer-locks");
++    if !dir.is_dir() { return None; } // Older Codex: use its native queue --resume.
++    let file = match File::open(dir.join(format!("{id}.lock"))) {
++        Ok(file) => file,
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
++        Err(_) => return None,
++    };
++    let mut lock = libc::flock { l_start: 0, l_len: 0, l_pid: 0, l_type: libc::F_WRLCK,
++        l_whence: libc::SEEK_SET as i16 };
++    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) };
++    (rc == 0).then_some(lock.l_type != libc::F_UNLCK)
++}
++
++#[cfg(not(target_os = "macos"))]
++pub(crate) fn has_writer(_: &str) -> Option<bool> { None }
+ 
+ fn index_path(root: &Path) -> Option<PathBuf> {
+     let (_, path) = std::fs::read_dir(root).ok()?.filter_map(|entry| {
+--- a/src/daemon/mail.rs
++++ b/src/daemon/mail.rs
+@@ -754,6 +754,24 @@
+                     }
+                     if codex::unavailable(&key) { return Err("local Codex thread unavailable".into()); }
+                 }
++                let thread = key.strip_prefix("codex:").filter(|_| bin == "codex");
++                let mut args = args;
++                let mut subscription = None;
++                let mut owner_queue = false;
++                if let Some(id) = thread {
++                    match codex::has_writer(id) {
++                        Some(false) => {
++                            // Load only the intended thread. Keep this Reason subscription alive through
++                            // enqueue so the native idle timer cannot fire between resume and queue.
++                            subscription = codex::resume_for_wake(id).await.ok();
++                            owner_queue = subscription.is_none() && codex::has_writer(id) == Some(true);
++                        }
++                        Some(true) => owner_queue = true,
++                        None => {}
++                    }
++                    if owner_queue { args.retain(|arg| arg != "--resume"); }
++                    if codex::unavailable(&key) { return Err("local Codex thread unavailable".into()); }
++                }
+                 let program = agent::command_for(bin).ok_or_else(|| format!("{bin} not found"))?;
+                 let out = crate::util::no_window(tokio::process::Command::from(program))
+                     .args(&args)
+@@ -765,16 +783,27 @@
+                 // waiting for the second step can replay an already queued message via hooks.
+                 if bin == "codex" {
+                     let o = out.await.map_err(|e| e.to_string())?;
++                    drop(subscription);
+                     if !o.status.success() {
+                         return Err(format!("queue exited with {}", o.status));
++                    }
++                    if owner_queue && let Some(id) = thread {
++                        if codex::has_writer(id) == Some(true) { return Ok(false); }
++                        // The old owner left during enqueue. The input already exists, so wake only.
++                        if !codex::unavailable(&key) && codex::resume_for_wake(id).await.is_ok() { return Ok(false); }
++                        return Ok(true);
+                     }
+                     let stderr = String::from_utf8_lossy(&o.stderr).to_ascii_lowercase();
+                     if let Some(warning) = stderr.lines().find(|line| line.contains("resum") && line.contains("warn")) {
+                         log(&format!("Codex wake for {key} ({ids:?}): {}", warning.chars().take(500).collect::<String>()));
+-                        if let Some(thread) = key.strip_prefix("codex:") {
++                        if warning.contains("already has an active writer")
++                            && thread.is_some_and(|id| codex::has_writer(id) == Some(true)) {
++                            return Ok(false);
++                        }
++                        if let Some(thread) = thread {
+                             if !codex::unavailable(&key) {
+-                                match codex::resume_queued(thread).await {
+-                                    Ok(()) => return Ok(false),
++                                match codex::resume_for_wake(thread).await {
++                                    Ok(_) => return Ok(false),
+                                     Err(e) => log(&format!("Codex resume retry {key} ({ids:?}): {e}")),
+                                 }
+                             }

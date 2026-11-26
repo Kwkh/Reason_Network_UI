@@ -4,7 +4,7 @@ SwiftUI 原生消息控制台。界面不使用 WebView，不启动浏览器、H
 
 ## 安装与首次配置
 
-从 [GitHub Releases](https://github.com/Kwkh/Reason_Network_UI/releases) 下载 Universal DMG，将 App 拖入 Applications。1.2.6 发行包内含通过 Apple 公证的 App 和配套后台。覆盖安装后首次打开 App，会自动更新主后台和各个 Network 的后台，并恢复已接入的对话。
+从 [GitHub Releases](https://github.com/Kwkh/Reason_Network_UI/releases) 下载 Universal DMG，将 App 拖入 Applications。发行包内含通过 Apple 公证的 App 和配套后台。覆盖安装后首次打开 App，会自动更新主后台和各个 Network 的后台，并恢复已接入的对话。
 
 首次启动自动检查内置兼容后台、登录服务、会话工具接入与 Network 状态；已配置的机器直接进入聊天。新机流程：
 

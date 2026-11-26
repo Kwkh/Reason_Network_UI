@@ -1,5 +1,6 @@
 """Exercise the bundled daemon's receive modes on isolated mailboxes and a stub Codex CLI."""
 from datetime import datetime, timezone
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,15 @@ if [ "$1 $2" = "queue --help" ]; then
   test ! -f "$HOME/unsupported" || exit 2
   if [ -f "$HOME/old-cli" ]; then echo 'codex queue --thread ID --message TEXT'; exit 0; fi
   echo 'codex queue --resume --thread ID --message TEXT'
+  exit 0
+fi
+if [ "$1 $2" = "queue --thread" ]; then
+  echo "$3" >> "$HOME/owner-dispatch"
+  echo "Queued message 11111111-2222-4333-8444-111111111111 for thread $3."
+  exit 0
+fi
+if [ "$1 $2" = "queue --resume" ] && [ "$4" = 11111111-2222-4333-8444-555555555555 ]; then
+  echo "$4" >> "$HOME/cold-dispatch"
   exit 0
 fi
 test "$1" = queue && test "$2" = --resume && test "$3" = --thread && test "$4" = alpha && test "$5" = --message || exit 2
@@ -145,6 +155,33 @@ fi
             assert name in tiers()
             call("send", **{"from": "codex:" + native, "to": "qa/beta", "body": "restored fixture", "wake": False})
         print("PASS: native lifecycle hides archived and missing UUIDs, denies both send directions and restores original identity")
+        locks = home / ".codex/thread-writer-locks"
+        locks.mkdir()
+        writer = (locks / (native + ".lock")).open("w")
+        fcntl.flock(writer, fcntl.LOCK_EX)
+        assert call("set_receive_mode", key="codex:"+native, network=network, mode="push")["effective"] == "push"
+        call("send", **{"from":"codex:beta", "to":addr, "body":"owned thread", "wake":True})
+        for _ in range(100):
+            with sqlite3.connect(state / "network.db") as db:
+                handed = db.execute("SELECT read_at FROM messages WHERE body='owned thread'").fetchone()
+            if handed and handed[0]: break
+            time.sleep(.05)
+        assert handed and handed[0]
+        writer.close()
+        assert (home / "owner-dispatch").read_text().splitlines() == [native]
+        assert not call("session_participation")["resume_pending"]
+        print("PASS: an existing writer consumes the original queue item without a competing resume")
+        # A stale unlocked file and an older app-server still use native queue --resume.
+        call("send", **{"from":"codex:beta", "to":addr, "body":"cold fallback", "wake":True})
+        for _ in range(100):
+            with sqlite3.connect(state / "network.db") as db:
+                handed = db.execute("SELECT read_at FROM messages WHERE body='cold fallback'").fetchone()
+            if handed and handed[0]: break
+            time.sleep(.05)
+        assert handed and handed[0]
+        assert (home / "cold-dispatch").read_text().splitlines() == [native]
+        (home / "server-ready").unlink(missing_ok=True)
+        print("PASS: a stale writer file with no control connection falls back to native wake once")
         assert tiers()["alpha"] == "push", "a new Codex thread should default to push"
         before = tiers()["beta"]
         assert mode("pull") == "pull"
