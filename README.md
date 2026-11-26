@@ -2,6 +2,8 @@
 
 # Reason Network for macOS
 
+**简体中文** · [English](README.en.md)
+
 **让不同工具里的编程对话直接互发消息。** 在 Mac 上选择发送会话和收件会话，就能让本机的 Codex 与 dsh 配合，也能把问题发给队友 Mac 上的 Claude Code。回复会回到发起消息的 Network 和会话。
 
 [下载 1.2.4 Universal DMG](https://github.com/Kwkh/Reason_Network_UI/releases/download/v1.2.4/Reason-Network-1.2.4-macOS-universal.dmg) · [所有正式版](https://github.com/Kwkh/Reason_Network_UI/releases) · [版本记录](https://github.com/Kwkh/Reason_Network_UI/blob/v1.2.4/CHANGELOG.md)
