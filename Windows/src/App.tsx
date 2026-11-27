@@ -186,17 +186,19 @@ export default function App() {
     person: string;
   }) => {
     if (!dialog) return;
+    // 新入网/建网只写主工作区：工作区已经是某个 Network 的家，不能覆盖。
     const output =
       dialog === "join"
-        ? await joinNetwork(network, fields.invite, fields.person)
-        : await createNetwork(network, fields.name, fields.person);
+        ? await joinNetwork(null, fields.invite, fields.person)
+        : await createNetwork(null, fields.name, fields.person);
     setDialog(null);
     setNotice(summarize(output, dialog === "join" ? "已加入 Network" : "已新建 Network"));
     setLocal(null);
     setPeer(null);
     setSnapshot(null);
     await refreshNetworks();
-    const next = await loadSnapshot(network, null, null);
+    setNetwork("primary");
+    const next = await loadSnapshot("primary", null, null);
     setSnapshot(next);
   };
 
