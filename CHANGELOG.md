@@ -2,6 +2,7 @@
 
 ## Windows 第二阶段（预览，进行中）
 
+- Codex 唤醒兜底：Windows 上用 `uds_windows` 连接 Codex 的 AF_UNIX 控制套接字，`codex queue --resume` 返回 resume 警告时补发 `initialize`/`thread/resume`；失败仍回落到消息排队。
 - 工作区：概览里可以新建或加入独立工作区，自动调用 `enable_workspaces`，用 `workspace-id` 记录团队 id；顶部 Network 菜单可在主工作区和各工作区之间切换。
 - 会话接入：概览列出本机会话，可暂停/恢复单个会话；暂停后从侧栏和目录消失，恢复后回来。操作直接走 daemon 命名管道并回读确认，失败时提示后台原始原因。
 - 加入工作区失败会清理半成品目录；同名身份等常见错误显示中文提示。

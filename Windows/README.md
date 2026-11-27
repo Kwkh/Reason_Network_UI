@@ -96,6 +96,7 @@ npm run tauri:build
 - 多工作区切换依赖 `~/.reason/workspaces` 下已有的数据库；在主工作区创建/加入
   Network 已支持，概览里的 Network 菜单可切换已有工作区，工作区可先用 CLI 入网
   （见 `../WINDOWS.md`）。
-- Windows 下 `codex queue --resume` 警告后的直接控制套接字重试未启用；消息仍会
-  排队，打开原线程即可继续。
+- Windows 的 Codex 控制套接字是 WinSock AF_UNIX：`resume_queued` 在阻塞线程里用
+  `uds_windows` + 同步 WebSocket 客户端完成 `initialize`/`thread/resume`；连接失败时
+  仍回落到“消息已排队，打开原线程即可继续”。真实 Codex 的端到端唤醒尚需手工联调。
 - 完整安装包、自动更新和安装器内置后台在后续阶段。

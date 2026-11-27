@@ -59,7 +59,8 @@ $PatchOrder = @(
     'dsh-presence',
     'compact-replies',
     'windows-workspaces',
-    'windows-codex-resume'
+    'windows-codex-resume',
+    'windows-codex-uds'
 )
 
 function Invoke-Checked {

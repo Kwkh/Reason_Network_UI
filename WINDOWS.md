@@ -30,7 +30,8 @@ labelColor 透明气泡、悬浮圆角输入区和概览 sheet。
 | --- | --- |
 | `Engine/build-windows.ps1` | 从固定上游提交 `5872711` 重建 Windows x64 后台，产出 `Engine/Bin/reason-network-backend.exe` |
 | `Engine/windows-workspaces.patch` | 在现有补丁序列之后应用：多工作区分发改用跨平台 `connect_in(home)`，Windows 走命名管道并校验 `daemon.lock` 里的 PID |
-| `Engine/windows-codex-resume.patch` | Windows 上停用直接连接 Codex AF_UNIX 控制套接字的兜底重试；主唤醒路径仍是 `codex queue --resume` |
+| `Engine/windows-codex-resume.patch` | 给 `resume_queued` 划分平台分支：Unix 保留原实现，Windows 改由下一个补丁接手 |
+| `Engine/windows-codex-uds.patch` | Windows 用 `uds_windows` + 同步 WebSocket 客户端连接 Codex 的 AF_UNIX 控制套接字，补上 `thread/resume` 兜底 |
 | `Tests/windows-smoke.ps1` | 隔离临时目录冒烟：daemon 启动、建网、team/link JSON、会话目录、重启恢复；`-JoinCheck` 额外验第二个实例入网 |
 | `Windows/` | Tauri v2 + React + TypeScript 客户端（见 `Windows/README.md`） |
 | `.github/workflows/windows.yml` | windows-latest 构建后台、跑冒烟、前端类型检查/构建、Tauri 桥接层 `cargo check` |
@@ -80,14 +81,16 @@ macOS 源码）。随后打开 Codex 原对话，在对话里要求把当前会�
 后，客户端侧栏的「本机会话」会出现它，队友目录里也能看到。界面里的「加入 Network」
 只处理 Network 成员关系，不会替你修改工具配置。
 
-**已知限制（Codex 唤醒兜底）：** Windows 版 Codex 用 WinSock 的 AF_UNIX 暴露控制套接字，
-tokio 没有对应实现，因此 `codex queue --resume` 返回 resume 警告后的直接 `thread/resume`
-重试在 Windows 上停用（见 `Engine/windows-codex-resume.patch`）。正常 Push 仍由
-`codex queue --resume` 完成；若出现该警告，消息已在原线程队列里，打开原线程即可继续。
-后续可复用 Codex 的 `codex_uds` / `uds_windows` 方案补齐这条兜底。
+**Codex 唤醒兜底：** Windows 版 Codex 用 WinSock 的 AF_UNIX 暴露控制套接字，tokio
+没有对应实现。`Engine/windows-codex-uds.patch` 在阻塞线程里用 `uds_windows` 连接
+`<CODEX_HOME>/app-server-control/app-server-control.sock`，再用同步 WebSocket 客户端
+依次发 `initialize`、`thread/resume`（与 Unix 分支相同的请求）。只有
+`codex queue --resume` 返回 resume 警告时才走这条兜底；失败仍回落到“消息已排队，
+打开原线程即可继续”。补丁带一个 mock AF_UNIX WebSocket 服务端的测试，不依赖真实
+Codex 也能验证握手和请求/响应。
 
-**多 Network 联调：** 客户端目前只在主工作区新建/加入 Network。要多开一个测试 Network，
-可先用相同后台在独立状态目录里入网，客户端会自动把它列进概览里的 Network 菜单：
+**多 Network 联调：** 概览里可以直接新建/加入独立工作区，不需要手动准备目录。需要
+用 CLI 复现时，也可以在独立状态目录里入网，客户端会自动列进 Network 菜单：
 
 ```powershell
 $ws = Join-Path $env:USERPROFILE ".reason\workspaces\$(New-Guid)"
