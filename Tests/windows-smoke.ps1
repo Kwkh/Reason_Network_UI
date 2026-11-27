@@ -46,7 +46,9 @@ $SavedEnv = @{
     REASON_NETWORK_NO_SERVICE   = $env:REASON_NETWORK_NO_SERVICE
     REASON_NETWORK_NO_TRAY      = $env:REASON_NETWORK_NO_TRAY
 }
-$script:Daemon = $null
+# 每个元素：@{ State = <REASON_NETWORK_HOME>; Process = <daemon 进程> }
+# 双实例入网时 A 必须保持在线，所以不能只记一个 daemon。
+$script:Daemons = @()
 
 function Set-IsolatedHome {
     param([string]$Name)
@@ -108,13 +110,14 @@ function Start-TestDaemon {
     $Info.EnvironmentVariables['REASON_NETWORK_NO_SERVICE'] = '1'
     $Info.EnvironmentVariables['REASON_NETWORK_NO_TRAY'] = '1'
 
-    $script:Daemon = [System.Diagnostics.Process]::Start($Info)
+    $Process = [System.Diagnostics.Process]::Start($Info)
+    $script:Daemons += @{ State = $State; Process = $Process }
     $Lock = Join-Path $State 'daemon.lock'
     $Deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 
     while ((Get-Date) -lt $Deadline) {
-        if ($script:Daemon.HasExited) {
-            throw "daemon 提前退出（退出码 $($script:Daemon.ExitCode)）。日志：$(Join-Path $State 'daemon.log')"
+        if ($Process.HasExited) {
+            throw "daemon 提前退出（退出码 $($Process.ExitCode)）。日志：$(Join-Path $State 'daemon.log')"
         }
         if (Test-Path $Lock) {
             $PidText = (Get-Content $Lock -Raw).Trim()
@@ -129,15 +132,25 @@ function Start-TestDaemon {
 
 function Stop-TestDaemon {
     if (-not $env:REASON_NETWORK_HOME) { return }
-    if ($script:Daemon) {
-        if (-not $script:Daemon.HasExited) {
-            $script:Daemon.Kill()
-            $script:Daemon.WaitForExit(10000) | Out-Null
+    Stop-DaemonAt -State $env:REASON_NETWORK_HOME
+}
+
+function Stop-DaemonAt {
+    param([string]$State)
+
+    $Entry = $script:Daemons | Where-Object { $_.State -eq $State } | Select-Object -First 1
+    if ($Entry) {
+        $Process = $Entry.Process
+        if ($Process) {
+            if (-not $Process.HasExited) {
+                $Process.Kill()
+                $Process.WaitForExit(10000) | Out-Null
+            }
+            $Process.Dispose()
         }
-        $script:Daemon.Dispose()
-        $script:Daemon = $null
+        $script:Daemons = @($script:Daemons | Where-Object { $_.State -ne $State })
     }
-    $Lock = Join-Path $env:REASON_NETWORK_HOME 'daemon.lock'
+    $Lock = Join-Path $State 'daemon.lock'
     if (Test-Path $Lock) {
         $PidText = (Get-Content $Lock -Raw).Trim()
         if ($PidText -match '^\d+$') {
@@ -189,16 +202,24 @@ try {
     Assert-True ($Again.person -eq 'alice') '重启后身份不变'
 
     if ($JoinCheck) {
-        Write-Host '==> 实例 B：通过邀请链接入网'
-        Stop-TestDaemon
-        $StateB = Set-IsolatedHome 'b'
+        # 邀请链接入网需要创建者机器在线，所以 A 的 daemon 必须保持运行。
+        Write-Host '==> 实例 B：通过邀请链接入网（A 保持在线）'
+        Set-IsolatedHome 'b' | Out-Null
         Start-TestDaemon
 
         $Joined = Invoke-Json @('join', $Link.link, '--as', 'bob', '--no-setup', '--json')
         Assert-True ($Joined.team_id -eq $TeamA) 'B 加入的是同一个 Network'
         Assert-True ($Joined.person -eq 'bob') 'B 的身份为 bob'
-        $TeamB = Invoke-Json @('team', '--json')
-        Assert-True (@($TeamB.members | Where-Object { $_.person -eq 'alice' }).Count -ge 1) 'B 能看到 alice'
+
+        # 成员列表可能比 join 返回晚一拍，最多等 30 秒。
+        $HasAlice = $false
+        $Deadline = (Get-Date).AddSeconds(30)
+        do {
+            $TeamB = Invoke-Json @('team', '--json')
+            $HasAlice = @($TeamB.members | Where-Object { $_.person -eq 'alice' }).Count -ge 1
+            if (-not $HasAlice) { Start-Sleep -Milliseconds 500 }
+        } while (-not $HasAlice -and (Get-Date) -lt $Deadline)
+        Assert-True $HasAlice 'B 能看到 alice'
         Stop-TestDaemon
     }
 
@@ -206,7 +227,9 @@ try {
     Write-Host 'PASS: Windows 后台冒烟通过'
 }
 finally {
-    Stop-TestDaemon
+    foreach ($Entry in @($script:Daemons)) {
+        Stop-DaemonAt -State $Entry.State
+    }
     foreach ($Key in $SavedEnv.Keys) {
         if ($null -eq $SavedEnv[$Key]) {
             Remove-Item -Path "env:$Key" -ErrorAction SilentlyContinue
