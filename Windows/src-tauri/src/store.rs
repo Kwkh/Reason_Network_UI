@@ -72,13 +72,18 @@ fn has_table(db: &Connection, name: &str) -> bool {
 
 fn has_column(db: &Connection, table: &str, column: &str) -> bool {
     let sql = format!("PRAGMA table_info({table})");
-    let Ok(mut stmt) = db.prepare(&sql) else {
-        return false;
+    // 不用 let-else：Rows 借用 stmt，let-else 的早退分支会触发 E0597。
+    let mut stmt = match db.prepare(&sql) {
+        Ok(stmt) => stmt,
+        Err(_) => return false,
     };
-    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(1)) else {
-        return false;
+    let rows = match stmt.query_map([], |row| row.get::<_, String>(1)) {
+        Ok(rows) => rows,
+        Err(_) => return false,
     };
-    rows.flatten().any(|name| name == column)
+    // Flatten 借用 stmt；先落到局部变量，确保它在 stmt 之前析构。
+    let found = rows.flatten().any(|name| name == column);
+    found
 }
 
 struct TeamRow {
