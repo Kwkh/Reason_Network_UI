@@ -55,6 +55,18 @@ pub struct DirectorySession {
     pub since: Option<i64>,
 }
 
+/// 某个队友会话最近一条来信，用于桌面通知和未读提示。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncomingNotice {
+    pub peer: String,
+    pub local: String,
+    pub message_id: String,
+    pub at: i64,
+    pub sender: String,
+    pub preview: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Conversation {
@@ -110,6 +122,8 @@ pub struct Snapshot {
     pub locals: Vec<LocalSession>,
     pub conversations: Vec<Conversation>,
     pub messages: Vec<ChatMessage>,
+    /// 当前本机会话下，每个队友会话的最近一条来信。
+    pub incoming: Vec<IncomingNotice>,
     pub selected_local: Option<String>,
     pub selected_peer: Option<String>,
     /// 后台或目录读取失败时的提示，界面只展示不阻塞。

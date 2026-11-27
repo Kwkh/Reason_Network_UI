@@ -12,8 +12,8 @@ use serde_json::Value;
 
 use crate::backend::run_json;
 use crate::types::{
-    Attachment, ChatMessage, Conversation, DirectorySession, LocalSession, Member, NetworkSummary,
-    Snapshot,
+    Attachment, ChatMessage, Conversation, DirectorySession, IncomingNotice, LocalSession, Member,
+    NetworkSummary, Snapshot,
 };
 
 pub fn user_home() -> PathBuf {
@@ -368,6 +368,51 @@ fn conversations(home: &Path, address: &str) -> Result<Vec<Conversation>, String
     Ok(out)
 }
 
+/// 每个队友会话只保留最近一条来信；桌面通知据此判断是否有新消息。
+fn latest_incoming(
+    home: &Path,
+    address: &str,
+    local: &str,
+) -> Result<Vec<IncomingNotice>, String> {
+    let db = open(home)?;
+    if !has_table(&db, "messages") {
+        return Ok(Vec::new());
+    }
+    let mut stmt = db
+        .prepare(
+            "SELECT id,sender,sent_at,body FROM messages
+             WHERE (recipient=?1 OR recipient LIKE ?1 || '@%') AND held=0 ORDER BY sent_at",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([address], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut map: HashMap<String, IncomingNotice> = HashMap::new();
+    for row in rows {
+        let (id, sender, at, body) = row.map_err(|e| e.to_string())?;
+        let peer = without_machine(&sender).to_string();
+        map.insert(
+            peer.clone(),
+            IncomingNotice {
+                peer,
+                local: local.to_string(),
+                message_id: id,
+                at,
+                sender,
+                preview: preview(&body),
+            },
+        );
+    }
+    Ok(map.into_values().collect())
+}
+
 fn chat_messages(home: &Path, address: &str, peer: &str) -> Result<Vec<ChatMessage>, String> {
     let db = open(home)?;
     let mut map: HashMap<String, ChatMessage> = HashMap::new();
@@ -577,6 +622,7 @@ pub fn snapshot(home: &Path, local: Option<&str>, peer: Option<&str>) -> Result<
             locals: Vec::new(),
             conversations: Vec::new(),
             messages: Vec::new(),
+            incoming: Vec::new(),
             selected_local: None,
             selected_peer: None,
             hint: Some("这台机器还没有加入 Network。".into()),
@@ -631,6 +677,14 @@ pub fn snapshot(home: &Path, local: Option<&str>, peer: Option<&str>) -> Result<
         .map(str::to_string)
         .or_else(|| locals.first().map(|session| session.name.clone()));
 
+    let incoming = match selected_local.as_deref() {
+        Some(name) if !person.is_empty() => {
+            let address = format!("{person}/{name}");
+            latest_incoming(home, &address, name).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+
     let (conversation_list, mut messages, selected_peer) = match selected_local.as_deref() {
         Some(name) if !person.is_empty() => {
             let address = format!("{person}/{name}");
@@ -671,6 +725,7 @@ pub fn snapshot(home: &Path, local: Option<&str>, peer: Option<&str>) -> Result<
         locals,
         conversations: conversation_list,
         messages,
+        incoming,
         selected_local,
         selected_peer,
         hint,

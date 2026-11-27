@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { onAction } from "@tauri-apps/plugin-notification";
 import {
   attachmentText,
   createNetwork,
@@ -19,6 +21,9 @@ import Composer from "./components/Composer";
 import JoinDialog from "./components/JoinDialog";
 import OverviewDialog from "./components/OverviewDialog";
 import AttachmentPreview from "./components/AttachmentPreview";
+import { splitAddress } from "./lib/format";
+import { draftKey, persistDraft, readDraft, removeDraft } from "./lib/drafts";
+import { ensureNotificationPermission, showIncomingToast } from "./lib/notify";
 
 type DialogMode = "join" | "create" | null;
 
@@ -72,6 +77,7 @@ export default function App() {
   const [files, setFiles] = useState<AttachmentDraft[]>([]);
   const [notify, setNotify] = useState(false);
   const [preview, setPreview] = useState<{ attachment: Attachment; text: string } | null>(null);
+  const [pendingReplyId, setPendingReplyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -84,6 +90,13 @@ export default function App() {
   const effectiveLocal =
     (localStillThere ? local : null) ?? snapshot?.selectedLocal ?? null;
   const effectivePeer = peer ?? snapshot?.selectedPeer ?? null;
+
+  // 草稿按 Network + 本机会话 + 对方会话隔离。
+  const conversationKey = draftKey(network, effectiveLocal, effectivePeer);
+  const draftKeyRef = useRef<string | null>(null);
+  // 桌面通知的基线：切换本机会话时重置，首次看到的历史消息不弹。
+  const noticeLocalRef = useRef<string | null>(null);
+  const noticeAtRef = useRef<Map<string, number>>(new Map());
 
   const refreshNetworks = useCallback(async () => {
     try {
@@ -107,6 +120,137 @@ export default function App() {
     const timer = window.setTimeout(() => setNotice(null), 6000);
     return () => window.clearTimeout(timer);
   }, [notice]);
+
+  // 切换会话：先把旧草稿落盘，再恢复目标会话的正文、附件、提醒开关和回复目标。
+  useEffect(() => {
+    const previous = draftKeyRef.current;
+    if (previous === conversationKey) return;
+    if (previous) {
+      persistDraft(previous, {
+        text: draft,
+        files: files.map((file) => file.path),
+        notify,
+        replyTo: replyTo?.id ?? null,
+      });
+    }
+    draftKeyRef.current = conversationKey;
+    const stored = readDraft(conversationKey);
+    setDraft(stored?.text ?? "");
+    setNotify(stored?.notify ?? false);
+    setReplyTo(null);
+    setPendingReplyId(stored?.replyTo ?? null);
+    setFiles([]);
+    if (!stored?.files.length) return;
+    const target = conversationKey;
+    void (async () => {
+      const restored: AttachmentDraft[] = [];
+      for (const path of stored.files) {
+        try {
+          const [file] = await inspectAttachments([path]);
+          if (file) restored.push(file);
+        } catch {
+          // 文件已移动或删除：恢复时跳过。
+        }
+      }
+      // 用会话 key 判断是否已经切走；这个 effect 的依赖包含本地状态，
+      // 不能靠 cleanup 取消，否则 setDraft/setFiles 会立刻把它作废。
+      if (draftKeyRef.current !== target) return;
+      setFiles(restored);
+      if (restored.length !== stored.files.length) {
+        setNotice("部分草稿附件已不可用，已移除。");
+      }
+    })();
+  }, [conversationKey, draft, files, notify, replyTo]);
+
+  // 输入时去抖写入，避免每个按键都碰 localStorage。
+  useEffect(() => {
+    if (!conversationKey) return;
+    const timer = window.setTimeout(() => {
+      persistDraft(conversationKey, {
+        text: draft,
+        files: files.map((file) => file.path),
+        notify,
+        replyTo: replyTo?.id ?? null,
+      });
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [conversationKey, draft, files, notify, replyTo]);
+
+  // 草稿里的回复目标要等对应消息加载后才能还原成完整对象。
+  useEffect(() => {
+    if (!pendingReplyId) return;
+    const message = snapshot?.messages.find((item) => item.id === pendingReplyId);
+    if (message) {
+      setReplyTo(message);
+      setPendingReplyId(null);
+    }
+  }, [pendingReplyId, snapshot]);
+
+  useEffect(() => {
+    void ensureNotificationPermission();
+  }, []);
+
+  // 点击通知：聚焦窗口并切到对应会话。
+  useEffect(() => {
+    let listener: { unregister: () => Promise<void> } | null = null;
+    let cancelled = false;
+    void onAction((event) => {
+      const extra = (event.notification?.extra ?? {}) as {
+        network?: unknown;
+        local?: unknown;
+        peer?: unknown;
+      };
+      void (async () => {
+        try {
+          const win = getCurrentWindow();
+          await win.show();
+          await win.unminimize();
+          await win.setFocus();
+        } catch {
+          // 窗口 API 不可用时至少保留会话切换。
+        }
+        if (typeof extra.network === "string" && extra.network) setNetwork(extra.network);
+        if (typeof extra.local === "string" && extra.local) setLocal(extra.local);
+        if (typeof extra.peer === "string" && extra.peer) setPeer(extra.peer);
+      })();
+    })
+      .then((value) => {
+        if (cancelled) void value.unregister();
+        else listener = value;
+      })
+      .catch(() => {
+        // 通知点击监听不可用（例如缺少权限）时忽略。
+      });
+    return () => {
+      cancelled = true;
+      if (listener) void listener.unregister();
+    };
+  }, []);
+
+  // 轮询发现新的来信时弹系统通知；首次加载只建立基线，不补弹历史。
+  useEffect(() => {
+    if (!snapshot?.joined || !effectiveLocal) return;
+    if (noticeLocalRef.current !== effectiveLocal) {
+      // 切换本机会话：以当前最新来信为基线，不补弹历史。
+      noticeLocalRef.current = effectiveLocal;
+      noticeAtRef.current = new Map(snapshot.incoming.map((item) => [item.peer, item.at]));
+      return;
+    }
+    for (const item of snapshot.incoming) {
+      const previous = noticeAtRef.current.get(item.peer);
+      noticeAtRef.current.set(item.peer, Math.max(previous ?? 0, item.at));
+      if (previous !== undefined && item.at <= previous) continue;
+      // 正在看这个会话且窗口有焦点时不打扰。
+      if (document.hasFocus() && item.peer === effectivePeer) continue;
+      const sender = splitAddress(item.sender).person || item.peer;
+      const peerName = splitAddress(item.peer).name || item.peer;
+      void showIncomingToast({
+        title: `${sender} · ${peerName}`,
+        body: item.preview || "新消息",
+        extra: { network, local: item.local, peer: item.peer },
+      });
+    }
+  }, [snapshot, effectiveLocal, effectivePeer, network]);
 
   useEffect(() => {
     if (!network) return;
@@ -141,25 +285,17 @@ export default function App() {
     setLocal(null);
     setPeer(null);
     setSnapshot(null);
-    setReplyTo(null);
-    setDraft("");
-    setFiles([]);
-    setNotify(false);
     setPreview(null);
+    // 草稿由 conversationKey 的变化负责保存/恢复。
   };
 
   const chooseLocal = (name: string) => {
     setLocal(name);
     setPeer(null);
-    setReplyTo(null);
-    // 附件属于具体会话；切换时丢弃，避免误发给另一个收件人。
-    setFiles([]);
   };
 
   const choosePeer = (address: string) => {
     setPeer(address);
-    setReplyTo(null);
-    setFiles([]);
   };
 
   const refresh = useCallback(async () => {
@@ -211,8 +347,10 @@ export default function App() {
         files: files.map((file) => file.path),
         notify,
       });
+      removeDraft(conversationKey);
       setDraft("");
       setReplyTo(null);
+      setPendingReplyId(null);
       setFiles([]);
       setNotify(false);
       setNotice(outcome.output || "已交给后台发送");
@@ -337,7 +475,10 @@ export default function App() {
           snapshot={snapshot}
           localName={effectiveLocal}
           peer={effectivePeer}
-          onReply={(message) => setReplyTo(message)}
+          onReply={(message) => {
+            setPendingReplyId(null);
+            setReplyTo(message);
+          }}
           onOpenAttachment={(attachment) => void handleOpenAttachment(attachment)}
           onJoin={() => setDialog("join")}
           onCreate={() => setDialog("create")}
@@ -352,7 +493,10 @@ export default function App() {
           busy={busy}
           onChange={setDraft}
           onSend={() => void handleSend()}
-          onCancelReply={() => setReplyTo(null)}
+          onCancelReply={() => {
+            setPendingReplyId(null);
+            setReplyTo(null);
+          }}
           onPickFiles={() => void handlePickFiles()}
           onRemoveFile={handleRemoveFile}
           onToggleNotify={() => setNotify((current) => !current)}

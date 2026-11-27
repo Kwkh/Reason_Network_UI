@@ -44,6 +44,16 @@ export interface DirectorySession {
   since: number | null;
 }
 
+/** 某个队友会话最近一条来信，用于桌面通知。 */
+export interface IncomingNotice {
+  peer: string;
+  local: string;
+  messageId: string;
+  at: number;
+  sender: string;
+  preview: string;
+}
+
 export interface Conversation {
   peer: string;
   lastAt: number;
@@ -87,6 +97,7 @@ export interface Snapshot {
   locals: LocalSession[];
   conversations: Conversation[];
   messages: ChatMessage[];
+  incoming: IncomingNotice[];
   selectedLocal: string | null;
   selectedPeer: string | null;
   hint: string | null;

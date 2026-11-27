@@ -5,9 +5,24 @@ mod backend;
 mod store;
 mod types;
 
+/// 未安装的 debug/release 构建没有 Start Menu 快捷方式；显式设置 AppUserModelID，
+/// 让 Windows 系统通知在开发环境也能归属到本应用。
+#[cfg(windows)]
+fn set_app_user_model_id() {
+    use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+    let id: Vec<u16> = "network.reason.windows\0".encode_utf16().collect();
+    // SAFETY: id 以 NUL 结尾且在调用期间保持存活。
+    unsafe {
+        let _ = SetCurrentProcessExplicitAppUserModelID(id.as_ptr());
+    }
+}
+
 pub fn run() {
+    #[cfg(windows)]
+    set_app_user_model_id();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             // Windows 高 DPI 下初始窗口可能按物理像素创建，导致 WebView 视口偏小。
             // 这里按逻辑像素再设置一次，保证 150%/200% 缩放时布局宽度仍是 940。

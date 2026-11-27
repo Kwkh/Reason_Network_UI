@@ -56,6 +56,10 @@ npm run tauri:dev
 `<home>/inbox/<ULID>/<name>`。Windows 客户端选择附件后先做同样的校验，收到后可
 在应用内预览或另存。发件记录只有文件名，因此只有收到的附件可以再打开。
 
+草稿按「Network + 本机会话 + 对方会话」隔离，正文、附件路径、通知开关和回复目标
+保存在 `localStorage`；收到新消息时会发 Windows 系统通知，点击可切回对应会话。
+Windows toast 需要 AppUserModelID：客户端启动时显式设置，安装包内会显示产品名。
+
 ### 接入本机 Codex 并登记会话
 
 Windows 后台只有在工具的原对话里被调用时才会登记会话。构建完成后先运行一次：
@@ -90,8 +94,8 @@ Remove-Item Env:\REASON_NETWORK_HOME, Env:\REASON_NETWORK_LOCAL_PARTICIPATION
 之后在客户端刷新即可切换；主 daemon 按会话 key 把请求分发到各工作区 daemon
 （这一步由 `Engine/windows-workspaces.patch` 在 Windows 上启用）。
 
-当前限制：附件只支持 UTF-8 文本（不支持二进制），暂不做每会话草稿、系统通知，
-安装包暂不内置后台；完整桌面体验按后续阶段补齐。Mac ↔ Windows 的实际验收仍按下方
+当前限制：附件只支持 UTF-8 文本（不支持二进制），暂不做工作区新建 UI、会话暂停/
+恢复和安装包内置后台；完整桌面体验按后续阶段补齐。Mac ↔ Windows 的实际验收仍按下方
 联调清单执行。
 
 ## 实现顺序
