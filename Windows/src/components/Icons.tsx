@@ -92,3 +92,98 @@ export function CheckIcon({ size = 14 }: IconProps) {
     </svg>
   );
 }
+
+export function SearchIcon({ size = 14 }: IconProps) {
+  return (
+    <svg {...frame(size)}>
+      <circle cx="11" cy="11" r="7" />
+      <path d="M16.5 16.5L21 21" />
+    </svg>
+  );
+}
+
+export function ChevronRightIcon({ size = 12 }: IconProps) {
+  return (
+    <svg {...frame(size)}>
+      <path d="M9 6l6 6-6 6" />
+    </svg>
+  );
+}
+
+export function ChevronDownIcon({ size = 12 }: IconProps) {
+  return (
+    <svg {...frame(size)}>
+      <path d="M6 9l6 6 6-6" />
+    </svg>
+  );
+}
+
+export function PersonIcon({ size = 14 }: IconProps) {
+  return (
+    <svg {...frame(size)}>
+      <circle cx="12" cy="8" r="3.5" />
+      <path d="M5 20a7 7 0 0 1 14 0" />
+    </svg>
+  );
+}
+
+export function TerminalIcon({ size = 14 }: IconProps) {
+  return (
+    <svg {...frame(size)}>
+      <rect x="3" y="4" width="18" height="16" rx="2.5" />
+      <path d="M7 9l3 3-3 3M13 15h4" />
+    </svg>
+  );
+}
+
+export function ClockIcon({ size = 14 }: IconProps) {
+  return (
+    <svg {...frame(size)}>
+      <circle cx="12" cy="12" r="8.5" />
+      <path d="M12 7.5V12l3 2" />
+    </svg>
+  );
+}
+
+export function GearIcon({ size = 16 }: IconProps) {
+  return (
+    <svg {...frame(size)}>
+      <circle cx="12" cy="12" r="3.2" />
+      <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.11-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1.11 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1z" />
+    </svg>
+  );
+}
+
+export function ArrowUpIcon({ size = 15 }: IconProps) {
+  return (
+    <svg {...frame(size)}>
+      <path d="M12 19V5M6 11l6-6 6 6" />
+    </svg>
+  );
+}
+
+export function LaptopIcon({ size = 16 }: IconProps) {
+  return (
+    <svg {...frame(size)}>
+      <rect x="3.5" y="5" width="17" height="11" rx="2" />
+      <path d="M2 20h20" />
+    </svg>
+  );
+}
+
+export function CopyIcon({ size = 14 }: IconProps) {
+  return (
+    <svg {...frame(size)}>
+      <rect x="8" y="8" width="11" height="12" rx="2" />
+      <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h2" />
+    </svg>
+  );
+}
+
+export function PaperclipIcon({ size = 14 }: IconProps) {
+  return (
+    <svg {...frame(size)}>
+      <path d="M21 11.5l-8.5 8.5a5 5 0 0 1-7-7L14 4.5a3.5 3.5 0 0 1 5 5L10.5 18a2 2 0 0 1-3-3L15 7.5" />
+    </svg>
+  );
+}

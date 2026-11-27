@@ -22,7 +22,9 @@ git switch -c windows-first-milestone
 ## 第一阶段实现（2026-11）
 
 Windows 版采用 **Tauri v2 + React + TypeScript**。前端只负责界面与只读展示；收发、入网、
-目录和命名管道都复用 `reason-network` 后台，避免维护第二套协议。
+目录和命名管道都复用 `reason-network` 后台，避免维护第二套协议。界面结构按
+`Sources/ContentView.swift` 的 SwiftUI 设计实现：双栏会话侧栏、person → agent 分组、
+labelColor 透明气泡、悬浮圆角输入区和概览 sheet。
 
 | 路径 | 用途 |
 | --- | --- |
@@ -68,7 +70,7 @@ tokio 没有对应实现，因此 `codex queue --resume` 返回 resume 警告后
 后续可复用 Codex 的 `codex_uds` / `uds_windows` 方案补齐这条兜底。
 
 **多 Network 联调：** 客户端目前只在主工作区新建/加入 Network。要多开一个测试 Network，
-可先用相同后台在独立状态目录里入网，客户端会自动把它列进 Network 选择器：
+可先用相同后台在独立状态目录里入网，客户端会自动把它列进概览里的 Network 菜单：
 
 ```powershell
 $ws = Join-Path $env:USERPROFILE ".reason\workspaces\$(New-Guid)"

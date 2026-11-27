@@ -4,6 +4,7 @@ import {
   joinNetwork,
   listNetworks,
   loadSnapshot,
+  networkLink,
   openDataFolder,
   sendMessage,
 } from "./api";
@@ -12,8 +13,26 @@ import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import Composer from "./components/Composer";
 import JoinDialog from "./components/JoinDialog";
+import OverviewDialog from "./components/OverviewDialog";
 
 type DialogMode = "join" | "create" | null;
+
+async function copyText(text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return;
+  } catch {
+    // WebView 的剪贴板权限可能被拒绝，退回 execCommand。
+  }
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  document.execCommand("copy");
+  area.remove();
+}
 
 function errorText(cause: unknown): string {
   if (typeof cause === "string") return cause;
@@ -49,6 +68,7 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [dialog, setDialog] = useState<DialogMode>(null);
+  const [overviewOpen, setOverviewOpen] = useState(false);
 
   // 选中的本机会话可能已经离线消失；此时回退到后台给出的默认会话。
   const localStillThere =
@@ -206,24 +226,27 @@ export default function App() {
     void openDataFolder(network).catch((cause) => setError(errorText(cause)));
   };
 
+  const handleCopyInvite = async () => {
+    try {
+      const link = await networkLink(network);
+      await copyText(link);
+      setNotice("邀请链接已复制");
+    } catch (cause) {
+      setError(errorText(cause));
+    }
+  };
+
   const canCompose = Boolean(snapshot?.joined && effectiveLocal && effectivePeer);
 
   return (
     <div className="app">
       <Sidebar
-        networks={networks}
-        network={network}
         snapshot={snapshot}
         local={effectiveLocal}
         peer={effectivePeer}
-        busy={busy}
-        onNetwork={changeNetwork}
         onLocal={chooseLocal}
         onPeer={choosePeer}
-        onJoin={() => setDialog("join")}
-        onCreate={() => setDialog("create")}
-        onRefresh={() => void refresh()}
-        onOpenFolder={handleOpenFolder}
+        onOverview={() => setOverviewOpen(true)}
       />
 
       <div className="workspace">
@@ -232,9 +255,9 @@ export default function App() {
           localName={effectiveLocal}
           peer={effectivePeer}
           onReply={(message) => setReplyTo(message)}
-          onRefresh={() => void refresh()}
           onJoin={() => setDialog("join")}
           onCreate={() => setDialog("create")}
+          onStatus={() => setOverviewOpen(true)}
         />
         <Composer
           value={draft}
@@ -246,6 +269,28 @@ export default function App() {
           onCancelReply={() => setReplyTo(null)}
         />
       </div>
+
+      {overviewOpen && (
+        <OverviewDialog
+          networks={networks}
+          network={network}
+          snapshot={snapshot}
+          busy={busy}
+          onSelectNetwork={changeNetwork}
+          onJoin={() => {
+            setOverviewOpen(false);
+            setDialog("join");
+          }}
+          onCreate={() => {
+            setOverviewOpen(false);
+            setDialog("create");
+          }}
+          onRefresh={() => void refresh()}
+          onOpenFolder={handleOpenFolder}
+          onCopyInvite={() => void handleCopyInvite()}
+          onClose={() => setOverviewOpen(false)}
+        />
+      )}
 
       {dialog && (
         <JoinDialog

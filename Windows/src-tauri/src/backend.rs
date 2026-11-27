@@ -262,6 +262,23 @@ pub async fn create_network(
 }
 
 #[tauri::command]
+pub async fn network_link(network: Option<String>) -> Result<String, String> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let home = store::home_for(network.as_deref())?;
+        let value = run_json(&home, &["link", "--json"])?;
+        value
+            .get("link")
+            .and_then(Value::as_str)
+            .filter(|link| !link.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| "后台没有返回邀请链接".to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    result
+}
+
+#[tauri::command]
 pub async fn native_catalog() -> Result<Vec<NativeEntry>, String> {
     let result = tauri::async_runtime::spawn_blocking(|| {
         let home = store::primary_home();

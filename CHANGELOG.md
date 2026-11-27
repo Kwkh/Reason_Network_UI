@@ -3,7 +3,7 @@
 ## Windows 第一阶段（预览）
 
 - 新增 `Engine/build-windows.ps1` 与 `Engine/windows-workspaces.patch`：从固定上游提交重建 Windows x64 后台，并把多工作区分发明文管道化，Windows 复用上游命名管道并校验 `daemon.lock` 的 PID。
-- 新增 `Windows/` 客户端：Tauri v2 + React + TypeScript，支持 Network 切换、本机会话、目录、对话、发送与按原消息回复；引擎数据库只读。
+- 新增 `Windows/` 客户端：Tauri v2 + React + TypeScript，界面按 macOS SwiftUI 的侧栏、分组、气泡和悬浮输入区实现；支持 Network 切换（概览 sheet）、本机会话、目录、对话、发送与按原消息回复；引擎数据库只读。
 - 新增 `Tests/windows-smoke.ps1` 与 `.github/workflows/windows.yml`：本机冒烟、后台构建、前端类型检查与 Tauri 桥接层检查。
 
 ## 1.2.4 (23)

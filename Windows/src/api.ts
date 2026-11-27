@@ -39,6 +39,10 @@ export function createNetwork(
   return invoke<string>("create_network", { network, name, person });
 }
 
+export function networkLink(network: string | null): Promise<string> {
+  return invoke<string>("network_link", { network });
+}
+
 export function nativeCatalog(): Promise<NativeEntry[]> {
   return invoke<NativeEntry[]>("native_catalog");
 }

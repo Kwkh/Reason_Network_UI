@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { ChatMessage } from "../types";
 import { splitAddress } from "../lib/format";
-import { CloseIcon, SendIcon } from "./Icons";
+import { ArrowUpIcon, CloseIcon, PlusIcon } from "./Icons";
 
 interface Props {
   value: string;
@@ -28,7 +28,7 @@ export default function Composer({
     const node = inputRef.current;
     if (!node) return;
     node.style.height = "auto";
-    node.style.height = `${Math.min(node.scrollHeight, 168)}px`;
+    node.style.height = `${Math.min(node.scrollHeight, 156)}px`;
   }, [value]);
 
   useEffect(() => {
@@ -39,22 +39,22 @@ export default function Composer({
 
   return (
     <footer className="composer">
-      {replyTo && (
-        <div className="reply-chip">
-          <span>
-            回复 <strong>{splitAddress(replyTo.peer).name || "这条消息"}</strong>：
-            {replyTo.body.slice(0, 80) || "（附件消息）"}
-          </span>
-          <button type="button" className="icon-button" title="取消回复" onClick={onCancelReply}>
-            <CloseIcon size={14} />
-          </button>
-        </div>
-      )}
-      <div className="composer-box">
+      <div className={replyTo ? "composer-box has-reply" : "composer-box"}>
+        {replyTo && (
+          <div className="reply-chip">
+            <span>
+              回复 <strong>{splitAddress(replyTo.peer).name || "这条消息"}</strong>：
+              {replyTo.body.slice(0, 80) || "（附件消息）"}
+            </span>
+            <button type="button" className="icon-button" title="取消回复" onClick={onCancelReply}>
+              <CloseIcon size={12} />
+            </button>
+          </div>
+        )}
         <textarea
           ref={inputRef}
           value={value}
-          placeholder={disabled ? "先选择会话" : "输入消息，Enter 发送，Shift + Enter 换行"}
+          placeholder={disabled ? "先选择会话" : "输入消息"}
           disabled={disabled}
           rows={1}
           onChange={(event) => onChange(event.target.value)}
@@ -66,19 +66,28 @@ export default function Composer({
             if (canSend) onSend();
           }}
         />
-        <button
-          type="button"
-          className="send-button"
-          onClick={onSend}
-          disabled={!canSend}
-          title="发送"
-        >
-          {busy ? <span className="spinner small" /> : <SendIcon />}
-        </button>
-      </div>
-      <div className="composer-hint">
-        <span>Enter 发送 · Shift + Enter 换行</span>
-        <span className="muted">{value.length > 0 ? `${value.length} 字` : ""}</span>
+        <div className="composer-actions">
+          <button
+            type="button"
+            className="composer-plus"
+            title="附件将在后续版本支持"
+            aria-label="附件"
+            disabled
+          >
+            <PlusIcon size={14} />
+          </button>
+          <span className="composer-hint">Enter 发送 · Shift + Enter 换行</span>
+          <button
+            type="button"
+            className={canSend ? "composer-send enabled" : "composer-send"}
+            onClick={onSend}
+            disabled={!canSend}
+            title="发送消息"
+            aria-label={busy ? "发送中" : "发送消息"}
+          >
+            {busy ? <span className="spinner small" /> : <ArrowUpIcon size={15} />}
+          </button>
+        </div>
       </div>
     </footer>
   );
