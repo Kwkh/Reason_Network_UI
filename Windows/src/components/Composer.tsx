@@ -1,26 +1,41 @@
 import { useEffect, useRef } from "react";
-import type { ChatMessage } from "../types";
+import type { AttachmentDraft, ChatMessage } from "../types";
 import { splitAddress } from "../lib/format";
-import { ArrowUpIcon, CloseIcon, PlusIcon } from "./Icons";
+import { ArrowUpIcon, BellIcon, CloseIcon, PaperclipIcon, PlusIcon } from "./Icons";
 
 interface Props {
   value: string;
   replyTo: ChatMessage | null;
+  files: AttachmentDraft[];
+  notify: boolean;
   disabled: boolean;
   busy: boolean;
   onChange: (value: string) => void;
   onSend: () => void;
   onCancelReply: () => void;
+  onPickFiles: () => void;
+  onRemoveFile: (path: string) => void;
+  onToggleNotify: () => void;
+}
+
+function sizeLabel(size: number): string {
+  if (size < 1024) return `${size} B`;
+  return `${(size / 1024).toFixed(1)} KiB`;
 }
 
 export default function Composer({
   value,
   replyTo,
+  files,
+  notify,
   disabled,
   busy,
   onChange,
   onSend,
   onCancelReply,
+  onPickFiles,
+  onRemoveFile,
+  onToggleNotify,
 }: Props) {
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -35,11 +50,30 @@ export default function Composer({
     if (replyTo) inputRef.current?.focus();
   }, [replyTo]);
 
-  const canSend = !disabled && !busy && value.trim().length > 0;
+  const canSend = !disabled && !busy && (value.trim().length > 0 || files.length > 0);
 
   return (
     <footer className="composer">
       <div className={replyTo ? "composer-box has-reply" : "composer-box"}>
+        {files.length > 0 && (
+          <div className="attachment-chips" aria-label="待发送附件">
+            {files.map((file) => (
+              <span key={file.path} className="attachment-chip" title={`${file.path} · ${sizeLabel(file.size)}`}>
+                <PaperclipIcon size={11} />
+                <span className="attachment-chip-name">{file.name}</span>
+                <button
+                  type="button"
+                  className="attachment-chip-remove"
+                  title={`移除 ${file.name}`}
+                  aria-label={`移除 ${file.name}`}
+                  onClick={() => onRemoveFile(file.path)}
+                >
+                  <CloseIcon size={10} />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
         {replyTo && (
           <div className="reply-chip">
             <span>
@@ -70,11 +104,23 @@ export default function Composer({
           <button
             type="button"
             className="composer-plus"
-            title="附件将在后续版本支持"
-            aria-label="附件"
-            disabled
+            title="添加文本附件"
+            aria-label="添加文本附件"
+            disabled={disabled || busy}
+            onClick={onPickFiles}
           >
             <PlusIcon size={14} />
+          </button>
+          <button
+            type="button"
+            className={notify ? "composer-plus active" : "composer-plus"}
+            title={notify ? "发送时会在对方电脑上弹窗提醒" : "在对方电脑上弹窗提醒"}
+            aria-label="在对方电脑上弹窗提醒"
+            aria-pressed={notify}
+            disabled={disabled || busy}
+            onClick={onToggleNotify}
+          >
+            <BellIcon size={14} />
           </button>
           <span className="composer-hint">Enter 发送 · Shift + Enter 换行</span>
           <button

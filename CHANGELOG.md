@@ -1,5 +1,12 @@
 # Changelog
 
+## Windows 第二阶段（预览，进行中）
+
+- 附件收发：输入区「＋」选择 UTF-8 文本附件，发送后显示在消息气泡里；收到的附件可预览和另存。沿用后台 `--file` 协议，单个 256 KiB、每条合计 512 KiB、最多 10 个，界面与后端双重校验。
+- 修正来信附件解析：`messages.files` 的 `{"dir","files":[...]}` 对象此前会被当成空列表，现在能正确显示并保留收件箱目录。
+- 新增“在对方电脑上弹窗提醒”开关（`--notify`）。
+- Debug 构建不再弹出黑色控制台窗口。
+
 ## Windows 第一阶段（预览）
 
 - 新增 `Engine/build-windows.ps1` 与 `Engine/windows-workspaces.patch`：从固定上游提交重建 Windows x64 后台，并把多工作区分发明文管道化，Windows 复用上游命名管道并校验 `daemon.lock` 的 PID。

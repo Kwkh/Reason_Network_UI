@@ -128,6 +128,7 @@ fn without_machine(address: &str) -> &str {
     address.split_once('@').map_or(address, |(name, _)| name)
 }
 
+/// 发件记录是 `["a.txt"]`；来信记录是 `{"dir":"<ULID>","files":[{"name":"a.txt"}]}`。
 fn parse_files(value: Option<String>) -> Vec<Attachment> {
     let Some(raw) = value.filter(|text| !text.trim().is_empty()) else {
         return Vec::new();
@@ -135,22 +136,30 @@ fn parse_files(value: Option<String>) -> Vec<Attachment> {
     let Ok(value) = serde_json::from_str::<Value>(&raw) else {
         return Vec::new();
     };
-    value
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    item.get("name")
-                        .and_then(Value::as_str)
-                        .or_else(|| item.as_str())
-                        .map(|name| Attachment {
-                            name: name.to_string(),
-                        })
-                })
-                .collect()
+    let (directory, items) = match &value {
+        Value::Array(items) => (None, Some(items)),
+        Value::Object(map) => (
+            map.get("dir").and_then(Value::as_str).map(str::to_string),
+            map.get("files").and_then(Value::as_array),
+        ),
+        _ => (None, None),
+    };
+    let Some(items) = items else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| item.as_str())?;
+            Some(Attachment {
+                name: name.to_string(),
+                directory: directory.clone(),
+            })
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn parse_members(value: &Value) -> Vec<Member> {
@@ -666,4 +675,37 @@ pub fn snapshot(home: &Path, local: Option<&str>, peer: Option<&str>) -> Result<
         selected_peer,
         hint,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_files;
+
+    #[test]
+    fn incoming_files_object_keeps_directory() {
+        let raw = r#"{"dir":"01ARZ3NDEKTSV4RRFFQ69G5FAV","files":[{"name":"a.txt"},{"name":"b.md"}]}"#;
+        let files = parse_files(Some(raw.to_string()));
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].name, "a.txt");
+        assert_eq!(
+            files[0].directory.as_deref(),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
+    }
+
+    #[test]
+    fn outgoing_files_array_has_no_directory() {
+        let files = parse_files(Some(r#"["a.txt","b.md"]"#.to_string()));
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[1].name, "b.md");
+        assert!(files.iter().all(|file| file.directory.is_none()));
+    }
+
+    #[test]
+    fn malformed_files_are_ignored() {
+        assert!(parse_files(None).is_empty());
+        assert!(parse_files(Some("".into())).is_empty());
+        assert!(parse_files(Some("{}".into())).is_empty());
+        assert!(parse_files(Some("null".into())).is_empty());
+    }
 }

@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import type { ChatMessage, Snapshot } from "../types";
+import type { Attachment, ChatMessage, Snapshot } from "../types";
 import {
   agentLabel,
   dayLabel,
@@ -9,13 +9,14 @@ import {
   statusLabel,
   withoutMachine,
 } from "../lib/format";
-import { ReplyIcon } from "./Icons";
+import { PaperclipIcon, ReplyIcon } from "./Icons";
 
 interface Props {
   snapshot: Snapshot | null;
   localName: string | null;
   peer: string | null;
   onReply: (message: ChatMessage) => void;
+  onOpenAttachment: (attachment: Attachment) => void;
   onJoin: () => void;
   onCreate: () => void;
   onStatus: () => void;
@@ -34,6 +35,7 @@ export default function ChatView({
   localName,
   peer,
   onReply,
+  onOpenAttachment,
   onJoin,
   onCreate,
   onStatus,
@@ -186,11 +188,29 @@ export default function ChatView({
                   </p>
                   {message.attachments.length > 0 && (
                     <ul className="attachments">
-                      {message.attachments.map((file) => (
-                        <li key={file.name} title={file.name}>
-                          📎 {file.name}
-                        </li>
-                      ))}
+                      {message.attachments.map((file, index) => {
+                        const openable = message.direction === "in" && file.directory !== null;
+                        return (
+                          <li key={`${file.name}-${index}`}>
+                            {openable ? (
+                              <button
+                                type="button"
+                                className="attachment-link"
+                                title={`打开 ${file.name}`}
+                                onClick={() => onOpenAttachment(file)}
+                              >
+                                <PaperclipIcon size={11} />
+                                <span>{file.name}</span>
+                              </button>
+                            ) : (
+                              <span className="attachment-name" title={file.name}>
+                                <PaperclipIcon size={11} />
+                                <span>{file.name}</span>
+                              </span>
+                            )}
+                          </li>
+                        );
+                      })}
                     </ul>
                   )}
                 </div>

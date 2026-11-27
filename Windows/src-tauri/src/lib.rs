@@ -1,11 +1,13 @@
 use tauri::{LogicalSize, Manager};
 
+mod attachments;
 mod backend;
 mod store;
 mod types;
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Windows 高 DPI 下初始窗口可能按物理像素创建，导致 WebView 视口偏小。
             // 这里按逻辑像素再设置一次，保证 150%/200% 缩放时布局宽度仍是 940。
@@ -21,6 +23,9 @@ pub fn run() {
             backend::list_networks,
             backend::snapshot,
             backend::send_message,
+            backend::inspect_attachments,
+            backend::attachment_text,
+            backend::save_attachment,
             backend::join_network,
             backend::create_network,
             backend::network_link,

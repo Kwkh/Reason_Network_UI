@@ -1,5 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { NativeEntry, NetworkSummary, SendOutcome, Snapshot } from "./types";
+import type {
+  AttachmentDraft,
+  NativeEntry,
+  NetworkSummary,
+  SendOutcome,
+  Snapshot,
+} from "./types";
 
 export function listNetworks(): Promise<NetworkSummary[]> {
   return invoke<NetworkSummary[]>("list_networks");
@@ -19,8 +25,31 @@ export function sendMessage(args: {
   to: string;
   body: string;
   replyTo: string | null;
+  files: string[];
+  notify: boolean;
 }): Promise<SendOutcome> {
   return invoke<SendOutcome>("send_message", args);
+}
+
+export function inspectAttachments(paths: string[]): Promise<AttachmentDraft[]> {
+  return invoke<AttachmentDraft[]>("inspect_attachments", { paths });
+}
+
+export function attachmentText(
+  network: string | null,
+  directory: string,
+  name: string,
+): Promise<string> {
+  return invoke<string>("attachment_text", { network, directory, name });
+}
+
+export function saveAttachment(
+  network: string | null,
+  directory: string,
+  name: string,
+  target: string,
+): Promise<void> {
+  return invoke<void>("save_attachment", { network, directory, name, target });
 }
 
 export function joinNetwork(

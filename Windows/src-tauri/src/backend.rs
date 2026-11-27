@@ -8,8 +8,9 @@ use std::process::{Command, Output, Stdio};
 
 use serde_json::Value;
 
+use crate::attachments;
 use crate::store;
-use crate::types::{NativeEntry, NetworkSummary, SendOutcome, Snapshot};
+use crate::types::{AttachmentDraft, NativeEntry, NetworkSummary, SendOutcome, Snapshot};
 
 /// 后台可执行文件：环境变量优先，其次仓库 `Engine/Bin`，最后在 PATH 里找。
 pub fn backend_binary() -> Result<PathBuf, String> {
@@ -86,6 +87,8 @@ fn check_output(output: Output) -> Result<Output, String> {
         } else {
             stderr.trim().to_string()
         };
+        // CLI 的错误行自带 `Error: ` 前缀，界面里去掉更干净。
+        let detail = detail.strip_prefix("Error: ").unwrap_or(&detail).to_string();
         return Err(if detail.is_empty() {
             format!("后台命令失败（{}）", output.status)
         } else {
@@ -164,18 +167,40 @@ pub async fn send_message(
     to: String,
     body: String,
     reply_to: Option<String>,
+    files: Option<Vec<String>>,
+    notify: Option<bool>,
 ) -> Result<SendOutcome, String> {
     let result = tauri::async_runtime::spawn_blocking(move || {
-        if body.trim().is_empty() {
-            return Err("消息不能为空".to_string());
-        }
         if from.trim().is_empty() || to.trim().is_empty() {
             return Err("缺少发送或接收会话".to_string());
         }
+        let files = files.unwrap_or_default();
+        // 发送前再校验一次：附件可能在选择后被改动。
+        let drafts = attachments::inspect(&files)?;
+        let typed = body.trim();
+        let content = if typed.is_empty() && !drafts.is_empty() {
+            "附件".to_string()
+        } else {
+            typed.to_string()
+        };
+        if content.is_empty() {
+            return Err("消息不能为空".to_string());
+        }
+        if content.chars().count() > 10_000 {
+            return Err("请输入 1–10000 字的消息".to_string());
+        }
         let home = store::home_for(network.as_deref())?;
         let bin = backend_binary()?;
-        // `send --from <session-key> <to> -`：正文从 stdin 读，与 macOS 客户端一致。
+        // `send --from <session-key> [--notify] [--file <path>]... <to> -`：
+        // 正文从 stdin 读，参数顺序与 macOS 客户端一致。
         let mut args = vec!["send".to_string(), "--from".to_string(), from];
+        if notify.unwrap_or(false) {
+            args.push("--notify".to_string());
+        }
+        for draft in &drafts {
+            args.push("--file".to_string());
+            args.push(draft.path.clone());
+        }
         if let Some(reply) = reply_to.filter(|value| !value.is_empty()) {
             args.push("--reply-to".to_string());
             args.push(reply);
@@ -183,10 +208,49 @@ pub async fn send_message(
         args.push(to);
         args.push("-".to_string());
         let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-        let output = run_cli_with_input(&bin, &home, &borrowed, &body)?;
+        let output = run_cli_with_input(&bin, &home, &borrowed, &content)?;
         Ok(SendOutcome {
             output: String::from_utf8_lossy(&output.stdout).trim().to_string(),
         })
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    result
+}
+
+#[tauri::command]
+pub async fn inspect_attachments(paths: Vec<String>) -> Result<Vec<AttachmentDraft>, String> {
+    let result = tauri::async_runtime::spawn_blocking(move || attachments::inspect(&paths))
+        .await
+        .map_err(|error| error.to_string())?;
+    result
+}
+
+#[tauri::command]
+pub async fn attachment_text(
+    network: Option<String>,
+    directory: String,
+    name: String,
+) -> Result<String, String> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let home = store::home_for(network.as_deref())?;
+        attachments::read_attachment(&home, &directory, &name)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    result
+}
+
+#[tauri::command]
+pub async fn save_attachment(
+    network: Option<String>,
+    directory: String,
+    name: String,
+    target: String,
+) -> Result<(), String> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let home = store::home_for(network.as_deref())?;
+        attachments::save_attachment(&home, &directory, &name, &target)
     })
     .await
     .map_err(|error| error.to_string())?;

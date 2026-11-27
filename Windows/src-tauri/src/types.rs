@@ -68,6 +68,17 @@ pub struct Conversation {
 #[serde(rename_all = "camelCase")]
 pub struct Attachment {
     pub name: String,
+    /// 来信附件的收件箱子目录（26 位 ULID）；发件记录没有。
+    pub directory: Option<String>,
+}
+
+/// 已通过校验、等待发送的本地附件。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentDraft {
+    pub path: String,
+    pub name: String,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

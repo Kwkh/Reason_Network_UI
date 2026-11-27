@@ -1,19 +1,24 @@
 import { useCallback, useEffect, useState } from "react";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import {
+  attachmentText,
   createNetwork,
+  inspectAttachments,
   joinNetwork,
   listNetworks,
   loadSnapshot,
   networkLink,
   openDataFolder,
+  saveAttachment,
   sendMessage,
 } from "./api";
-import type { ChatMessage, NetworkSummary, Snapshot } from "./types";
+import type { Attachment, AttachmentDraft, ChatMessage, NetworkSummary, Snapshot } from "./types";
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import Composer from "./components/Composer";
 import JoinDialog from "./components/JoinDialog";
 import OverviewDialog from "./components/OverviewDialog";
+import AttachmentPreview from "./components/AttachmentPreview";
 
 type DialogMode = "join" | "create" | null;
 
@@ -64,6 +69,9 @@ export default function App() {
   const [peer, setPeer] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
+  const [files, setFiles] = useState<AttachmentDraft[]>([]);
+  const [notify, setNotify] = useState(false);
+  const [preview, setPreview] = useState<{ attachment: Attachment; text: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -135,17 +143,23 @@ export default function App() {
     setSnapshot(null);
     setReplyTo(null);
     setDraft("");
+    setFiles([]);
+    setNotify(false);
+    setPreview(null);
   };
 
   const chooseLocal = (name: string) => {
     setLocal(name);
     setPeer(null);
     setReplyTo(null);
+    // 附件属于具体会话；切换时丢弃，避免误发给另一个收件人。
+    setFiles([]);
   };
 
   const choosePeer = (address: string) => {
     setPeer(address);
     setReplyTo(null);
+    setFiles([]);
   };
 
   const refresh = useCallback(async () => {
@@ -167,7 +181,14 @@ export default function App() {
   }, [network, local, peer, refreshNetworks]);
 
   const handleSend = async () => {
-    if (!snapshot || !effectiveLocal || !effectivePeer || !draft.trim() || busy) return;
+    if (
+      !snapshot ||
+      !effectiveLocal ||
+      !effectivePeer ||
+      (!draft.trim() && files.length === 0) ||
+      busy
+    )
+      return;
     const sender = snapshot.locals.find((session) => session.name === effectiveLocal);
     if (!sender) {
       setError("本机会话已离线，请刷新后重试。");
@@ -187,9 +208,13 @@ export default function App() {
         to,
         body: draft,
         replyTo: replyTo?.id ?? null,
+        files: files.map((file) => file.path),
+        notify,
       });
       setDraft("");
       setReplyTo(null);
+      setFiles([]);
+      setNotify(false);
       setNotice(outcome.output || "已交给后台发送");
       const next = await loadSnapshot(network, effectiveLocal, effectivePeer);
       setSnapshot(next);
@@ -197,6 +222,64 @@ export default function App() {
       setError(errorText(cause));
     } finally {
       setBusy(false);
+    }
+  };
+
+  const handlePickFiles = async () => {
+    try {
+      const picked = await open({ multiple: true, title: "添加文本附件" });
+      if (!picked) return;
+      const paths = Array.isArray(picked) ? picked : [picked];
+      const existing = new Set(files.map((file) => file.path.toLowerCase()));
+      const additions = paths.filter((path) => !existing.has(path.toLowerCase()));
+      if (additions.length === 0) return;
+      if (files.length + additions.length > 10) {
+        setError("每条消息最多添加 10 个附件。");
+        return;
+      }
+      setBusy(true);
+      const drafts = await inspectAttachments([
+        ...files.map((file) => file.path),
+        ...additions,
+      ]);
+      setFiles(drafts);
+      setError(null);
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRemoveFile = (path: string) => {
+    setFiles((current) => current.filter((file) => file.path !== path));
+  };
+
+  const handleOpenAttachment = async (attachment: Attachment) => {
+    const directory = attachment.directory;
+    if (!directory) return;
+    try {
+      const text = await attachmentText(network, directory, attachment.name);
+      setPreview({ attachment, text });
+    } catch (cause) {
+      setError(errorText(cause));
+    }
+  };
+
+  const handleSavePreview = async () => {
+    const current = preview;
+    const directory = current?.attachment.directory;
+    if (!current || !directory) return;
+    try {
+      const target = await save({
+        title: "保存附件",
+        defaultPath: current.attachment.name,
+      });
+      if (!target) return;
+      await saveAttachment(network, directory, current.attachment.name, target);
+      setNotice("附件已保存");
+    } catch (cause) {
+      setError(errorText(cause));
     }
   };
 
@@ -255,6 +338,7 @@ export default function App() {
           localName={effectiveLocal}
           peer={effectivePeer}
           onReply={(message) => setReplyTo(message)}
+          onOpenAttachment={(attachment) => void handleOpenAttachment(attachment)}
           onJoin={() => setDialog("join")}
           onCreate={() => setDialog("create")}
           onStatus={() => setOverviewOpen(true)}
@@ -262,11 +346,16 @@ export default function App() {
         <Composer
           value={draft}
           replyTo={replyTo}
+          files={files}
+          notify={notify}
           disabled={!canCompose}
           busy={busy}
           onChange={setDraft}
           onSend={() => void handleSend()}
           onCancelReply={() => setReplyTo(null)}
+          onPickFiles={() => void handlePickFiles()}
+          onRemoveFile={handleRemoveFile}
+          onToggleNotify={() => setNotify((current) => !current)}
         />
       </div>
 
@@ -289,6 +378,15 @@ export default function App() {
           onOpenFolder={handleOpenFolder}
           onCopyInvite={() => void handleCopyInvite()}
           onClose={() => setOverviewOpen(false)}
+        />
+      )}
+
+      {preview && (
+        <AttachmentPreview
+          name={preview.attachment.name}
+          text={preview.text}
+          onSave={() => void handleSavePreview()}
+          onClose={() => setPreview(null)}
         />
       )}
 

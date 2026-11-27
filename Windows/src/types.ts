@@ -53,6 +53,15 @@ export interface Conversation {
 
 export interface Attachment {
   name: string;
+  /** 来信附件的收件箱子目录；发件记录没有。 */
+  directory: string | null;
+}
+
+/** 已通过验证、等待发送的本地附件。 */
+export interface AttachmentDraft {
+  path: string;
+  name: string;
+  size: number;
 }
 
 export interface ChatMessage {
