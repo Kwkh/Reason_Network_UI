@@ -3,3 +3,12 @@ DerivedData/
 build/
 xcuserdata/
 *.xcuserstate
+
+# Windows 客户端
+node_modules/
+Windows/dist/
+Windows/src-tauri/target/
+Windows/src-tauri/gen/
+
+# 后台构建产物（由 Engine/build-windows.ps1 生成）
+Engine/Bin/*.exe

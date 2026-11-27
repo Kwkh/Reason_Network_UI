@@ -10,7 +10,7 @@ Set-Location Reason_Network_UI
 git switch -c windows-first-milestone
 ```
 
-首轮以 Windows 11 x64 为验证环境。准备 Git、Visual Studio 的 WinUI 与 C++ MSVC 构建工具、Windows SDK、.NET SDK 和 Rust MSVC 工具链。仓库目前提供 macOS 源码和后台补丁；第一个 Windows PR 应带上可重复执行的构建命令与 Windows CI。界面可用 C# / WinUI 3，按现有侧栏、工作区切换、聊天和输入行为实现。
+首轮以 Windows 11 x64 为验证环境。准备 Git、Visual Studio 的 C++ MSVC 构建工具、Windows SDK 和 Rust MSVC 工具链（Tauri 另需 WebView2，Windows 11 自带）。仓库目前提供 macOS 源码和后台补丁；第一个 Windows PR 应带上可重复执行的构建命令与 Windows CI。界面采用 **Tauri v2 + React + TypeScript**，按现有侧栏、工作区切换、聊天和输入行为实现。
 
 | 路径 | 用途 |
 | --- | --- |
@@ -18,6 +18,72 @@ git switch -c windows-first-milestone
 | [Sources/ReasonService.swift](Sources/ReasonService.swift)、[Sources/NetworkWorkspaces.swift](Sources/NetworkWorkspaces.swift) | 参考消息历史、会话身份、Network 选择和后台调用。引擎数据库由后台管理，客户端读取历史时使用只读连接。 |
 | [Sources/ContentView.swift](Sources/ContentView.swift)、[Sources/NetworkModel.swift](Sources/NetworkModel.swift) | 参考侧栏、会话状态、输入法、滚动、草稿和消息回执。 |
 | [Tests/workspace-checks.py](Tests/workspace-checks.py)、[Tests/receive-mode-checks.py](Tests/receive-mode-checks.py)、[Tests/native-wake-checks.py](Tests/native-wake-checks.py) | 参考多工作区、Push/Pull 和唤醒用例。Windows 用例需适配命名管道和平台进程管理。 |
+
+## 第一阶段实现（2026-11）
+
+Windows 版采用 **Tauri v2 + React + TypeScript**。前端只负责界面与只读展示；收发、入网、
+目录和命名管道都复用 `reason-network` 后台，避免维护第二套协议。
+
+| 路径 | 用途 |
+| --- | --- |
+| `Engine/build-windows.ps1` | 从固定上游提交 `5872711` 重建 Windows x64 后台，产出 `Engine/Bin/reason-network-backend.exe` |
+| `Engine/windows-workspaces.patch` | 在现有补丁序列之后应用：多工作区分发改用跨平台 `connect_in(home)`，Windows 走命名管道并校验 `daemon.lock` 里的 PID |
+| `Engine/windows-codex-resume.patch` | Windows 上停用直接连接 Codex AF_UNIX 控制套接字的兜底重试；主唤醒路径仍是 `codex queue --resume` |
+| `Tests/windows-smoke.ps1` | 隔离临时目录冒烟：daemon 启动、建网、team/link JSON、会话目录、重启恢复；`-JoinCheck` 额外验第二个实例入网 |
+| `Windows/` | Tauri v2 + React + TypeScript 客户端（见 `Windows/README.md`） |
+| `.github/workflows/windows.yml` | windows-latest 构建后台、跑冒烟、前端类型检查/构建、Tauri 桥接层 `cargo check` |
+
+构建与运行：
+
+```powershell
+./Engine/build-windows.ps1
+./Tests/windows-smoke.ps1
+cd Windows
+npm install
+npm run build
+npm run tauri:dev
+```
+
+客户端读取主工作区 `%USERPROFILE%\.reason\network`，额外工作区在
+`%USERPROFILE%\.reason\workspaces\<id>`；所有 `network.db` 都以只读方式打开。后台按
+`REASON_NETWORK_BIN` → `Engine\Bin` → `PATH` 的顺序查找。
+
+### 接入本机 Codex 并登记会话
+
+Windows 后台只有在工具的原对话里被调用时才会登记会话。构建完成后先运行一次：
+
+```powershell
+.\Engine\Bin\reason-network-backend.exe setup --no-service
+```
+
+它会为检测到的 Codex / Claude Code / Gemini CLI / dsh 写入 MCP、hooks 等配置（不改动
+macOS 源码）。随后打开 Codex 原对话，在对话里要求把当前会话加入目标 Network；会话登记
+后，客户端侧栏的「本机会话」会出现它，队友目录里也能看到。界面里的「加入 Network」
+只处理 Network 成员关系，不会替你修改工具配置。
+
+**已知限制（Codex 唤醒兜底）：** Windows 版 Codex 用 WinSock 的 AF_UNIX 暴露控制套接字，
+tokio 没有对应实现，因此 `codex queue --resume` 返回 resume 警告后的直接 `thread/resume`
+重试在 Windows 上停用（见 `Engine/windows-codex-resume.patch`）。正常 Push 仍由
+`codex queue --resume` 完成；若出现该警告，消息已在原线程队列里，打开原线程即可继续。
+后续可复用 Codex 的 `codex_uds` / `uds_windows` 方案补齐这条兜底。
+
+**多 Network 联调：** 客户端目前只在主工作区新建/加入 Network。要多开一个测试 Network，
+可先用相同后台在独立状态目录里入网，客户端会自动把它列进 Network 选择器：
+
+```powershell
+$ws = Join-Path $env:USERPROFILE ".reason\workspaces\$(New-Guid)"
+New-Item -ItemType Directory -Force $ws | Out-Null
+$env:REASON_NETWORK_HOME = $ws
+$env:REASON_NETWORK_LOCAL_PARTICIPATION = "1"
+.\Engine\Bin\reason-network-backend.exe join "<邀请链接>" --as <测试身份> --no-setup --json
+Remove-Item Env:\REASON_NETWORK_HOME, Env:\REASON_NETWORK_LOCAL_PARTICIPATION
+```
+
+之后在客户端刷新即可切换；主 daemon 按会话 key 把请求分发到各工作区 daemon
+（这一步由 `Engine/windows-workspaces.patch` 在 Windows 上启用）。
+
+第一阶段限制：不做附件选择/下载、每会话草稿、系统通知，安装包暂不内置后台；完整桌面
+体验按后续阶段补齐。Mac ↔ Windows 的实际验收仍按下方联调清单执行。
 
 ## 实现顺序
 

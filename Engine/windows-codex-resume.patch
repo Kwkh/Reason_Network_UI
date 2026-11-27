@@ -1,0 +1,27 @@
+diff --git a/src/codex.rs b/src/codex.rs
+index 65451fa..c7ebfe0 100644
+--- a/src/codex.rs
++++ b/src/codex.rs
+@@ -31,6 +31,7 @@ pub(crate) async fn ensure_resume_server() -> anyhow::Result<()> {
+ 
+ /// A queue warning means the message already exists. Retry only the native
+ /// thread/resume request, with no message body or turn/start request.
++#[cfg(unix)]
+ pub(crate) async fn resume_queued(thread: &str) -> anyhow::Result<()> {
+     use futures_util::{SinkExt, StreamExt};
+     use serde_json::{Value, json};
+@@ -63,6 +64,14 @@ pub(crate) async fn resume_queued(thread: &str) -> anyhow::Result<()> {
+     }).await?
+ }
+ 
++/// Windows 版暂不支持直接连接 Codex 的 AF_UNIX 控制套接字（Codex 在 Windows
++/// 用 WinSock 的 AF_UNIX，tokio 没有对应实现）。主唤醒路径仍然是
++/// `codex queue --resume`；这里只在 Codex 返回 resume 警告时兜底。
++#[cfg(windows)]
++pub(crate) async fn resume_queued(_thread: &str) -> anyhow::Result<()> {
++    anyhow::bail!("Windows 暂不支持直接重试 Codex 控制套接字；消息已排队，打开原线程即可继续。")
++}
++
+ /// Only native Codex UUIDs can be verified against the desktop thread index. Other
+ /// agent identities and legacy process-based registrations follow the usual routing.
+ pub(crate) fn unavailable(key: &str) -> bool {

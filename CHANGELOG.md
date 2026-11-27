@@ -1,5 +1,11 @@
 # Changelog
 
+## Windows 第一阶段（预览）
+
+- 新增 `Engine/build-windows.ps1` 与 `Engine/windows-workspaces.patch`：从固定上游提交重建 Windows x64 后台，并把多工作区分发明文管道化，Windows 复用上游命名管道并校验 `daemon.lock` 的 PID。
+- 新增 `Windows/` 客户端：Tauri v2 + React + TypeScript，支持 Network 切换、本机会话、目录、对话、发送与按原消息回复；引擎数据库只读。
+- 新增 `Tests/windows-smoke.ps1` 与 `.github/workflows/windows.yml`：本机冒烟、后台构建、前端类型检查与 Tauri 桥接层检查。
+
 ## 1.2.4 (23)
 
 - 普通推送使用简短回信地址。后台把回复关联到原 Network、联系人和消息，重启后仍可使用。旧消息继续支持完整地址。

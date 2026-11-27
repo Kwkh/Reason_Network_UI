@@ -1,0 +1,74 @@
+name: Windows CI
+
+on:
+  push:
+    branches:
+      - windows
+      - windows-first-milestone
+  pull_request:
+    branches:
+      - windows
+  workflow_dispatch:
+
+jobs:
+  backend:
+    name: 后台构建与冒烟
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust（MSVC）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: 从固定上游提交构建后台
+        shell: pwsh
+        run: ./Engine/build-windows.ps1
+
+      - name: 本机冒烟测试
+        shell: pwsh
+        run: ./Tests/windows-smoke.ps1
+
+  client:
+    name: 前端类型检查与构建
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: Windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: Windows/package-lock.json
+
+      - run: npm ci
+
+      - run: npm run build
+
+  tauri:
+    name: Tauri 桥接层检查
+    runs-on: windows-latest
+    needs: client
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: Windows/package-lock.json
+
+      - name: 安装 Rust（MSVC）
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 生成前端产物
+        working-directory: Windows
+        run: npm ci && npm run build
+
+      - name: 检查 Rust 桥接层
+        working-directory: Windows/src-tauri
+        run: cargo check
