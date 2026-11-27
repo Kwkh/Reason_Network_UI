@@ -8,6 +8,7 @@ import {
   LinkIcon,
   PlusIcon,
   RefreshIcon,
+  TerminalIcon,
 } from "./Icons";
 
 interface Props {
@@ -18,6 +19,12 @@ interface Props {
   onSelectNetwork: (id: string) => void;
   onJoin: () => void;
   onCreate: () => void;
+  onJoinWorkspace: () => void;
+  onCreateWorkspace: () => void;
+  onSessionParticipation: (
+    session: { name: string; key: string },
+    paused: boolean,
+  ) => void;
   onRefresh: () => void;
   onOpenFolder: () => void;
   onCopyInvite: () => void;
@@ -32,6 +39,9 @@ export default function OverviewDialog({
   onSelectNetwork,
   onJoin,
   onCreate,
+  onJoinWorkspace,
+  onCreateWorkspace,
+  onSessionParticipation,
   onRefresh,
   onOpenFolder,
   onCopyInvite,
@@ -51,6 +61,8 @@ export default function OverviewDialog({
     (session) => session.status !== "offline",
   ).length;
   const onlineDevices = (snapshot?.members ?? []).filter((member) => member.online).length;
+  const locals = snapshot?.locals ?? [];
+  const paused = snapshot?.pausedSessions ?? [];
 
   return (
     <div className="overlay" role="presentation" onMouseDown={onClose}>
@@ -122,6 +134,67 @@ export default function OverviewDialog({
                 <strong>{onlineDevices}</strong>
                 <span>在线设备</span>
               </div>
+            </div>
+
+            <div className="overview-devices">
+              <h2>工作区</h2>
+              <p className="overview-help">
+                独立工作区可以和当前 Network 同时存在，用上方菜单切换。
+              </p>
+              <div className="overview-actions">
+                <button type="button" onClick={onCreateWorkspace} disabled={busy}>
+                  <PlusIcon size={14} /> 新建工作区
+                </button>
+                <button type="button" onClick={onJoinWorkspace} disabled={busy}>
+                  <LinkIcon size={14} /> 加入工作区
+                </button>
+              </div>
+            </div>
+
+            <div className="overview-devices">
+              <h2>本机会话接入</h2>
+              {locals.length + paused.length === 0 ? (
+                <p className="overview-empty-line">暂无本机会话</p>
+              ) : (
+                <>
+                  {locals.map((session) => (
+                    <div className="device-row" key={session.key}>
+                      <TerminalIcon size={16} />
+                      <div className="device-main">
+                        <span className="device-name">{session.name}</span>
+                        <span className="device-sub">{session.agent} · 接入中</span>
+                      </div>
+                      <button
+                        type="button"
+                        className="session-action"
+                        disabled={busy}
+                        onClick={() => onSessionParticipation(session, true)}
+                      >
+                        暂停
+                      </button>
+                    </div>
+                  ))}
+                  {paused.map((session) => (
+                    <div className="device-row paused" key={session.key}>
+                      <TerminalIcon size={16} />
+                      <div className="device-main">
+                        <span className="device-name">{session.name}</span>
+                        <span className="device-sub">
+                          {session.agent || "会话"} · 已暂停
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        className="session-action"
+                        disabled={busy}
+                        onClick={() => onSessionParticipation(session, false)}
+                      >
+                        恢复
+                      </button>
+                    </div>
+                  ))}
+                </>
+              )}
             </div>
 
             <div className="overview-devices">

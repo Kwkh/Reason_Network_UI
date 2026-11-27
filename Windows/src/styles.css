@@ -1249,6 +1249,34 @@ button:disabled {
   font-variant-numeric: tabular-nums;
 }
 
+.device-row.paused {
+  opacity: 0.62;
+}
+
+.session-action {
+  padding: 2px 10px;
+  border: 1px solid var(--control-border);
+  border-radius: 999px;
+  background: var(--control-bg);
+  color: var(--text);
+  font-size: 11px;
+}
+
+.session-action:hover:not(:disabled) {
+  background: var(--fill-hover);
+}
+
+.session-action:disabled {
+  opacity: 0.5;
+}
+
+.overview-help {
+  margin: 0 0 2px;
+  color: var(--secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .overview-empty {
   padding: 12px 0;
   color: var(--secondary);

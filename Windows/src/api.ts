@@ -72,6 +72,26 @@ export function networkLink(network: string | null): Promise<string> {
   return invoke<string>("network_link", { network });
 }
 
+export function setSessionParticipation(
+  network: string | null,
+  key: string,
+  paused: boolean,
+): Promise<void> {
+  return invoke<void>("set_session_participation", { network, key, paused });
+}
+
+export function enableWorkspaces(network: string | null): Promise<void> {
+  return invoke<void>("enable_workspaces", { network });
+}
+
+export function createWorkspace(name: string, person: string): Promise<NetworkSummary> {
+  return invoke<NetworkSummary>("create_workspace", { name, person });
+}
+
+export function joinWorkspace(invite: string, person: string): Promise<NetworkSummary> {
+  return invoke<NetworkSummary>("join_workspace", { invite, person });
+}
+
 export function nativeCatalog(): Promise<NativeEntry[]> {
   return invoke<NativeEntry[]>("native_catalog");
 }

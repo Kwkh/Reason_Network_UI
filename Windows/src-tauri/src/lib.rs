@@ -2,6 +2,7 @@ use tauri::{LogicalSize, Manager};
 
 mod attachments;
 mod backend;
+mod daemon_ipc;
 mod store;
 mod types;
 
@@ -44,6 +45,10 @@ pub fn run() {
             backend::join_network,
             backend::create_network,
             backend::network_link,
+            backend::set_session_participation,
+            backend::enable_workspaces,
+            backend::create_workspace,
+            backend::join_workspace,
             backend::native_catalog,
             backend::open_data_folder,
         ])

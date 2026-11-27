@@ -1,8 +1,8 @@
 # Reason Network · Windows 客户端
 
 Tauri v2 + React + TypeScript 的 Windows 桌面客户端。支持切换 Network、选择本机会话、
-查看对话、收发消息、按原消息回复、加入/新建 Network、UTF-8 文本附件的发送/预览/另存，
-以及每会话草稿和新的来信桌面通知。
+查看对话、收发消息、按原消息回复、加入/新建 Network、UTF-8 文本附件的发送/预览/另存、
+每会话草稿和新的来信桌面通知，以及独立工作区的创建/加入与本机会话的暂停/恢复。
 
 ## 界面
 
@@ -21,7 +21,9 @@ Tauri v2 + React + TypeScript 的 Windows 桌面客户端。支持切换 Network
 - 轮询发现新的来信时弹 Windows 通知；正在查看该会话且窗口有焦点时不打扰，首次加载
   不补弹历史。点击通知会聚焦窗口并切到对应会话（Windows 仅在 toast 显示期间上报点击）。
 - 左侧底部齿轮打开「概览」sheet：切换 Network、复制邀请、加入/新建、刷新、打开数据
-  目录、在线会话/设备统计和设备列表。
+  目录、在线会话/设备统计、设备列表，以及工作区和本机会话接入管理。
+- 「工作区」可以在不改动主工作区的情况下新建或加入另一个 Network，仍用顶部菜单切换。
+- 「本机会话接入」可以暂停/恢复单个会话；暂停后它从侧栏消失，恢复后重新出现。
 
 `src-tauri/windows-app-manifest.xml` 声明 Per-Monitor V2 DPI 感知，避免 150%/200%
 缩放下 WebView 视口偏小或裁切。
@@ -78,6 +80,9 @@ npm run tauri:build
   文件名不含路径分隔符，并用 `canonicalize` 防止符号链接逃出收件箱。
 - 草稿保存在 WebView 的 `localStorage`（键前缀 `rn.draft.v1.`），不写入引擎数据库；
   输入后 300ms 落盘，异常强制结束进程可能丢失最后一小段输入。
+- 暂停/恢复和 `enable_workspaces` 没有 CLI 子命令，客户端直接连引擎命名管道
+  `\\.\pipe\reason-network-<FNV-1a(home)>`：发送一行 JSON，并校验管道对端 PID 与
+  `daemon.lock` 一致。工作区目录里的 `workspace-id` 记录团队 id，用于菜单和 `home_for` 定位。
 - 界面轮询 3 秒；消息按「本机会话 + 对方会话」隔离，默认显示最近 200 条。
 
 ## 第一阶段限制
@@ -86,7 +91,8 @@ npm run tauri:build
   二进制文件传输。发件记录只保留文件名，只有收到的附件可以预览/另存。
 - 通知依赖应用的 AppUserModelID；未安装的开发构建可能显示为宿主进程名（如
   Windows PowerShell），安装包会显示 “Reason Network”。
-- 不做会话暂停/恢复和环境配置向导；这些仍在原工具与后台侧完成。
+- 工作区只支持新建/加入/切换；归档和删除工作区尚未提供，删除目录前需要自行停止该工作区的 daemon。
+- 不做环境配置向导；这些仍在原工具与后台侧完成。
 - 多工作区切换依赖 `~/.reason/workspaces` 下已有的数据库；在主工作区创建/加入
   Network 已支持，概览里的 Network 菜单可切换已有工作区，工作区可先用 CLI 入网
   （见 `../WINDOWS.md`）。

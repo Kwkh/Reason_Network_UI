@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::backend::run_json;
 use crate::types::{
     Attachment, ChatMessage, Conversation, DirectorySession, IncomingNotice, LocalSession, Member,
-    NetworkSummary, Snapshot,
+    NetworkSummary, PausedSession, Snapshot,
 };
 
 pub fn user_home() -> PathBuf {
@@ -39,12 +39,26 @@ pub fn home_for(network: Option<&str>) -> Result<PathBuf, String> {
             if id.contains('\\') || id.contains('/') || id.contains("..") {
                 return Err("Network 标识不合法".into());
             }
-            let dir = workspaces_root().join(id);
-            if dir.join("network.db").is_file() {
-                Ok(dir)
-            } else {
-                Err(format!("找不到 Network 工作区：{id}"))
+            // 新工作区的 id 是团队 id，存在 workspace-id 文件里；旧工作区直接以目录名作 id。
+            let direct = workspaces_root().join(id);
+            if direct.join("network.db").is_file() {
+                return Ok(direct);
             }
+            if let Ok(entries) = std::fs::read_dir(workspaces_root()) {
+                for entry in entries.flatten() {
+                    let dir = entry.path();
+                    if !dir.join("network.db").is_file() {
+                        continue;
+                    }
+                    let matches = std::fs::read_to_string(dir.join("workspace-id"))
+                        .map(|value| value.trim() == id)
+                        .unwrap_or(false);
+                    if matches {
+                        return Ok(dir);
+                    }
+                }
+            }
+            Err(format!("找不到 Network 工作区：{id}"))
         }
     }
 }
@@ -277,6 +291,32 @@ fn read_locals(home: &Path) -> Result<Vec<LocalSession>, String> {
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("读取本机会话失败：{e}"))
+}
+
+fn read_paused(home: &Path) -> Result<Vec<PausedSession>, String> {
+    let db = open(home)?;
+    if !has_table(&db, "paused_sessions") {
+        return Ok(Vec::new());
+    }
+    let sql = if has_table(&db, "sessions") {
+        "SELECT p.key, COALESCE(s.name, p.key), COALESCE(s.agent, '')
+         FROM paused_sessions p LEFT JOIN sessions s ON s.key = p.key
+         ORDER BY s.last_seen DESC, p.key"
+    } else {
+        "SELECT key, key, '' FROM paused_sessions ORDER BY key"
+    };
+    let mut stmt = db.prepare(sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(PausedSession {
+                key: row.get(0)?,
+                name: row.get(1)?,
+                agent: row.get(2)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("读取暂停会话失败：{e}"))
 }
 
 fn conversations(home: &Path, address: &str) -> Result<Vec<Conversation>, String> {
@@ -558,15 +598,19 @@ pub fn list_networks() -> Result<Vec<NetworkSummary>, String> {
     // 先让主 daemon 起来，避免只读连接撞上正在恢复的 WAL。
     let primary = primary_home();
     let _ = run_json(&primary, &["team", "--json"]);
+    let mut primary_team_id: Option<String> = None;
     match read_team(&primary)? {
-        Some(team) => out.push(NetworkSummary {
-            id: "primary".into(),
-            name: team.name,
-            person: String::new(),
-            machine: String::new(),
-            joined: true,
-            primary: true,
-        }),
+        Some(team) => {
+            primary_team_id = Some(team.id.clone());
+            out.push(NetworkSummary {
+                id: "primary".into(),
+                name: team.name,
+                person: String::new(),
+                machine: String::new(),
+                joined: true,
+                primary: true,
+            });
+        }
         None => out.push(NetworkSummary {
             id: "primary".into(),
             name: "本机 Network".into(),
@@ -584,16 +628,26 @@ pub fn list_networks() -> Result<Vec<NetworkSummary>, String> {
             if !dir.is_dir() || !dir.join("network.db").is_file() {
                 continue;
             }
-            let Some(id) = dir.file_name().and_then(|name| name.to_str()) else {
+            let Some(dir_name) = dir.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
             let Ok(Some(team)) = read_team(&dir) else {
                 continue;
             };
+            if primary_team_id.as_deref() == Some(team.id.as_str()) {
+                // 已经作为主工作区显示，不再重复列一份。
+                continue;
+            }
+            // 新工作区把团队 id 写在 workspace-id；旧工作区退回目录名。
+            let id = std::fs::read_to_string(dir.join("workspace-id"))
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| dir_name.to_string());
             // 主 daemon 的分发需要各工作区 daemon 在线；启动时顺手拉起（和 macOS 的 KeepAlive 一致）。
             let _ = run_json(&dir, &["team", "--json"]);
             workspaces.push(NetworkSummary {
-                id: id.to_string(),
+                id,
                 name: team.name,
                 person: String::new(),
                 machine: String::new(),
@@ -604,6 +658,9 @@ pub fn list_networks() -> Result<Vec<NetworkSummary>, String> {
     }
     workspaces.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
     out.extend(workspaces);
+    // 同一团队可能被重复加入为工作区；菜单里只保留一份。
+    let mut seen = HashSet::new();
+    out.retain(|summary| seen.insert(summary.id.clone()));
     Ok(out)
 }
 
@@ -620,6 +677,7 @@ pub fn snapshot(home: &Path, local: Option<&str>, peer: Option<&str>) -> Result<
             members: Vec::new(),
             directory: Vec::new(),
             locals: Vec::new(),
+            paused_sessions: Vec::new(),
             conversations: Vec::new(),
             messages: Vec::new(),
             incoming: Vec::new(),
@@ -662,6 +720,7 @@ pub fn snapshot(home: &Path, local: Option<&str>, peer: Option<&str>) -> Result<
     };
 
     let mut locals = read_locals(home).unwrap_or_default();
+    let paused_sessions = read_paused(home).unwrap_or_default();
     for session in &mut locals {
         if person.is_empty() {
             break;
@@ -723,6 +782,7 @@ pub fn snapshot(home: &Path, local: Option<&str>, peer: Option<&str>) -> Result<
         members,
         directory,
         locals,
+        paused_sessions,
         conversations: conversation_list,
         messages,
         incoming,

@@ -9,6 +9,7 @@ use std::process::{Command, Output, Stdio};
 use serde_json::Value;
 
 use crate::attachments;
+use crate::daemon_ipc;
 use crate::store;
 use crate::types::{AttachmentDraft, NativeEntry, NetworkSummary, SendOutcome, Snapshot};
 
@@ -135,6 +136,217 @@ pub fn run_json(home: &Path, args: &[&str]) -> Result<Value, String> {
     let bin = backend_binary()?;
     let output = run_cli(&bin, home, args)?;
     serde_json::from_slice(&output.stdout).map_err(|error| format!("解析后台 JSON 失败：{error}"))
+}
+
+/// 先跑一次 CLI，让按需启动的 daemon 起来，再走命名管道。
+async fn ensure_daemon(home: PathBuf) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let bin = backend_binary()?;
+        run_cli(&bin, &home, &["team", "--json"]).map(|_| ())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn set_session_participation(
+    network: Option<String>,
+    key: String,
+    paused: bool,
+) -> Result<(), String> {
+    if key.trim().is_empty() {
+        return Err("缺少本机会话".into());
+    }
+    let home = store::home_for(network.as_deref())?;
+    ensure_daemon(home.clone()).await?;
+    daemon_ipc::request(
+        &home,
+        serde_json::json!({
+            "op": "set_session_participation",
+            "key": key,
+            "paused": paused,
+        }),
+    )
+    .await?;
+    // 与 macOS 一致：回读一次，确认 daemon 真的接受了状态。
+    let state = daemon_ipc::request(&home, serde_json::json!({ "op": "session_participation" })).await?;
+    let confirmed = state
+        .get("paused")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().any(|item| item.as_str() == Some(key.as_str())))
+        .unwrap_or(false);
+    if confirmed != paused {
+        return Err("后台没有确认会话状态，请刷新后重试。".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn enable_workspaces(network: Option<String>) -> Result<(), String> {
+    let home = store::home_for(network.as_deref())?;
+    ensure_daemon(home.clone()).await?;
+    daemon_ipc::request(&home, serde_json::json!({ "op": "enable_workspaces" })).await?;
+    Ok(())
+}
+
+/// 加入失败时 daemon 可能已经起来并占着数据库；先结束它，才能删掉半成品目录。
+fn stop_daemon_process(home: &Path) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
+        let pid = std::fs::read_to_string(home.join("daemon.lock"))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok());
+        if let Some(pid) = pid {
+            // SAFETY: 只用 PROCESS_TERMINATE 打开 daemon.lock 记录的 PID。
+            unsafe {
+                let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                if !handle.is_null() {
+                    let _ = TerminateProcess(handle, 1);
+                    let _ = CloseHandle(handle);
+                }
+            }
+            for _ in 0..20 {
+                if !home.join("daemon.lock").exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = home;
+}
+
+fn friendly_workspace_error(error: String) -> String {
+    let text = error.trim();
+    let text = text.strip_prefix("Error: ").unwrap_or(text);
+    if text.contains("\"name_taken\"") {
+        return "这台机器上已有同名身份，请换一个本机名称后再试。".into();
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        if let Some(code) = value.get("error").and_then(Value::as_str) {
+            return format!("加入失败：{code}");
+        }
+    }
+    text.to_string()
+}
+
+fn new_workspace_name() -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    format!("{stamp:032x}")
+}
+
+/// 在主工作区启用工作区分发，然后在 `~/.reason/workspaces/<新目录>` 里建网或入网。
+async fn provision_workspace(
+    name: String,
+    person: String,
+    invite: Option<String>,
+) -> Result<NetworkSummary, String> {
+    let person = person.trim().to_string();
+    if person.is_empty() {
+        return Err("请填写本机名称".into());
+    }
+    let name = name.trim().to_string();
+    let invite = invite
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if invite.is_none() {
+        if name.is_empty() {
+            return Err("请填写 Network 名称".into());
+        }
+        if name.chars().count() > 60 {
+            return Err("Network 名称最多 60 字".into());
+        }
+    }
+
+    let primary = store::primary_home();
+    ensure_daemon(primary.clone()).await?;
+    daemon_ipc::request(&primary, serde_json::json!({ "op": "enable_workspaces" })).await?;
+
+    let task_person = person.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<NetworkSummary, String> {
+        let bin = backend_binary()?;
+        let root = store::workspaces_root();
+        std::fs::create_dir_all(&root).map_err(|error| format!("创建工作区目录失败：{error}"))?;
+        let mut dir = root.join(new_workspace_name());
+        while dir.exists() {
+            dir = root.join(new_workspace_name());
+        }
+        std::fs::create_dir_all(&dir).map_err(|error| format!("创建工作区目录失败：{error}"))?;
+
+        let args: Vec<String> = match &invite {
+            Some(ticket) => vec![
+                "join".into(),
+                ticket.clone(),
+                "--as".into(),
+                task_person.clone(),
+                "--no-setup".into(),
+                "--json".into(),
+            ],
+            None => vec![
+                "init".into(),
+                name.clone(),
+                "--as".into(),
+                task_person.clone(),
+                "--no-setup".into(),
+                "--json".into(),
+            ],
+        };
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = match run_cli(&bin, &dir, &borrowed) {
+            Ok(output) => output,
+            Err(error) => {
+                // 新建/加入失败时不要留下半成品工作区目录。
+                stop_daemon_process(&dir);
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(friendly_workspace_error(error));
+            }
+        };
+        let value: Value = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("解析后台 JSON 失败：{error}"))?;
+        let id = value
+            .get("team_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "后台没有返回 Network id".to_string())?
+            .to_string();
+        let team_name = value
+            .get("team_name")
+            .and_then(Value::as_str)
+            .unwrap_or("Network")
+            .to_string();
+        std::fs::write(dir.join("workspace-id"), &id)
+            .map_err(|error| format!("写入工作区标识失败：{error}"))?;
+        // init/join 会重启 daemon；顺手拉起并等它就绪。
+        let _ = run_json(&dir, &["team", "--json"]);
+        Ok(NetworkSummary {
+            id,
+            name: team_name,
+            person: task_person,
+            machine: String::new(),
+            joined: true,
+            primary: false,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn create_workspace(name: String, person: String) -> Result<NetworkSummary, String> {
+    provision_workspace(name, person, None).await
+}
+
+#[tauri::command]
+pub async fn join_workspace(invite: String, person: String) -> Result<NetworkSummary, String> {
+    provision_workspace(String::new(), person, Some(invite)).await
 }
 
 #[tauri::command]

@@ -60,6 +60,13 @@ npm run tauri:dev
 保存在 `localStorage`；收到新消息时会发 Windows 系统通知，点击可切回对应会话。
 Windows toast 需要 AppUserModelID：客户端启动时显式设置，安装包内会显示产品名。
 
+独立工作区在概览里新建/加入：客户端先对主工作区 daemon 发 `enable_workspaces`，再在
+`%USERPROFILE%\.reason\workspaces\<新目录>` 里跑 `init`/`join`（带
+`REASON_NETWORK_LOCAL_PARTICIPATION=1`），成功后写 `workspace-id`。暂停/恢复使用
+daemon 协议的 `set_session_participation`。这些操作没有 CLI 子命令，客户端直接连
+`\\.\pipe\reason-network-<FNV-1a(home)>` 发一行 JSON，并校验管道对端 PID 与
+`daemon.lock` 一致，因此不需要额外引擎补丁。归档/删除工作区尚未提供。
+
 ### 接入本机 Codex 并登记会话
 
 Windows 后台只有在工具的原对话里被调用时才会登记会话。构建完成后先运行一次：

@@ -12,7 +12,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+tokio = { version = "1", features = ["net", "io-util", "time"] }
 
 [dependencies]
 tauri = { version = "2", features = [] }

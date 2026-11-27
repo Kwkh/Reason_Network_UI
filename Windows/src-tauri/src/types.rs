@@ -39,6 +39,15 @@ pub struct LocalSession {
     pub online: bool,
 }
 
+/// 已暂停接入的本机会话；在概览里可以恢复。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PausedSession {
+    pub name: String,
+    pub key: String,
+    pub agent: String,
+}
+
 /// `who --json` 返回的本机与队友会话目录。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -120,6 +129,7 @@ pub struct Snapshot {
     pub members: Vec<Member>,
     pub directory: Vec<DirectorySession>,
     pub locals: Vec<LocalSession>,
+    pub paused_sessions: Vec<PausedSession>,
     pub conversations: Vec<Conversation>,
     pub messages: Vec<ChatMessage>,
     /// 当前本机会话下，每个队友会话的最近一条来信。

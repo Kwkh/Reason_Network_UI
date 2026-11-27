@@ -5,14 +5,17 @@ import { onAction } from "@tauri-apps/plugin-notification";
 import {
   attachmentText,
   createNetwork,
+  createWorkspace,
   inspectAttachments,
   joinNetwork,
+  joinWorkspace,
   listNetworks,
   loadSnapshot,
   networkLink,
   openDataFolder,
   saveAttachment,
   sendMessage,
+  setSessionParticipation,
 } from "./api";
 import type { Attachment, AttachmentDraft, ChatMessage, NetworkSummary, Snapshot } from "./types";
 import Sidebar from "./components/Sidebar";
@@ -82,6 +85,7 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [dialog, setDialog] = useState<DialogMode>(null);
+  const [dialogScope, setDialogScope] = useState<"primary" | "workspace">("primary");
   const [overviewOpen, setOverviewOpen] = useState(false);
 
   // 选中的本机会话可能已经离线消失；此时回退到后台给出的默认会话。
@@ -279,6 +283,11 @@ export default function App() {
     };
   }, [network, local, peer]);
 
+  const openDialog = (mode: Exclude<DialogMode, null>, scope: "primary" | "workspace") => {
+    setDialogScope(scope);
+    setDialog(mode);
+  };
+
   const changeNetwork = (id: string) => {
     if (!id || id === network) return;
     setNetwork(id);
@@ -421,13 +430,57 @@ export default function App() {
     }
   };
 
+  const handleSessionParticipation = async (
+    session: { name: string; key: string },
+    paused: boolean,
+  ) => {
+    if (!network || busy) return;
+    setBusy(true);
+    try {
+      await setSessionParticipation(network, session.key, paused);
+      setNotice(paused ? `已暂停 ${session.name} 的接入` : `已恢复 ${session.name} 的接入`);
+      if (paused && effectiveLocal === session.name) {
+        setLocal(null);
+        setPeer(null);
+      }
+      const next = await loadSnapshot(
+        network,
+        paused ? null : session.name,
+        paused ? null : effectivePeer,
+      );
+      setSnapshot(next);
+      if (!paused) setLocal(session.name);
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleDialogSubmit = async (fields: {
     invite: string;
     name: string;
     person: string;
   }) => {
     if (!dialog) return;
-    // 新入网/建网只写主工作区：工作区已经是某个 Network 的家，不能覆盖。
+    if (dialogScope === "workspace") {
+      const summary =
+        dialog === "join"
+          ? await joinWorkspace(fields.invite, fields.person)
+          : await createWorkspace(fields.name, fields.person);
+      setDialog(null);
+      setNotice(`${dialog === "join" ? "已加入工作区" : "已新建工作区"}：${summary.name}`);
+      setLocal(null);
+      setPeer(null);
+      setSnapshot(null);
+      setPreview(null);
+      await refreshNetworks();
+      setNetwork(summary.id);
+      const next = await loadSnapshot(summary.id, null, null);
+      setSnapshot(next);
+      return;
+    }
+    // 主工作区的入网/建网：工作区已经是某个 Network 的家，不能覆盖。
     const output =
       dialog === "join"
         ? await joinNetwork(null, fields.invite, fields.person)
@@ -480,8 +533,8 @@ export default function App() {
             setReplyTo(message);
           }}
           onOpenAttachment={(attachment) => void handleOpenAttachment(attachment)}
-          onJoin={() => setDialog("join")}
-          onCreate={() => setDialog("create")}
+          onJoin={() => openDialog("join", "primary")}
+          onCreate={() => openDialog("create", "primary")}
           onStatus={() => setOverviewOpen(true)}
         />
         <Composer
@@ -512,12 +565,23 @@ export default function App() {
           onSelectNetwork={changeNetwork}
           onJoin={() => {
             setOverviewOpen(false);
-            setDialog("join");
+            openDialog("join", "primary");
           }}
           onCreate={() => {
             setOverviewOpen(false);
-            setDialog("create");
+            openDialog("create", "primary");
           }}
+          onJoinWorkspace={() => {
+            setOverviewOpen(false);
+            openDialog("join", "workspace");
+          }}
+          onCreateWorkspace={() => {
+            setOverviewOpen(false);
+            openDialog("create", "workspace");
+          }}
+          onSessionParticipation={(session, paused) =>
+            void handleSessionParticipation(session, paused)
+          }
           onRefresh={() => void refresh()}
           onOpenFolder={handleOpenFolder}
           onCopyInvite={() => void handleCopyInvite()}
@@ -536,8 +600,9 @@ export default function App() {
 
       {dialog && (
         <JoinDialog
-          key={dialog}
+          key={`${dialogScope}-${dialog}`}
           mode={dialog}
+          scope={dialogScope}
           defaultPerson={snapshot?.person ?? ""}
           onClose={() => setDialog(null)}
           onSubmit={handleDialogSubmit}

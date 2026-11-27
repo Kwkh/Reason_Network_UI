@@ -31,6 +31,13 @@ export interface LocalSession {
   online: boolean;
 }
 
+/** 已暂停接入的本机会话。 */
+export interface PausedSession {
+  name: string;
+  key: string;
+  agent: string;
+}
+
 export interface DirectorySession {
   address: string;
   name: string;
@@ -95,6 +102,7 @@ export interface Snapshot {
   members: Member[];
   directory: DirectorySession[];
   locals: LocalSession[];
+  pausedSessions: PausedSession[];
   conversations: Conversation[];
   messages: ChatMessage[];
   incoming: IncomingNotice[];

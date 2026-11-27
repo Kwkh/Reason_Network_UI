@@ -10,12 +10,20 @@ interface Fields {
 
 interface Props {
   mode: "join" | "create";
+  scope?: "primary" | "workspace";
   defaultPerson: string;
   onClose: () => void;
   onSubmit: (fields: Fields) => Promise<void>;
 }
 
-export default function JoinDialog({ mode, defaultPerson, onClose, onSubmit }: Props) {
+export default function JoinDialog({
+  mode,
+  scope = "primary",
+  defaultPerson,
+  onClose,
+  onSubmit,
+}: Props) {
+  const workspace = scope === "workspace";
   const [invite, setInvite] = useState("");
   const [name, setName] = useState("");
   const [person, setPerson] = useState(defaultPerson);
@@ -47,7 +55,15 @@ export default function JoinDialog({ mode, defaultPerson, onClose, onSubmit }: P
     <div className="overlay" role="presentation">
       <form className="dialog" onSubmit={submit}>
         <header className="dialog-header">
-          <h2>{mode === "join" ? "加入 Network" : "新建 Network"}</h2>
+          <h2>
+            {mode === "join"
+              ? workspace
+                ? "加入工作区"
+                : "加入 Network"
+              : workspace
+                ? "新建工作区"
+                : "新建 Network"}
+          </h2>
           <button
             type="button"
             className="icon-button"
@@ -60,9 +76,13 @@ export default function JoinDialog({ mode, defaultPerson, onClose, onSubmit }: P
         </header>
 
         <p className="dialog-help">
-          {mode === "join"
-            ? "粘贴完整邀请链接或邀请行。邀请方需要在线；Windows 端会使用临时测试身份加入。"
-            : "在本机创建一个临时 Network，把邀请链接发给 Mac 端就能开始联调。"}
+          {workspace
+            ? mode === "join"
+              ? "在独立工作区里加入另一个 Network，不影响当前 Network。邀请方需要在线。"
+              : "在独立工作区里新建 Network，可与当前 Network 同时存在并切换。"
+            : mode === "join"
+              ? "粘贴完整邀请链接或邀请行。邀请方需要在线；Windows 端会使用临时测试身份加入。"
+              : "在本机创建一个临时 Network，把邀请链接发给 Mac 端就能开始联调。"}
         </p>
 
         {mode === "join" ? (
