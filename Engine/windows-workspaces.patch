@@ -1,0 +1,123 @@
+diff --git a/src/client.rs b/src/client.rs
+index 2fcdd31..4edfc8e 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -231,7 +231,12 @@ async fn reconnect(link: Weak<Link>) {
+ 
+ /// The daemon that holds the lock, if it is alive (it may still be starting).
+ pub fn running_daemon() -> Option<u32> {
+-    holder(&paths::lock())
++    running_daemon_in(&paths::home())
++}
++
++/// The daemon serving the state directory `home`, if it is alive. A workspace has its own daemon and lock.
++pub fn running_daemon_in(home: &std::path::Path) -> Option<u32> {
++    holder(&home.join("daemon.lock"))
+ }
+ 
+ /// Who holds the lock at `path`. Asked of the lock, not the pid: a daemon that exited holds none, even when a
+diff --git a/src/daemon/mod.rs b/src/daemon/mod.rs
+index 0d44b02..47708ac 100644
+--- a/src/daemon/mod.rs
++++ b/src/daemon/mod.rs
+@@ -14,7 +14,6 @@ mod reason;
+ mod sessions;
+ mod teamops;
+ mod update;
+-#[cfg(unix)]
+ mod workspaces;
+ 
+ use crate::{
+@@ -395,10 +394,7 @@ impl Daemon {
+                     Request::Register { session, replay } => Some((session.key.clone(), *replay)),
+                     _ => None,
+                 };
+-                let reply = match {
+-                    #[cfg(unix)] { this.dispatch(conn, f.body).await }
+-                    #[cfg(not(unix))] { this.handle(conn, f.body).await }
+-                } {
++                let reply = match this.dispatch(conn, f.body).await {
+                     Ok(v) => Reply::ok(f.id, v),
+                     Err(e) => {
+                         let error = match registration {
+diff --git a/src/daemon/workspaces.rs b/src/daemon/workspaces.rs
+index 632abb8..a2ba597 100644
+--- a/src/daemon/workspaces.rs
++++ b/src/daemon/workspaces.rs
+@@ -62,11 +62,10 @@ fn workspaces(key: Option<&str>) -> Result<Vec<Workspace>> {
+ 
+ impl Workspace {
+     async fn call(&self, request: &Request) -> Result<Value> {
+-        let path = paths::socket_in(&self.dir);
+         let wait = if matches!(request, Request::Ask { .. }) { MAX_WAIT + 5 } else { 32 };
+         let result = tokio::time::timeout(Duration::from_secs(wait), async {
+-            let stream = tokio::net::UnixStream::connect(path).await?;
+-            let (read, mut write) = stream.into_split();
++            let stream = crate::ipc::connect_in(&self.dir).await?;
++            let (read, mut write) = tokio::io::split(stream);
+             let mut frame =
+                 serde_json::to_vec(&json!({"id":1,"op":"workspace_dispatch","network":self.team,"request":request}))?;
+             frame.push(b'\n');
+diff --git a/src/ipc.rs b/src/ipc.rs
+index 35d72a0..a06137a 100644
+--- a/src/ipc.rs
++++ b/src/ipc.rs
+@@ -17,16 +17,28 @@ pub use tokio::net::windows::named_pipe::NamedPipeServer as Accepted;
+ 
+ #[cfg(unix)]
+ pub async fn connect() -> io::Result<Stream> {
+-    Stream::connect(paths::socket()).await
++    connect_in(&paths::home()).await
+ }
+ 
+ #[cfg(windows)]
+ pub async fn connect() -> io::Result<Stream> {
++    connect_in(&paths::home()).await
++}
++
++/// Connects to the daemon serving `home`: the primary state directory, or one workspace.
++#[cfg(unix)]
++pub async fn connect_in(home: &std::path::Path) -> io::Result<Stream> {
++    Stream::connect(paths::socket_in(home)).await
++}
++
++#[cfg(windows)]
++pub async fn connect_in(home: &std::path::Path) -> io::Result<Stream> {
+     use std::os::windows::io::AsRawHandle;
+     use tokio::net::windows::named_pipe::ClientOptions;
++    let path = paths::socket_in(home);
+     let mut tries = 0;
+     let pipe = loop {
+-        match ClientOptions::new().open(paths::socket()) {
++        match ClientOptions::new().open(&path) {
+             // Every instance is taken for a moment while the daemon opens the next one.
+             Err(e)
+                 if e.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32) && tries < 20 =>
+@@ -41,8 +53,8 @@ pub async fn connect() -> io::Result<Stream> {
+     let mut server = 0;
+     // SAFETY: asks about the pipe handle we hold.
+     unsafe { windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut server) };
+-    if crate::client::running_daemon() != Some(server) {
+-        return Err(io::Error::other(format!("{} is not this user's network daemon", paths::socket().display())));
++    if crate::client::running_daemon_in(home) != Some(server) {
++        return Err(io::Error::other(format!("{} is not this user's network daemon", path.display())));
+     }
+     Ok(pipe)
+ }
+diff --git a/src/paths.rs b/src/paths.rs
+index 1d8703e..3055a91 100644
+--- a/src/paths.rs
++++ b/src/paths.rs
+@@ -97,6 +97,12 @@ fn pipe_in(home: &Path) -> PathBuf {
+     PathBuf::from(format!(r"\\.\pipe\{stem}-{:016x}", hash(&dir)))
+ }
+ 
++/// The local transport for the state directory `home`: the same named-pipe rule as [`socket`], for workspaces.
++#[cfg(windows)]
++pub(crate) fn socket_in(home: &Path) -> PathBuf {
++    pipe_in(home)
++}
++
+ /// FNV-1a: stable across builds, unlike `DefaultHasher`.
+ fn hash(path: &Path) -> u64 {
+     path.as_os_str()

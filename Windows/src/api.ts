@@ -1,0 +1,168 @@
+import { invoke } from "@tauri-apps/api/core";
+import type {
+  AttachmentDraft,
+  BackendInfo,
+  JoinResult,
+  NativeEntry,
+  NetworkSummary,
+  ParticipationBatch,
+  ReceiveMode,
+  SendOutcome,
+  Snapshot,
+} from "./types";
+
+export function listNetworks(): Promise<NetworkSummary[]> {
+  return invoke<NetworkSummary[]>("list_networks");
+}
+
+export function loadSnapshot(
+  network: string | null,
+  local: string | null,
+  peer: string | null,
+): Promise<Snapshot> {
+  return invoke<Snapshot>("snapshot", { network, local, peer });
+}
+
+export function sendMessage(args: {
+  network: string | null;
+  from: string;
+  to: string;
+  body: string;
+  replyTo: string | null;
+  files: string[];
+  notify: boolean;
+}): Promise<SendOutcome> {
+  return invoke<SendOutcome>("send_message", args);
+}
+
+export function inspectAttachments(paths: string[]): Promise<AttachmentDraft[]> {
+  return invoke<AttachmentDraft[]>("inspect_attachments", { paths });
+}
+
+export function attachmentText(
+  network: string | null,
+  directory: string,
+  name: string,
+): Promise<string> {
+  return invoke<string>("attachment_text", { network, directory, name });
+}
+
+export function saveAttachment(
+  network: string | null,
+  directory: string,
+  name: string,
+  target: string,
+): Promise<void> {
+  return invoke<void>("save_attachment", { network, directory, name, target });
+}
+
+export function joinNetwork(
+  network: string | null,
+  invite: string,
+  person: string,
+): Promise<string> {
+  return invoke<string>("join_network", { network, invite, person });
+}
+
+export function createNetwork(
+  network: string | null,
+  name: string,
+  person: string,
+): Promise<string> {
+  return invoke<string>("create_network", { network, name, person });
+}
+
+export function networkLink(network: string | null): Promise<string> {
+  return invoke<string>("network_link", { network });
+}
+
+export function setSessionParticipation(  network: string | null,
+  key: string,
+  paused: boolean,
+): Promise<void> {
+  return invoke<void>("set_session_participation", { network, key, paused });
+}
+
+export function joinSessionNetwork(
+  session: { key: string; agent: string; name: string; cwd: string },
+  target: string,
+): Promise<JoinResult> {
+  return invoke<JoinResult>("join_session_network", {
+    key: session.key,
+    agent: session.agent,
+    name: session.name,
+    cwd: session.cwd,
+    target,
+  });
+}
+
+export function inviteCode(network: string | null): Promise<string> {
+  return invoke<string>("invite_code", { network });
+}
+
+export function leaveNetwork(network: string | null, force = false): Promise<void> {
+  return invoke<void>("leave_network", { network, force });
+}
+
+export function dissolveNetwork(network: string | null): Promise<void> {
+  return invoke<void>("dissolve_network", { network });
+}
+
+export function removeDevice(network: string | null, endpoint: string): Promise<void> {
+  return invoke<void>("remove_device", { network, endpoint });
+}
+
+export function setReceiveMode(
+  network: string | null,
+  key: string,
+  mode: ReceiveMode,
+): Promise<void> {
+  return invoke<void>("set_receive_mode", { network, key, mode });
+}
+
+export function setSessionsParticipation(
+  network: string | null,
+  keys: string[],
+  paused: boolean,
+): Promise<ParticipationBatch> {
+  return invoke<ParticipationBatch>("set_sessions_participation", { network, keys, paused });
+}
+
+export function enableWorkspaces(network: string | null): Promise<void> {  return invoke<void>("enable_workspaces", { network });
+}
+
+export function createWorkspace(name: string, person: string): Promise<NetworkSummary> {
+  return invoke<NetworkSummary>("create_workspace", { name, person });
+}
+
+export function joinWorkspace(invite: string, person: string): Promise<NetworkSummary> {
+  return invoke<NetworkSummary>("join_workspace", { invite, person });
+}
+
+export function deleteWorkspace(id: string): Promise<void> {
+  return invoke<void>("delete_workspace", { id });
+}
+
+export function nativeCatalog(): Promise<NativeEntry[]> {
+  return invoke<NativeEntry[]>("native_catalog");
+}
+
+export function backendInfo(): Promise<BackendInfo> {
+  return invoke<BackendInfo>("backend_info");
+}
+
+export function appIntegrations(): Promise<string[]> {
+  return invoke<string[]>("app_integrations");
+}
+
+export function setupPreview(): Promise<string> {
+  return invoke<string>("setup_preview");
+}
+
+export function setupConfigure(): Promise<string> {
+  return invoke<string>("setup_configure");
+}
+
+export function openDataFolder(network: string | null): Promise<void> {
+  return invoke<void>("open_data_folder", { network });
+}
