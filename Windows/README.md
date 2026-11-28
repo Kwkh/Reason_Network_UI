@@ -63,12 +63,21 @@ Debug 构建也不弹控制台窗口；需要在终端看 Rust 输出时，临�
 ## 打包
 
 ```powershell
+..\Engine\build-windows.ps1   # 先把后台产物放到 Engine\Bin
 npm run tauri:build
 ```
 
-产物在 `src-tauri/target/release/bundle/nsis/`。打包不会自动附带后台二进制；
-发布前需把 `Engine\Bin\reason-network-backend.exe` 放进安装包资源或用
-`REASON_NETWORK_BIN` 指定，后续阶段再补安装器集成。
+`tauri.conf.json` 只保留开发/`cargo check` 所需的最小配置；内置后台、NSIS 钩子放在
+`src-tauri/tauri.release.conf.json`，`npm run tauri:build` 会自动合并。
+
+产物在 `src-tauri/target/release/bundle/nsis/`。安装包会把
+`Engine\Bin\reason-network-backend.exe` 作为资源放进 `backend\`，运行时优先使用
+它；开发构建没有资源目录时回落到仓库 `Engine\Bin`。NSIS 的安装/升级/卸载钩子会
+先运行 `backend\stop-daemons.ps1`，结束主工作区和各工作区的 daemon，避免占用或
+留在已删除的路径。
+
+当前安装包未签名，也没有接入自动更新：签名需要 Windows 代码签名证书，更新需要
+`tauri-plugin-updater`、密钥和 `latest.json` 托管，凭据就绪后再补。
 
 ## 数据与安全
 

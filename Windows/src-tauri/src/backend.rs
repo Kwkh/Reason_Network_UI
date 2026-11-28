@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::OnceLock;
 
 use serde_json::Value;
 
@@ -13,7 +14,18 @@ use crate::daemon_ipc;
 use crate::store;
 use crate::types::{AttachmentDraft, NativeEntry, NetworkSummary, SendOutcome, Snapshot};
 
-/// 后台可执行文件：环境变量优先，其次仓库 `Engine/Bin`，最后在 PATH 里找。
+/// 安装包内置的后台路径；由 `setup` 在启动时解析资源目录后写入。
+static BUNDLED_BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+pub fn set_bundled_binary(path: Option<PathBuf>) {
+    let _ = BUNDLED_BINARY.set(path);
+}
+
+fn bundled_binary() -> Option<PathBuf> {
+    BUNDLED_BINARY.get().and_then(|path| path.clone())
+}
+
+/// 后台可执行文件：环境变量优先，其次安装包内置资源、仓库 `Engine/Bin`，最后在 PATH 里找。
 pub fn backend_binary() -> Result<PathBuf, String> {
     if let Some(value) = std::env::var_os("REASON_NETWORK_BIN") {
         let path = PathBuf::from(value);
@@ -24,6 +36,10 @@ pub fn backend_binary() -> Result<PathBuf, String> {
             "REASON_NETWORK_BIN 指向的文件不存在：{}",
             path.display()
         ));
+    }
+
+    if let Some(candidate) = bundled_binary().filter(|path| path.is_file()) {
+        return Ok(candidate);
     }
 
     // Windows/src-tauri -> Windows -> 仓库根

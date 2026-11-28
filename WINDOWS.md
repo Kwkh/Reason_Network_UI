@@ -104,9 +104,14 @@ Remove-Item Env:\REASON_NETWORK_HOME, Env:\REASON_NETWORK_LOCAL_PARTICIPATION
 之后在客户端刷新即可切换；主 daemon 按会话 key 把请求分发到各工作区 daemon
 （这一步由 `Engine/windows-workspaces.patch` 在 Windows 上启用）。
 
-当前限制：附件只支持 UTF-8 文本（不支持二进制），暂不做工作区新建 UI、会话暂停/
-恢复和安装包内置后台；完整桌面体验按后续阶段补齐。Mac ↔ Windows 的实际验收仍按下方
-联调清单执行。
+安装包：基础 `tauri.conf.json` 只保留开发/`cargo check` 需要的配置，内置后台和 NSIS
+钩子在 `tauri.release.conf.json`，由 `npm run tauri:build` 合并。安装包会把后台放进
+资源 `backend\`，运行时优先使用；NSIS 安装/升级/卸载前会结束本机 daemon。未签名、
+未接自动更新，发布凭据就绪后再补。CI 的 `windows-release.yml` 在手动触发或
+`windows-v*` 标签时构建 NSIS 并上传产物。
+
+当前限制：附件只支持 UTF-8 文本（不支持二进制），工作区归档/删除未提供；Mac ↔
+Windows 的实际验收仍按下方联调清单执行。
 
 ## 实现顺序
 

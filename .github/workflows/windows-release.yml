@@ -1,0 +1,79 @@
+name: Windows Release
+
+# 只在手动触发或推送 windows-v* 标签时构建安装包，避免每次提交都跑完整发布链。
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'windows-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: 构建内置后台
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust（MSVC）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: 从固定上游提交构建后台
+        shell: pwsh
+        run: ./Engine/build-windows.ps1
+
+      - name: 本机冒烟测试
+        shell: pwsh
+        run: ./Tests/windows-smoke.ps1
+
+      - name: 上传后台二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: reason-network-backend
+          path: Engine/Bin/reason-network-backend.exe
+          if-no-files-found: error
+
+  installer:
+    name: 构建 NSIS 安装包
+    runs-on: windows-latest
+    needs: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: Windows/package-lock.json
+
+      - name: 安装 Rust（MSVC）
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 取回后台二进制
+        uses: actions/download-artifact@v4
+        with:
+          name: reason-network-backend
+          path: Engine/Bin
+
+      - name: 安装前端依赖
+        working-directory: Windows
+        run: npm ci
+
+      - name: 构建 NSIS 安装包
+        working-directory: Windows
+        run: npm run tauri:build
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: reason-network-windows-nsis
+          path: Windows/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+      # 签名与自动更新需要证书/签名密钥，等发布凭据就绪后再接入：
+      # - signtool sign /fd SHA256 /tr <timestamp> /td SHA256 /f <pfx> /p <password> <installer>
+      # - tauri-plugin-updater + latest.json，私钥和公钥分别放 Secrets 与 tauri.conf.json

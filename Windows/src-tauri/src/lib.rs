@@ -25,6 +25,16 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            // 安装包把后台放在可执行文件旁的 backend/ 下；开发构建没有这个目录，
+            // 会回落到仓库 Engine/Bin。
+            let bundled = app
+                .path()
+                .resource_dir()
+                .ok()
+                .map(|dir| dir.join("backend").join("reason-network-backend.exe"))
+                .filter(|path| path.is_file());
+            backend::set_bundled_binary(bundled);
+
             // Windows 高 DPI 下初始窗口可能按物理像素创建，导致 WebView 视口偏小。
             // 这里按逻辑像素再设置一次，保证 150%/200% 缩放时布局宽度仍是 940。
             if let Some(window) = app.get_webview_window("main") {
