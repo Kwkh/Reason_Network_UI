@@ -1438,6 +1438,8 @@ button:disabled {
   flex: none;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .overview-warn {

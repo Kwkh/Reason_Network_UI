@@ -63,6 +63,7 @@ pub fn run() {
             backend::create_network,
             backend::network_link,
             backend::set_session_participation,
+            backend::join_session_network,
             backend::enable_workspaces,
             backend::create_workspace,
             backend::join_workspace,

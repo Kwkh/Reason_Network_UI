@@ -13,7 +13,7 @@ use crate::attachments;
 use crate::daemon_ipc;
 use crate::store;
 use crate::types::{
-    AttachmentDraft, BackendInfo, NativeEntry, NetworkSummary, SendOutcome, Snapshot,
+    AttachmentDraft, BackendInfo, JoinResult, NativeEntry, NetworkSummary, SendOutcome, Snapshot,
 };
 
 /// 安装包内置的后台路径；由 `setup` 在启动时解析资源目录后写入。
@@ -345,6 +345,7 @@ async fn provision_workspace(
         // init/join 会重启 daemon；顺手拉起并等它就绪。
         let _ = run_json(&dir, &["team", "--json"]);
         Ok(NetworkSummary {
+            team_id: Some(id.clone()),
             id,
             name: team_name,
             person: task_person,
@@ -396,9 +397,95 @@ pub async fn delete_workspace(id: String) -> Result<(), String> {
     .map_err(|error| error.to_string())?
 }
 
+/// 能接入工作区的原生 agent，与上游 `agent::workspace_agent` 保持一致。
+const NATIVE_AGENTS: [&str; 4] = ["codex", "claude-code", "gemini", "dsh"];
+
+fn native_session_payload(key: &str, agent: &str, name: &str, cwd: &str) -> Result<Value, String> {
+    if !NATIVE_AGENTS.contains(&agent) {
+        return Err(
+            "只有原生 agent 会话（Codex、Claude Code、Gemini CLI、dsh）可以接入 Network。".into(),
+        );
+    }
+    let id = key
+        .strip_prefix(&format!("{agent}:"))
+        .filter(|id| !id.is_empty() && id.len() <= 512 && !id.chars().any(char::is_control))
+        .ok_or_else(|| "会话标识不完整，无法接入 Network。".to_string())?;
+    Ok(serde_json::json!({
+        "key": key,
+        "agent": agent,
+        "cwd": cwd,
+        "agent_session_id": id,
+        "tier": "pull",
+        "name": name,
+    }))
+}
+
+fn friendly_join_error(error: String) -> String {
+    let text = error.trim().trim_start_matches("Error: ");
+    let mapped = if text.contains("has not joined the requested Network") {
+        "本机还没有加入这个 Network。"
+    } else if text.contains("More than one workspace matches") {
+        "有同名 Network，请刷新后选择唯一 ID。"
+    } else if text.contains("native identity for the calling conversation") {
+        "只有原生 agent 会话（Codex、Claude Code、Gemini CLI、dsh）可以接入 Network。"
+    } else if text.contains("Codex thread is archived") {
+        "这个 Codex 线程已归档或不可用，请打开原对话后重试。"
+    } else if text.contains("disconnected during join") {
+        "会话在接入过程中被暂停，请恢复后重试。"
+    } else if text.contains("Network membership changed") {
+        "Network 状态已变化，请刷新后重试。"
+    } else {
+        return format!("接入 Network 失败：{text}");
+    };
+    mapped.to_string()
+}
+
+/// 把一个本机会话接入指定 Network（主工作区或独立工作区）。
+///
+/// 只把请求发给主工作区 daemon：它按 team id 找到对应工作区，再转发过去。
 #[tauri::command]
-pub async fn list_networks() -> Result<Vec<NetworkSummary>, String> {
-    let result = tauri::async_runtime::spawn_blocking(store::list_networks)
+pub async fn join_session_network(
+    key: String,
+    agent: String,
+    name: String,
+    cwd: String,
+    target: String,
+) -> Result<JoinResult, String> {
+    let session = native_session_payload(&key, &agent, &name, &cwd)?;
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("请选择要接入的 Network。".into());
+    }
+    let primary = store::primary_home();
+    ensure_daemon(primary.clone()).await?;
+    let value = daemon_ipc::request(
+        &primary,
+        serde_json::json!({ "op": "join_current_session", "network": target, "session": session }),
+    )
+    .await
+    .map_err(friendly_join_error)?;
+    Ok(JoinResult {
+        network_id: value
+            .get("network_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        network_name: value
+            .get("network_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        address: value
+            .get("address")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        online: value.get("online").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+#[tauri::command]
+pub async fn list_networks() -> Result<Vec<NetworkSummary>, String> {    let result = tauri::async_runtime::spawn_blocking(store::list_networks)
         .await
         .map_err(|error| error.to_string())?;
     result
@@ -759,4 +846,22 @@ pub async fn open_data_folder(network: Option<String>) -> Result<(), String> {
         let _ = &home;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::native_session_payload;
+
+    #[test]
+    fn join_payload_requires_native_agent() {
+        assert!(native_session_payload("cli:probe", "cli", "probe", "/tmp").is_err());
+        assert!(native_session_payload("claude-code:probe", "claude-code", "probe", "/tmp").is_ok());
+    }
+
+    #[test]
+    fn join_payload_checks_key_shape() {
+        assert!(native_session_payload("codex:", "codex", "probe", "/tmp").is_err());
+        assert!(native_session_payload("codex:abc", "claude-code", "probe", "/tmp").is_err());
+        assert!(native_session_payload("codex:abc", "codex", "probe", "/tmp").is_ok());
+    }
 }

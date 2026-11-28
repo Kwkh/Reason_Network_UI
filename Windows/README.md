@@ -129,9 +129,7 @@ npm run tauri:build
   Windows PowerShell），安装包会显示 “Reason Network”。
 - 工作区支持新建/加入/切换/删除；归档未提供。删除会先结束该工作区的 daemon 再删目录，
   主工作区和 `~/.reason` 其它数据不受影响。
-- 工作区只接受原生 agent 会话（Codex、Claude Code、Gemini CLI、dsh）；`listen`/
-  终端这类 `cli` 会话只能在主工作区登记。把会话接入/移出指定工作区的界面尚未提供，
-  目前原生会话默认留在主工作区。
+- 工作区只接受原生 agent 会话（Codex、Claude Code、Gemini CLI、dsh）。概览「本机会话接入」可以把会话接入其它已加入的 Network（主工作区或独立工作区），接入后会话会同时出现在两边；`listen`/终端这类 `cli` 会话仍只能在主工作区登记。
 - 不做环境配置向导；这些仍在原工具与后台侧完成。
 - 多工作区切换依赖 `~/.reason/workspaces` 下已有的数据库；在主工作区创建/加入
   Network 已支持，概览里的 Network 菜单可切换已有工作区，工作区可先用 CLI 入网

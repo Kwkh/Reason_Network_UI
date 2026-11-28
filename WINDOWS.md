@@ -121,8 +121,8 @@ Remove-Item Env:\REASON_NETWORK_HOME, Env:\REASON_NETWORK_LOCAL_PARTICIPATION
 正式发布前必须换成正式密钥并更新 `tauri.conf.json` 的 `pubkey`。
 
 当前限制：附件只支持 UTF-8 文本（不支持二进制），工作区归档未提供；工作区只接受
-原生 agent 会话（`listen`/终端会话仅限主工作区），客户端尚未提供把会话接入/移出
-指定工作区的界面；Mac ↔ Windows 的实际验收仍按下方联调清单执行。
+原生 agent 会话（`listen`/终端会话仅限主工作区），概览里可以把本机会话接入其它
+已加入的 Network。Mac ↔ Windows 的实际验收仍按下方联调清单执行。
 
 ## 实现顺序
 

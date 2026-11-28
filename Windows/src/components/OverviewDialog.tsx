@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { NetworkSummary, Snapshot } from "../types";
+import type { LocalSession, NetworkSummary, Snapshot } from "../types";
 import {
   CheckIcon,
   CopyIcon,
@@ -27,6 +27,7 @@ interface Props {
     session: { name: string; key: string },
     paused: boolean,
   ) => void;
+  onJoinSession: (session: LocalSession, target: string) => Promise<void>;
   onSetup: () => void;
   onCheckUpdate: () => void;
   onRefresh: () => void;
@@ -47,6 +48,7 @@ export default function OverviewDialog({
   onCreateWorkspace,
   onDeleteWorkspace,
   onSessionParticipation,
+  onJoinSession,
   onSetup,
   onCheckUpdate,
   onRefresh,
@@ -56,6 +58,7 @@ export default function OverviewDialog({
 }: Props) {
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
+  const [joiningKey, setJoiningKey] = useState<string | null>(null);
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
@@ -77,6 +80,16 @@ export default function OverviewDialog({
       setRemoving(null);
     }
   };
+
+  const confirmJoin = async (session: LocalSession, target: string) => {
+    await onJoinSession(session, target);
+    setJoiningKey(null);
+  };
+
+  // 可以接入的目标：已加入、有 team id，且不是当前正在查看的 Network。
+  const joinTargets = networks.filter(
+    (item) => item.joined && item.teamId && item.teamId !== snapshot?.networkId,
+  );
 
   const own = snapshot?.members.find((member) => member.isMe) ?? null;  const joined = Boolean(snapshot?.joined);
   const onlineSessions = (snapshot?.directory ?? []).filter(
@@ -252,6 +265,11 @@ export default function OverviewDialog({
                 <p className="overview-empty-line">暂无本机会话</p>
               ) : (
                 <>
+                  {locals.length > 0 && (
+                    <p className="overview-help">
+                      可以把原生 agent 会话接入另一个 Network；接入后会话会同时出现在两边。
+                    </p>
+                  )}
                   {locals.map((session) => (
                     <div className="device-row" key={session.key}>
                       <TerminalIcon size={16} />
@@ -259,14 +277,57 @@ export default function OverviewDialog({
                         <span className="device-name">{session.name}</span>
                         <span className="device-sub">{session.agent} · 接入中</span>
                       </div>
-                      <button
-                        type="button"
-                        className="session-action"
-                        disabled={busy}
-                        onClick={() => onSessionParticipation(session, true)}
-                      >
-                        暂停
-                      </button>
+                      {joiningKey === session.key ? (
+                        <div className="workspace-actions">
+                          {joinTargets.length === 0 ? (
+                            <span className="device-sub">没有其它 Network</span>
+                          ) : (
+                            joinTargets.map((item) => (
+                              <button
+                                key={item.id}
+                                type="button"
+                                className="session-action"
+                                disabled={busy}
+                                onClick={() => void confirmJoin(session, item.teamId ?? "")}
+                              >
+                                接入 {item.name}
+                              </button>
+                            ))
+                          )}
+                          <button
+                            type="button"
+                            className="session-action"
+                            disabled={busy}
+                            onClick={() => setJoiningKey(null)}
+                          >
+                            取消
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="workspace-actions">
+                          <button
+                            type="button"
+                            className="session-action"
+                            disabled={busy || joinTargets.length === 0}
+                            title={
+                              joinTargets.length === 0
+                                ? "没有其它已加入的 Network"
+                                : "接入另一个 Network"
+                            }
+                            onClick={() => setJoiningKey(session.key)}
+                          >
+                            接入 Network…
+                          </button>
+                          <button
+                            type="button"
+                            className="session-action"
+                            disabled={busy}
+                            onClick={() => onSessionParticipation(session, true)}
+                          >
+                            暂停
+                          </button>
+                        </div>
+                      )}
                     </div>
                   ))}
                   {paused.map((session) => (

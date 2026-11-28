@@ -10,6 +10,7 @@ import {
   deleteWorkspace,
   inspectAttachments,
   joinNetwork,
+  joinSessionNetwork,
   joinWorkspace,
   listNetworks,
   loadSnapshot,
@@ -19,7 +20,7 @@ import {
   sendMessage,
   setSessionParticipation,
 } from "./api";
-import type { Attachment, AttachmentDraft, ChatMessage, NetworkSummary, Snapshot } from "./types";
+import type { Attachment, AttachmentDraft, ChatMessage, LocalSession, NetworkSummary, Snapshot } from "./types";
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import Composer from "./components/Composer";
@@ -578,6 +579,22 @@ export default function App() {
     }
   };
 
+  // 把本机会话接入另一个 Network（主工作区或独立工作区），daemon 返回新地址。
+  const handleJoinSession = async (session: LocalSession, target: string) => {
+    setBusy(true);
+    try {
+      const result = await joinSessionNetwork(session, target);
+      setNotice(
+        `已接入 ${result.networkName || "Network"}：${result.address || session.name}`,
+      );
+      await refresh();
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleCheckUpdate = async () => {
     setBusy(true);
     try {
@@ -692,6 +709,7 @@ export default function App() {
           onSessionParticipation={(session, paused) =>
             void handleSessionParticipation(session, paused)
           }
+          onJoinSession={(session, target) => handleJoinSession(session, target)}
           onSetup={() => {
             setOverviewOpen(false);
             setSetupOpen(true);

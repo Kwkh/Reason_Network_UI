@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AttachmentDraft,
   BackendInfo,
+  JoinResult,
   NativeEntry,
   NetworkSummary,
   SendOutcome,
@@ -73,12 +74,24 @@ export function networkLink(network: string | null): Promise<string> {
   return invoke<string>("network_link", { network });
 }
 
-export function setSessionParticipation(
-  network: string | null,
+export function setSessionParticipation(  network: string | null,
   key: string,
   paused: boolean,
 ): Promise<void> {
   return invoke<void>("set_session_participation", { network, key, paused });
+}
+
+export function joinSessionNetwork(
+  session: { key: string; agent: string; name: string; cwd: string },
+  target: string,
+): Promise<JoinResult> {
+  return invoke<JoinResult>("join_session_network", {
+    key: session.key,
+    agent: session.agent,
+    name: session.name,
+    cwd: session.cwd,
+    target,
+  });
 }
 
 export function enableWorkspaces(network: string | null): Promise<void> {

@@ -630,6 +630,7 @@ pub fn list_networks() -> Result<Vec<NetworkSummary>, String> {
             out.push(NetworkSummary {
                 id: "primary".into(),
                 name: team.name,
+                team_id: Some(team.id),
                 person: String::new(),
                 machine: String::new(),
                 joined: true,
@@ -639,6 +640,7 @@ pub fn list_networks() -> Result<Vec<NetworkSummary>, String> {
         None => out.push(NetworkSummary {
             id: "primary".into(),
             name: "本机 Network".into(),
+            team_id: None,
             person: String::new(),
             machine: String::new(),
             joined: false,
@@ -674,6 +676,7 @@ pub fn list_networks() -> Result<Vec<NetworkSummary>, String> {
             workspaces.push(NetworkSummary {
                 id,
                 name: team.name,
+                team_id: Some(team.id),
                 person: String::new(),
                 machine: String::new(),
                 joined: true,

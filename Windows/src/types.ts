@@ -3,10 +3,20 @@
 export interface NetworkSummary {
   id: string;
   name: string;
+  /** 团队 id：主工作区和独立工作区都有，用于把本机会话接入指定 Network。 */
+  teamId: string | null;
   person: string;
   machine: string;
   joined: boolean;
   primary: boolean;
+}
+
+/** 把本机会话接入 Network 后返回的地址。 */
+export interface JoinResult {
+  networkId: string;
+  networkName: string;
+  address: string;
+  online: boolean;
 }
 
 export interface Member {

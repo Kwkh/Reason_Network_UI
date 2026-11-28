@@ -6,10 +6,22 @@ use serde::{Deserialize, Serialize};
 pub struct NetworkSummary {
     pub id: String,
     pub name: String,
+    /// 团队 id：主工作区和独立工作区都填，用于把本机会话接入指定 Network。
+    pub team_id: Option<String>,
     pub person: String,
     pub machine: String,
     pub joined: bool,
     pub primary: bool,
+}
+
+/// 把本机会话接入某个 Network 后，daemon 返回的地址信息。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JoinResult {
+    pub network_id: String,
+    pub network_name: String,
+    pub address: String,
+    pub online: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
