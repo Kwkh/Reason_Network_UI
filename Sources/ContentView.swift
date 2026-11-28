@@ -823,8 +823,8 @@ private struct ConversationSidebar: View {
                             session.address, session.repo ?? "", session.machine ?? ""].joined(separator: " ")
             return tokens.allSatisfy { haystack.localizedCaseInsensitiveContains(String($0)) }
         }
-        let history = sessions.filter(\.deletableLocalHistory)
-        let groups = Dictionary(grouping: sessions.filter { !$0.deletableLocalHistory }, by: \.person)
+        let history = sessions.filter(\.isHistoryOnly)
+        let groups = Dictionary(grouping: sessions.filter { !$0.isHistoryOnly }, by: \.person)
         var rows: [SidebarRow] = []
         let members = model.directory?.machines.filter { device in
             model.directory?.managesNetwork == true && !device.isMe && tokens.allSatisfy {
@@ -899,7 +899,7 @@ private struct ConversationSidebar: View {
                             }
                             .padding(.leading, 13)
                         case .session(let session):
-                            if session.deletableLocalHistory, model.error == nil, let directory = model.directory, let network = directory.networkID {
+                            if session.canClearLocalHistory, model.error == nil, let directory = model.directory, let network = directory.networkID {
                                 peerButton(session).contextMenu {
                                     Button(L10n.text("删除本机聊天记录"), role: .destructive) {
                                         historyDeletion = HistoryDeletion(network: network, team: directory.team ?? network,
@@ -916,7 +916,7 @@ private struct ConversationSidebar: View {
             }
             .mask { ScrollEdgeMask(edge: .bottom) }
             .accessibilityLabel(L10n.text("会话联系人"))
-            .onChange(of: model.peer?.deletableLocalHistory) { _, isHistory in
+            .onChange(of: model.peer?.isHistoryOnly) { _, isHistory in
                 if isHistory == true { historyExpansion.wrappedValue = true }
             }
             .overlay(alignment: .top) {
@@ -1067,16 +1067,16 @@ private struct ConversationSidebar: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(session.title).lineLimit(1)
-                    if session.deletableLocalHistory {
+                    if session.isHistoryOnly {
                         Text(session.address).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                     } else if session.title != session.name {
                         Text(session.name).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     }
                 }
                 Spacer(minLength: 3)
-                if session.offline && !session.deletableLocalHistory { Text(session.statusText).font(.caption2).foregroundStyle(.secondary) }
+                if session.offline && !session.isHistoryOnly { Text(session.statusText).font(.caption2).foregroundStyle(.secondary) }
             }
-            .padding(.leading, session.deletableLocalHistory ? 18 : 36).padding(.trailing, 5).padding(.vertical, 5)
+            .padding(.leading, session.isHistoryOnly ? 18 : 36).padding(.trailing, 5).padding(.vertical, 5)
             .background(.primary.opacity(selected ? 0.10 : 0), in: RoundedRectangle(cornerRadius: 7))
             .contentShape(Rectangle())
         }.buttonStyle(.plain).help(session.titleHelp)

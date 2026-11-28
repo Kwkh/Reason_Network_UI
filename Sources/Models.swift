@@ -23,7 +23,8 @@ struct NetworkSession: Decodable, Identifiable, Equatable {
     var target: String?
     var clientTitle: String?
     var restriction: LocalThreadRestriction?
-    var deletableLocalHistory = false
+    var canClearLocalHistory = false
+    var isHistoryOnly = false
     var deletedPeerKey: String?
     var overviewID: [String] { [target ?? address, machine ?? ""] }
     var offline: Bool { restriction != nil || status == "offline" }

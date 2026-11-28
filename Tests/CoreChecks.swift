@@ -183,7 +183,7 @@ struct CoreChecks {
         let siblingCopy = Message(id: "peer-copy", at: 10, local: "sibling", peer: "me/local", direction: "out", body: "other side", result: "")
         try cache.insert(siblingCopy, network: "team-a")
         let stalePeer = try await service.snapshot(local: "sibling", peer: "me/local")
-        try expect(stalePeer.conversations.contains { $0.address == "me/local" && $0.deletedPeerKey == key && $0.deletableLocalHistory },
+        try expect(stalePeer.conversations.contains { $0.address == "me/local" && $0.deletedPeerKey == key && $0.isHistoryOnly },
                    "a locally deleted peer has a scoped history action")
         try await model.deleteSenderHistory(network: "team-a", sender: deleted)
         let cleared = try await service.snapshot(local: "local", peer: "peer/remote")
@@ -588,6 +588,33 @@ elif sys.argv[1]=='doctor': print('fixture healthy')
         try reopened.sync(for: local) { backfill += $0 }
         try expect(backfill.map(\.id) == events.map(\.id), "fresh mirror reads records before the former 8 MB cutoff")
         try await checkThreadLifecycle(service: service, engine: engine, catalog: catalog, cache: cache)
+        // Exercise a listed peer with a transcript owned by a different sender.
+        let pair = Message(id: "offline-clear", at: Date().timeIntervalSince1970, local: "sibling", peer: "peer/remote",
+                           direction: "in", body: "clear me", result: "")
+        try cache.insert(pair, network: "team-a")
+        try Data(#"{"status":"offline"}"#.utf8).write(to: metadata)
+        let sidebar = NetworkModel(service: service)
+        sidebar.selectedLocal = pair.local
+        sidebar.selectedPeer = pair.peer
+        await sidebar.refresh()
+        try expect(sidebar.peer?.canClearLocalHistory == true && sidebar.peer?.isHistoryOnly == false,
+                   "listed offline peer offers deletion in its normal group")
+        try Data(#"{"status":"idle"}"#.utf8).write(to: metadata)
+        do {
+            try await service.deleteLocalHistory(network: "team-a", local: pair.local, peer: pair.peer)
+            preconditionFailure("reconnected peer accepted stale deletion")
+        } catch is NetworkError {}
+        try Data(#"{"status":"offline"}"#.utf8).write(to: metadata)
+        try await service.deleteLocalHistory(network: "team-a", local: pair.local, peer: pair.peer)
+        try Data(#"{"status":"idle"}"#.utf8).write(to: metadata)
+        let empty = try await service.snapshot(local: pair.local, peer: pair.peer)
+        try expect(empty.messages.isEmpty && empty.directory.sessions.contains { $0.address == pair.peer && !$0.offline },
+                   "cleared peer returns online without replaying history")
+        try cache.insert(Message(id: "offline-clear-new", at: Date().timeIntervalSince1970 + 1, local: pair.local, peer: pair.peer,
+                                 direction: "in", body: "new", result: ""), network: "team-a")
+        let latest = try await service.snapshot(local: pair.local, peer: pair.peer)
+        try expect(latest.messages.map(\.id) == ["offline-clear-new"], "reconnected peer accepts fresh mail")
+        print("PASS: offline peer deletion, reconnect during confirmation, empty history on reconnect, fresh messages")
         print("PASS: native adapter, read-only inbox, held-message exclusion, conversation isolation, sender identity, literal extraction, partial JSONL, and send cache")
     }
 }

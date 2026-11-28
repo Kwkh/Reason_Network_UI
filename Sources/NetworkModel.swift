@@ -114,8 +114,11 @@ final class NetworkModel: ObservableObject {
         // Show the selected sender's actual remaining history in its place.
         let histories = Dictionary(conversations.map { ($0.address, $0) }, uniquingKeysWith: { first, _ in first })
         return result.compactMap { session in
-            guard session.restriction == .missing, session.person == directory.person else { return session }
-            return histories[session.address]
+            let history = histories[session.address]
+            if session.restriction == .missing, session.person == directory.person { return history }
+            var row = session
+            row.canClearLocalHistory = session.offline && history?.canClearLocalHistory == true
+            return row
         }
     }
     var peer: NetworkSession? { peers.first { $0.address == selectedPeer } }

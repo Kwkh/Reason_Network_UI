@@ -207,6 +207,14 @@ actor ReasonService {
             }
         }
         let registered = Set(try engine.rows("SELECT name FROM sessions").compactMap { $0["name"] })
+        // A device-qualified transcript can have a different address from its live directory row.
+        var activeRoutes = Set<String>()
+        for session in directory.sessions where !session.offline || session.restriction != nil {
+            activeRoutes.insert(session.address)
+            if let target = session.target { activeRoutes.insert(target) }
+            if let machine = session.machine { activeRoutes.insert(session.address + "@" + machine) }
+        }
+        protectedAddresses.formUnion(activeRoutes)
         let previousPeers = conversations.filter { !hiddenAddresses.contains($0) }.map { address in
             let parts = address.split(separator: "/", maxSplits: 1).map(String.init)
             let person = parts.first ?? "", name = parts.last ?? address
@@ -214,13 +222,14 @@ actor ReasonService {
             var history = NetworkSession(address: address, name: name, person: person, agent: "离线", doing: remembered?.activity, status: "offline",
                                   clientTitle: (person == directory.person ? locals.first { $0.name == name }?.doing ?? localTitlesByName[name] : nil) ?? remembered?.title,
                                   restriction: person == directory.person ? restrictions[name] : nil)
-            history.deletableLocalHistory = !unverifiedPeople.contains(person) && directory.isOnlyLocalHistory(address, origins: origins, registered: registered, listed: protectedAddresses)
+            history.isHistoryOnly = !unverifiedPeople.contains(person) && directory.isOnlyLocalHistory(address, origins: origins, registered: registered, listed: protectedAddresses)
             if person == directory.person, restrictions[name] == .missing,
                let key = registrations.first(where: { $0["name"] == name })?["key"],
                !directory.machines.contains(where: { !$0.isMe && $0.person == person }) {
-                history.deletableLocalHistory = true
+                history.isHistoryOnly = true
                 history.deletedPeerKey = key
             }
+            history.canClearLocalHistory = history.isHistoryOnly || (history.restriction == nil && !activeRoutes.contains(address))
             return history
         }
         let page: MessagePage
@@ -255,7 +264,7 @@ actor ReasonService {
         // Refresh immediately before committing. A peer may have rejoined while the alert was open.
         let state = try snapshot(local: local, peer: peer)
         guard state.directory.networkID == network,
-              state.conversations.contains(where: { $0.address == peer && $0.deletableLocalHistory && $0.deletedPeerKey == deletedPeerKey }) else {
+              state.conversations.contains(where: { $0.address == peer && $0.canClearLocalHistory && $0.deletedPeerKey == deletedPeerKey }) else {
             throw NetworkError("会话状态已变化，请刷新后重试。")
         }
         try store().clearHistory(network: network, local: local, peer: peer)

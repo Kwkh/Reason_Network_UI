@@ -209,7 +209,7 @@ struct WorkspaceChecks {
                             [network.id,"engine-history","codex:test","qa/beta",peer,String(Int64(now * 1000)),"engine copy","[]"])
         let before = try await service.snapshot(local: "beta", peer: peer)
         precondition(before.messages.contains { $0.id == "engine-history" })
-        precondition(before.conversations.contains { $0.address == peer && $0.deletableLocalHistory })
+        precondition(before.conversations.contains { $0.address == peer && $0.isHistoryOnly })
         do {
             try await service.deleteLocalHistory(network: network.id, local: "alpha", peer: "qa/beta")
             preconditionFailure("Refused deletion expected for a current member")
