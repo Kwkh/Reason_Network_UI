@@ -17,6 +17,8 @@ permissions:
 jobs:
   backend:
     name: 构建内置后台
+    # 双保险：即使 workflow 因文件变更被分支推送误触发，也只在手动或标签时构建。
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/windows-v')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,10 +47,14 @@ jobs:
     name: 构建 NSIS 安装包
     runs-on: windows-latest
     needs: backend
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/windows-v')
     env:
       # 更新签名密钥：缺失时 build-release.mjs 自动退化为只出普通安装包。
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      # step 级 if 不能直接用 secrets 上下文，先转成 env 再判断。
+      WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -95,7 +101,7 @@ jobs:
         run: node scripts/latest-json.mjs --version "${{ steps.meta.outputs.version }}" --tag "${{ steps.meta.outputs.tag }}"
 
       - name: 签名安装包（配置证书时）
-        if: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' }}
+        if: ${{ env.WINDOWS_CERTIFICATE_BASE64 != '' }}
         shell: pwsh
         env:
           CERT_B64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
