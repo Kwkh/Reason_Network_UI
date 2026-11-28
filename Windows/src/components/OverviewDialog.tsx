@@ -4,6 +4,7 @@ import {
   CheckIcon,
   CopyIcon,
   FolderIcon,
+  GearIcon,
   LaptopIcon,
   LinkIcon,
   PlusIcon,
@@ -25,6 +26,7 @@ interface Props {
     session: { name: string; key: string },
     paused: boolean,
   ) => void;
+  onSetup: () => void;
   onRefresh: () => void;
   onOpenFolder: () => void;
   onCopyInvite: () => void;
@@ -42,6 +44,7 @@ export default function OverviewDialog({
   onJoinWorkspace,
   onCreateWorkspace,
   onSessionParticipation,
+  onSetup,
   onRefresh,
   onOpenFolder,
   onCopyInvite,
@@ -122,6 +125,9 @@ export default function OverviewDialog({
               </button>
               <button type="button" onClick={onOpenFolder}>
                 <FolderIcon size={14} /> 打开数据目录
+              </button>
+              <button type="button" onClick={onSetup}>
+                <GearIcon size={14} /> 环境配置
               </button>
             </div>
 

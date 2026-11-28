@@ -24,6 +24,7 @@ import Composer from "./components/Composer";
 import JoinDialog from "./components/JoinDialog";
 import OverviewDialog from "./components/OverviewDialog";
 import AttachmentPreview from "./components/AttachmentPreview";
+import SetupDialog from "./components/SetupDialog";
 import { splitAddress } from "./lib/format";
 import { draftKey, persistDraft, readDraft, removeDraft } from "./lib/drafts";
 import { ensureNotificationPermission, showIncomingToast } from "./lib/notify";
@@ -87,6 +88,7 @@ export default function App() {
   const [dialog, setDialog] = useState<DialogMode>(null);
   const [dialogScope, setDialogScope] = useState<"primary" | "workspace">("primary");
   const [overviewOpen, setOverviewOpen] = useState(false);
+  const [setupOpen, setSetupOpen] = useState(false);
 
   // 选中的本机会话可能已经离线消失；此时回退到后台给出的默认会话。
   const localStillThere =
@@ -535,6 +537,7 @@ export default function App() {
           onOpenAttachment={(attachment) => void handleOpenAttachment(attachment)}
           onJoin={() => openDialog("join", "primary")}
           onCreate={() => openDialog("create", "primary")}
+          onSetup={() => setSetupOpen(true)}
           onStatus={() => setOverviewOpen(true)}
         />
         <Composer
@@ -582,11 +585,19 @@ export default function App() {
           onSessionParticipation={(session, paused) =>
             void handleSessionParticipation(session, paused)
           }
+          onSetup={() => {
+            setOverviewOpen(false);
+            setSetupOpen(true);
+          }}
           onRefresh={() => void refresh()}
           onOpenFolder={handleOpenFolder}
           onCopyInvite={() => void handleCopyInvite()}
           onClose={() => setOverviewOpen(false)}
         />
+      )}
+
+      {setupOpen && (
+        <SetupDialog snapshot={snapshot} onClose={() => setSetupOpen(false)} />
       )}
 
       {preview && (

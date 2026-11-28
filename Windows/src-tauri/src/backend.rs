@@ -12,7 +12,9 @@ use serde_json::Value;
 use crate::attachments;
 use crate::daemon_ipc;
 use crate::store;
-use crate::types::{AttachmentDraft, NativeEntry, NetworkSummary, SendOutcome, Snapshot};
+use crate::types::{
+    AttachmentDraft, BackendInfo, NativeEntry, NetworkSummary, SendOutcome, Snapshot,
+};
 
 /// 安装包内置的后台路径；由 `setup` 在启动时解析资源目录后写入。
 static BUNDLED_BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -564,6 +566,135 @@ pub async fn network_link(network: Option<String>) -> Result<String, String> {
             .filter(|link| !link.is_empty())
             .map(str::to_string)
             .ok_or_else(|| "后台没有返回邀请链接".to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    result
+}
+
+/// 配置类命令不设置 REASON_NETWORK_NO_SERVICE：是否安装服务由 `--no-service` 决定。
+fn setup_command(bin: &Path, home: &Path) -> Command {
+    let mut command = Command::new(bin);
+    command
+        .env("REASON_NETWORK_HOME", home)
+        .env("REASON_NETWORK_NO_TRAY", "1")
+        .env("REASON_NETWORK_NO_UPDATE", "1");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command
+}
+
+fn run_setup(home: &Path, args: &[&str]) -> Result<String, String> {
+    let bin = backend_binary()?;
+    let output = setup_command(&bin, home)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("启动后台失败：{error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim_end().to_string();
+    if !output.status.success() {
+        let detail = if stderr.trim().is_empty() {
+            stdout
+        } else {
+            stderr
+        };
+        let detail = detail.trim().strip_prefix("Error: ").unwrap_or(detail.trim());
+        return Err(if detail.is_empty() {
+            format!("后台命令失败（{}）", output.status)
+        } else {
+            detail.to_string()
+        });
+    }
+    let mut text = stdout;
+    if !stderr.trim().is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&stderr);
+    }
+    Ok(text)
+}
+
+fn backend_source(path: &Path) -> String {
+    if std::env::var_os("REASON_NETWORK_BIN")
+        .map(PathBuf::from)
+        .as_deref()
+        == Some(path)
+    {
+        return "环境变量".into();
+    }
+    if bundled_binary().as_deref() == Some(path) {
+        return "安装包内置".into();
+    }
+    if let Some(repo) = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+    {
+        if repo.join("Engine").join("Bin").join("reason-network-backend.exe") == path {
+            return "仓库构建".into();
+        }
+    }
+    "PATH".into()
+}
+
+#[tauri::command]
+pub async fn backend_info() -> Result<BackendInfo, String> {
+    let result = tauri::async_runtime::spawn_blocking(|| {
+        let path = backend_binary()?;
+        let output = Command::new(&path)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| format!("无法运行后台：{error}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        Ok(BackendInfo {
+            path: path.to_string_lossy().to_string(),
+            version: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            source: backend_source(&path),
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    result
+}
+
+#[tauri::command]
+pub async fn app_integrations() -> Result<Vec<String>, String> {
+    let result = tauri::async_runtime::spawn_blocking(|| {
+        let home = store::primary_home();
+        let bin = backend_binary()?;
+        let bin_text = bin.to_string_lossy().to_string();
+        // 与 macOS 一致：把后台路径作为可执行文件传给 app-integrations，
+        // 否则它只报到“正在使用”的工具，可能返回空数组。
+        let text = run_setup(&home, &["app-integrations", &bin_text])?;
+        serde_json::from_str::<Vec<String>>(&text)
+            .map_err(|error| format!("解析工具列表失败：{error}（{text}）"))
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    result
+}
+
+#[tauri::command]
+pub async fn setup_preview() -> Result<String, String> {
+    let result = tauri::async_runtime::spawn_blocking(|| {
+        run_setup(&store::primary_home(), &["setup", "--dry-run"])
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    result
+}
+
+#[tauri::command]
+pub async fn setup_configure() -> Result<String, String> {
+    let result = tauri::async_runtime::spawn_blocking(|| {
+        run_setup(&store::primary_home(), &["setup", "--no-service"])
     })
     .await
     .map_err(|error| error.to_string())?;

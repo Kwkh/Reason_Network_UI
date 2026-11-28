@@ -115,6 +115,12 @@ export interface SendOutcome {
   output: string;
 }
 
+export interface BackendInfo {
+  path: string;
+  version: string;
+  source: string;
+}
+
 export interface NativeEntry {
   agent: string;
   id: string;

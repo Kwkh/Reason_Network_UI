@@ -27,12 +27,17 @@ pub fn run() {
         .setup(|app| {
             // 安装包把后台放在可执行文件旁的 backend/ 下；开发构建没有这个目录，
             // 会回落到仓库 Engine/Bin。
+            // debug 构建（tauri dev / cargo build）始终用仓库后台，避免把工具配置
+            // 指向 target\debug 下的临时资源；release/安装包才使用内置后台。
+            #[cfg(not(debug_assertions))]
             let bundled = app
                 .path()
                 .resource_dir()
                 .ok()
                 .map(|dir| dir.join("backend").join("reason-network-backend.exe"))
                 .filter(|path| path.is_file());
+            #[cfg(debug_assertions)]
+            let bundled = None;
             backend::set_bundled_binary(bundled);
 
             // Windows 高 DPI 下初始窗口可能按物理像素创建，导致 WebView 视口偏小。
@@ -60,6 +65,10 @@ pub fn run() {
             backend::create_workspace,
             backend::join_workspace,
             backend::native_catalog,
+            backend::backend_info,
+            backend::app_integrations,
+            backend::setup_preview,
+            backend::setup_configure,
             backend::open_data_folder,
         ])
         .run(tauri::generate_context!())

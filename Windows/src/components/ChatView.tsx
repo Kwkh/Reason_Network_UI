@@ -19,6 +19,7 @@ interface Props {
   onOpenAttachment: (attachment: Attachment) => void;
   onJoin: () => void;
   onCreate: () => void;
+  onSetup: () => void;
   onStatus: () => void;
 }
 
@@ -38,6 +39,7 @@ export default function ChatView({
   onOpenAttachment,
   onJoin,
   onCreate,
+  onSetup,
   onStatus,
 }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
@@ -91,6 +93,9 @@ export default function ChatView({
             </button>
             <button type="button" className="button" onClick={onCreate}>
               新建 Network
+            </button>
+            <button type="button" className="button" onClick={onSetup}>
+              检查环境
             </button>
           </div>
         </div>

@@ -104,6 +104,10 @@ Remove-Item Env:\REASON_NETWORK_HOME, Env:\REASON_NETWORK_LOCAL_PARTICIPATION
 之后在客户端刷新即可切换；主 daemon 按会话 key 把请求分发到各工作区 daemon
 （这一步由 `Engine/windows-workspaces.patch` 在 Windows 上启用）。
 
+环境配置向导：空状态或概览里打开，显示后台路径/版本/来源、`app-integrations`
+结果、Network 与会话状态，并用 `setup --dry-run` 预览写入内容。必须再点一次
+“确认写入”才执行 `setup --no-service`；不会安装服务，也不会未经确认改工具配置。
+
 安装包：基础 `tauri.conf.json` 只保留开发/`cargo check` 需要的配置，内置后台和 NSIS
 钩子在 `tauri.release.conf.json`，由 `npm run tauri:build` 合并。安装包会把后台放进
 资源 `backend\`，运行时优先使用；NSIS 安装/升级/卸载前会结束本机 daemon。未签名、

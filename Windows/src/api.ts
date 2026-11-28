@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AttachmentDraft,
+  BackendInfo,
   NativeEntry,
   NetworkSummary,
   SendOutcome,
@@ -94,6 +95,22 @@ export function joinWorkspace(invite: string, person: string): Promise<NetworkSu
 
 export function nativeCatalog(): Promise<NativeEntry[]> {
   return invoke<NativeEntry[]>("native_catalog");
+}
+
+export function backendInfo(): Promise<BackendInfo> {
+  return invoke<BackendInfo>("backend_info");
+}
+
+export function appIntegrations(): Promise<string[]> {
+  return invoke<string[]>("app_integrations");
+}
+
+export function setupPreview(): Promise<string> {
+  return invoke<string>("setup_preview");
+}
+
+export function setupConfigure(): Promise<string> {
+  return invoke<string>("setup_configure");
 }
 
 export function openDataFolder(network: string | null): Promise<void> {

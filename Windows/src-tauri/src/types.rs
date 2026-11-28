@@ -146,6 +146,16 @@ pub struct SendOutcome {
     pub output: String,
 }
 
+/// 环境配置向导展示的后台信息。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendInfo {
+    pub path: String,
+    pub version: String,
+    /// 环境变量、安装包内置、仓库构建或 PATH。
+    pub source: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeEntry {

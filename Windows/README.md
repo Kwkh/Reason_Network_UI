@@ -60,6 +60,16 @@ Debug 构建也不弹控制台窗口；需要在终端看 Rust 输出时，临�
 ..\Engine\Bin\reason-network-backend.exe setup --no-service
 ```
 
+## 环境配置
+
+空状态的「检查环境」或概览里的「环境配置」打开向导：
+
+- 显示后台路径、版本和来源（环境变量 / 安装包内置 / 仓库构建 / PATH）；
+- 用 `app-integrations <后台>` 列出已接入的 Codex、Claude Code、Gemini CLI、dsh；
+- 显示 Network、本机会话和原生会话目录数量；
+- 用 `setup --dry-run` 展示将要写入的配置，点「配置本机工具…」后还要再点一次
+  「确认写入」才执行 `setup --no-service`。不会安装后台服务，也不会在未经确认时改配置。
+
 ## 打包
 
 ```powershell

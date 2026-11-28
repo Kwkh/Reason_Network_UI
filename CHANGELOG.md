@@ -2,6 +2,7 @@
 
 ## Windows 第二阶段（预览，进行中）
 
+- 环境配置向导：显示后台路径/版本/来源、已接入工具、Network 与会话状态，预览 `setup --dry-run` 的写入内容；需要二次确认后才执行 `setup --no-service`，不会擅自改工具配置或安装服务。
 - 安装包：NSIS 构建会把后台二进制放进 `backend\`，客户端运行时优先使用内置后台；安装/升级/卸载前结束主工作区和各工作区的 daemon。新增手动/标签触发的 `windows-release.yml` 构建并上传安装包。
 - Codex 唤醒兜底：Windows 上用 `uds_windows` 连接 Codex 的 AF_UNIX 控制套接字，`codex queue --resume` 返回 resume 警告时补发 `initialize`/`thread/resume`；失败仍回落到消息排队。
 - 工作区：概览里可以新建或加入独立工作区，自动调用 `enable_workspaces`，用 `workspace-id` 记录团队 id；顶部 Network 菜单可在主工作区和各工作区之间切换。
