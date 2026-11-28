@@ -93,6 +93,10 @@ export function joinWorkspace(invite: string, person: string): Promise<NetworkSu
   return invoke<NetworkSummary>("join_workspace", { invite, person });
 }
 
+export function deleteWorkspace(id: string): Promise<void> {
+  return invoke<void>("delete_workspace", { id });
+}
+
 export function nativeCatalog(): Promise<NativeEntry[]> {
   return invoke<NativeEntry[]>("native_catalog");
 }

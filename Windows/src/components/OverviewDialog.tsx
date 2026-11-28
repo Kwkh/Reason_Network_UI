@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import type { NetworkSummary, Snapshot } from "../types";
 import {
   CheckIcon,
@@ -22,6 +22,7 @@ interface Props {
   onCreate: () => void;
   onJoinWorkspace: () => void;
   onCreateWorkspace: () => void;
+  onDeleteWorkspace: (id: string) => Promise<void>;
   onSessionParticipation: (
     session: { name: string; key: string },
     paused: boolean,
@@ -43,6 +44,7 @@ export default function OverviewDialog({
   onCreate,
   onJoinWorkspace,
   onCreateWorkspace,
+  onDeleteWorkspace,
   onSessionParticipation,
   onSetup,
   onRefresh,
@@ -50,22 +52,119 @@ export default function OverviewDialog({
   onCopyInvite,
   onClose,
 }: Props) {
+  const [confirmId, setConfirmId] = useState<string | null>(null);
+  const [removing, setRemoving] = useState<string | null>(null);
+
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") {
+        if (confirmId) setConfirmId(null);
+        else onClose();
+      }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [onClose]);
+  }, [onClose, confirmId]);
 
-  const own = snapshot?.members.find((member) => member.isMe) ?? null;
-  const joined = Boolean(snapshot?.joined);
+  const confirmDelete = async (item: NetworkSummary) => {
+    setRemoving(item.id);
+    try {
+      await onDeleteWorkspace(item.id);
+      setConfirmId(null);
+    } finally {
+      setRemoving(null);
+    }
+  };
+
+  const own = snapshot?.members.find((member) => member.isMe) ?? null;  const joined = Boolean(snapshot?.joined);
   const onlineSessions = (snapshot?.directory ?? []).filter(
     (session) => session.status !== "offline",
   ).length;
   const onlineDevices = (snapshot?.members ?? []).filter((member) => member.online).length;
   const locals = snapshot?.locals ?? [];
   const paused = snapshot?.pausedSessions ?? [];
+
+  // 工作区列表不依赖“当前 Network 是否已加入”：主工作区没入网时也要能管理独立工作区。
+  const workspaceSection =
+    networks.length > 1 ? (
+      <div className="overview-devices">
+        <h2>工作区</h2>
+        <p className="overview-help">
+          独立工作区可以和当前 Network 同时存在，用上方菜单切换。
+        </p>
+        {networks.map((item) => {
+          const current = item.id === network;
+          return (
+            <div className="device-row" key={item.id}>
+              <FolderIcon size={16} />
+              <div className="device-main">
+                <span className="device-name">{item.name}</span>
+                <span className="device-sub">
+                  {item.primary ? "主工作区" : "独立工作区"}
+                  {current ? " · 当前" : ""}
+                </span>
+              </div>
+              {confirmId === item.id ? (
+                <div className="workspace-actions">
+                  <button
+                    type="button"
+                    className="session-action danger"
+                    disabled={removing !== null}
+                    onClick={() => void confirmDelete(item)}
+                  >
+                    {removing === item.id ? "删除中…" : "确认删除"}
+                  </button>
+                  <button
+                    type="button"
+                    className="session-action"
+                    disabled={removing !== null}
+                    onClick={() => setConfirmId(null)}
+                  >
+                    取消
+                  </button>
+                </div>
+              ) : (
+                <div className="workspace-actions">
+                  {!current && (
+                    <button
+                      type="button"
+                      className="session-action"
+                      disabled={busy}
+                      onClick={() => onSelectNetwork(item.id)}
+                    >
+                      切换
+                    </button>
+                  )}
+                  {!item.primary && (
+                    <button
+                      type="button"
+                      className="session-action"
+                      disabled={busy || removing !== null}
+                      onClick={() => setConfirmId(item.id)}
+                    >
+                      删除
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {confirmId && (
+          <p className="overview-warn">
+            删除会先结束该工作区后台，再删除本机数据库；消息记录无法恢复，主工作区不受影响。
+          </p>
+        )}
+        <div className="overview-actions">
+          <button type="button" onClick={onCreateWorkspace} disabled={busy}>
+            <PlusIcon size={14} /> 新建工作区
+          </button>
+          <button type="button" onClick={onJoinWorkspace} disabled={busy}>
+            <LinkIcon size={14} /> 加入工作区
+          </button>
+        </div>
+      </div>
+    ) : null;
 
   return (
     <div className="overlay" role="presentation" onMouseDown={onClose}>
@@ -139,21 +238,6 @@ export default function OverviewDialog({
               <div className="metric">
                 <strong>{onlineDevices}</strong>
                 <span>在线设备</span>
-              </div>
-            </div>
-
-            <div className="overview-devices">
-              <h2>工作区</h2>
-              <p className="overview-help">
-                独立工作区可以和当前 Network 同时存在，用上方菜单切换。
-              </p>
-              <div className="overview-actions">
-                <button type="button" onClick={onCreateWorkspace} disabled={busy}>
-                  <PlusIcon size={14} /> 新建工作区
-                </button>
-                <button type="button" onClick={onJoinWorkspace} disabled={busy}>
-                  <LinkIcon size={14} /> 加入工作区
-                </button>
               </div>
             </div>
 
@@ -237,6 +321,8 @@ export default function OverviewDialog({
             </div>
           </div>
         )}
+
+        {workspaceSection}
 
         {snapshot?.hint && <p className="overview-hint">{snapshot.hint}</p>}
       </section>

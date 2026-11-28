@@ -63,6 +63,31 @@ pub fn home_for(network: Option<&str>) -> Result<PathBuf, String> {
     }
 }
 
+/// 定位一个可以删除的工作区目录。
+///
+/// 只接受 `workspaces_root()` 的直接子目录：拒绝主工作区、路径分隔符和 `..`，
+/// 并对结果做 canonicalize，避免符号链接或联接点把删除操作带出数据目录。
+pub fn workspace_dir_for(id: &str) -> Result<PathBuf, String> {
+    if id.is_empty() || id == "primary" {
+        return Err("主工作区不能删除。".into());
+    }
+    let dir = home_for(Some(id))?;
+    checked_workspace_dir(&workspaces_root(), &dir)
+}
+
+fn checked_workspace_dir(root: &Path, dir: &Path) -> Result<PathBuf, String> {
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("找不到工作区数据目录：{error}"))?;
+    let canonical = dir
+        .canonicalize()
+        .map_err(|error| format!("找不到工作区目录：{error}"))?;
+    if canonical.parent() != Some(root.as_path()) || !canonical.is_dir() {
+        return Err("工作区路径不在数据目录内，已取消删除。".into());
+    }
+    Ok(canonical)
+}
+
 fn open(home: &Path) -> Result<Connection, String> {
     let path = home.join("network.db");
     if !path.is_file() {
@@ -794,7 +819,39 @@ pub fn snapshot(home: &Path, local: Option<&str>, peer: Option<&str>) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::parse_files;
+    use super::{checked_workspace_dir, parse_files};
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!("rn-store-test-{tag}-{stamp}"));
+        std::fs::create_dir_all(&dir).expect("创建测试目录");
+        dir
+    }
+
+    #[test]
+    fn workspace_must_be_direct_child_of_root() {
+        let root = scratch("root");
+        let child = root.join("workspace");
+        std::fs::create_dir_all(&child).unwrap();
+        assert_eq!(
+            checked_workspace_dir(&root, &child).unwrap(),
+            child.canonicalize().unwrap()
+        );
+
+        // 数据目录本身、嵌套子目录和目录外的路径都不能删。
+        assert!(checked_workspace_dir(&root, &root).is_err());
+        let nested = child.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(checked_workspace_dir(&root, &nested).is_err());
+        let outside = scratch("outside");
+        assert!(checked_workspace_dir(&root, &outside).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
 
     #[test]
     fn incoming_files_object_keeps_directory() {

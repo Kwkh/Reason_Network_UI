@@ -2,6 +2,7 @@
 
 ## Windows 第二阶段（预览，进行中）
 
+- 工作区可以删除：概览的「工作区」里两次确认后，先结束该工作区后台，再删除本机数据库；删除当前工作区会自动切回主工作区，主工作区和其它工作区不受影响。主工作区未入网时也能管理工作区列表。
 - 环境配置向导：显示后台路径/版本/来源、已接入工具、Network 与会话状态，预览 `setup --dry-run` 的写入内容；需要二次确认后才执行 `setup --no-service`，不会擅自改工具配置或安装服务。
 - 安装包：NSIS 构建会把后台二进制放进 `backend\`，客户端运行时优先使用内置后台；安装/升级/卸载前结束主工作区和各工作区的 daemon。新增手动/标签触发的 `windows-release.yml` 构建并上传安装包。
 - Codex 唤醒兜底：Windows 上用 `uds_windows` 连接 Codex 的 AF_UNIX 控制套接字，`codex queue --resume` 返回 resume 警告时补发 `initialize`/`thread/resume`；失败仍回落到消息排队。

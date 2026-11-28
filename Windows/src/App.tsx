@@ -6,6 +6,7 @@ import {
   attachmentText,
   createNetwork,
   createWorkspace,
+  deleteWorkspace,
   inspectAttachments,
   joinNetwork,
   joinWorkspace,
@@ -26,7 +27,7 @@ import OverviewDialog from "./components/OverviewDialog";
 import AttachmentPreview from "./components/AttachmentPreview";
 import SetupDialog from "./components/SetupDialog";
 import { splitAddress } from "./lib/format";
-import { draftKey, persistDraft, readDraft, removeDraft } from "./lib/drafts";
+import { draftKey, persistDraft, readDraft, removeDraft, removeNetworkDrafts } from "./lib/drafts";
 import { ensureNotificationPermission, showIncomingToast } from "./lib/notify";
 
 type DialogMode = "join" | "create" | null;
@@ -512,7 +513,45 @@ export default function App() {
     }
   };
 
+  // 删除独立工作区：后台会先结束该工作区 daemon 再删目录；当前正看着它时切回主工作区。
+  const handleDeleteWorkspace = async (id: string) => {
+    const target = networks.find((item) => item.id === id);
+    const wasCurrent = network === id;
+    setBusy(true);
+    try {
+      if (wasCurrent) {
+        // 先切走：轮询会在每次快照时拉起对应工作区的 daemon，留着会占住数据库。
+        setDraft("");
+        setFiles([]);
+        setNotify(false);
+        setReplyTo(null);
+        setPendingReplyId(null);
+        setPreview(null);
+        setLocal(null);
+        setPeer(null);
+        setSnapshot(null);
+        setNetwork("primary");
+      }
+      await deleteWorkspace(id);
+      await refreshNetworks();
+      if (wasCurrent) {
+        const next = await loadSnapshot("primary", null, null);
+        setSnapshot(next);
+        if (next.selectedLocal) setLocal(next.selectedLocal);
+        setPeer(next.selectedPeer ?? null);
+      }
+      // 等切换 effect 跑完再清理，否则旧草稿可能被重新写回。
+      removeNetworkDrafts(id);
+      setNotice(`已删除工作区：${target?.name ?? id}`);
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const canCompose = Boolean(snapshot?.joined && effectiveLocal && effectivePeer);
+
 
   return (
     <div className="app">
@@ -582,6 +621,7 @@ export default function App() {
             setOverviewOpen(false);
             openDialog("create", "workspace");
           }}
+          onDeleteWorkspace={handleDeleteWorkspace}
           onSessionParticipation={(session, paused) =>
             void handleSessionParticipation(session, paused)
           }

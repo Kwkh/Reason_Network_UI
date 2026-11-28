@@ -64,6 +64,7 @@ pub fn run() {
             backend::enable_workspaces,
             backend::create_workspace,
             backend::join_workspace,
+            backend::delete_workspace,
             backend::native_catalog,
             backend::backend_info,
             backend::app_integrations,

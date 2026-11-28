@@ -1424,6 +1424,45 @@ button:disabled {
   opacity: 0.5;
 }
 
+.session-action.danger {
+  border-color: rgba(214, 64, 69, 0.45);
+  color: #d64045;
+}
+
+.session-action.danger:hover:not(:disabled) {
+  background: rgba(214, 64, 69, 0.12);
+}
+
+.workspace-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+}
+
+.overview-warn {
+  margin: 4px 0 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(214, 64, 69, 0.1);
+  color: #b3393d;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+@media (prefers-color-scheme: dark) {
+  .session-action.danger {
+    color: #ff7b7f;
+    border-color: rgba(255, 123, 127, 0.45);
+  }
+
+  .overview-warn {
+    background: rgba(255, 123, 127, 0.14);
+    color: #ff9a9d;
+  }
+}
+
+
 .overview-help {
   margin: 0 0 2px;
   color: var(--secondary);

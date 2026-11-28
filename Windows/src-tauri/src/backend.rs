@@ -367,6 +367,35 @@ pub async fn join_workspace(invite: String, person: String) -> Result<NetworkSum
     provision_workspace(String::new(), person, Some(invite)).await
 }
 
+/// 删除一个独立工作区：先结束它自己的 daemon（SQLite 被占用时目录删不掉），
+/// 再删掉本机目录。主工作区、`~/.reason` 其它数据和工作区目录之外的内容都不动。
+#[tauri::command]
+pub async fn delete_workspace(id: String) -> Result<(), String> {
+    let dir = store::workspace_dir_for(&id)?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let mut last = String::new();
+        // 客户端的轮询可能在第一次结束 daemon 后马上又把它拉起来，所以重试几次；
+        // 每次重试都重新按 daemon.lock 结束进程。
+        for attempt in 0..10u32 {
+            stop_daemon_process(&dir);
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => return Ok(()),
+                Err(error) => last = error.to_string(),
+            }
+            if attempt >= 3 {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+        Err(format!(
+            "删除工作区失败：{last}。请关闭正在使用该工作区的程序后重试。"
+        ))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[tauri::command]
 pub async fn list_networks() -> Result<Vec<NetworkSummary>, String> {
     let result = tauri::async_runtime::spawn_blocking(store::list_networks)

@@ -79,3 +79,21 @@ export function persistDraft(key: string | null, draft: StoredDraft): void {
     writeDraft(key, draft);
   }
 }
+
+/** 删除工作区后清掉它在 localStorage 里的全部草稿（所有会话）。 */
+export function removeNetworkDrafts(network: string | null): void {
+  const prefix = `${PREFIX}${network ?? "primary"}:`;
+  try {
+    const store = storage();
+    if (!store) return;
+    const keys: string[] = [];
+    for (let index = 0; index < store.length; index += 1) {
+      const key = store.key(index);
+      if (key?.startsWith(prefix)) keys.push(key);
+    }
+    for (const key of keys) store.removeItem(key);
+  } catch {
+    // 忽略：删除工作区本身已成功，残留草稿不影响使用。
+  }
+}
+
