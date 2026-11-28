@@ -70,6 +70,24 @@ Debug 构建也不弹控制台窗口；需要在终端看 Rust 输出时，临�
 - 用 `setup --dry-run` 展示将要写入的配置，点「配置本机工具…」后还要再点一次
   「确认写入」才执行 `setup --no-service`。不会安装后台服务，也不会在未经确认时改配置。
 
+## 真实 Codex 联调
+
+Microsoft Store（MSIX）版 Codex 自带的 CLI 不在 PATH 里，后台的 `find_bin` 不会
+自动发现它。需要唤醒（`resume_queued`）或联调时，把 `REASON_NETWORK_CODEX_BIN`
+指向实际可执行文件：
+
+```powershell
+$codex = Get-ChildItem 'C:\Program Files\WindowsApps' -Directory -Filter 'OpenAI.Codex_*_x64__*' |
+  Sort-Object Name -Descending | Select-Object -First 1 |
+  ForEach-Object { Join-Path $_.FullName 'app\resources\codex.exe' }
+$env:REASON_NETWORK_CODEX_BIN = $codex
+```
+
+`Tests\codex-e2e.ps1` 会在临时目录里搭隔离环境（只复制已登录的 `auth.json`，不改
+真实 Codex 配置），依次验证登录复用、Network 初始化、`setup --no-service` 写入 MCP
+配置、真实线程创建和 `native-session-catalog`，最后打印手工唤醒步骤。先运行
+`& $codex login` 完成登录。
+
 ## 打包
 
 ```powershell
