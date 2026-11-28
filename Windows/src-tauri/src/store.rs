@@ -128,6 +128,7 @@ fn has_column(db: &Connection, table: &str, column: &str) -> bool {
 struct TeamRow {
     id: String,
     name: String,
+    founder: Option<String>,
 }
 
 fn read_team(home: &Path) -> Result<Option<TeamRow>, String> {
@@ -141,17 +142,30 @@ fn read_team(home: &Path) -> Result<Option<TeamRow>, String> {
     }
     let row = db
         .query_row(
-            "SELECT COALESCE(json_extract(value,'$.id'),''),json_extract(value,'$.meta.body.name')
+            "SELECT COALESCE(json_extract(value,'$.id'),''),json_extract(value,'$.meta.body.name'),
+                    json_extract(value,'$.founder')
              FROM kv WHERE key='team'",
             [],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
         .optional()
         .map_err(|e| format!("读取 Network 失败：{e}"))?;
-    Ok(row.map(|(id, name)| TeamRow {
+    Ok(row.map(|(id, name, founder)| TeamRow {
         id,
         name: name.unwrap_or_else(|| "Network".to_string()),
+        founder,
     }))
+}
+
+/// 当前 home 所属的团队 id；未加入时为 None。
+pub fn team_id(home: &Path) -> Result<Option<String>, String> {
+    Ok(read_team(home)?.map(|team| team.id))
 }
 
 fn preview(body: &str) -> String {
@@ -293,9 +307,15 @@ fn read_locals(home: &Path) -> Result<Vec<LocalSession>, String> {
     } else {
         ""
     };
+    // 接收偏好写在 kv 的 `receive-mode:<key>`；没有时退回 sessions.tier。
+    let tier = if has_table(&db, "kv") {
+        "COALESCE((SELECT value FROM kv WHERE key='receive-mode:'||s.key), s.tier)"
+    } else {
+        "s.tier"
+    };
     let sql = format!(
-        "SELECT name,key,agent,cwd,repo,branch,doing,tier,last_seen FROM sessions
-         WHERE attached=1 AND key NOT LIKE 'proc:%'{paused} ORDER BY last_seen DESC"
+        "SELECT s.name,s.key,s.agent,s.cwd,s.repo,s.branch,s.doing,{tier},s.last_seen FROM sessions s
+         WHERE s.attached=1 AND s.key NOT LIKE 'proc:%'{paused} ORDER BY s.last_seen DESC"
     );
     let mut stmt = db.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
@@ -700,6 +720,7 @@ pub fn snapshot(home: &Path, local: Option<&str>, peer: Option<&str>) -> Result<
             joined: false,
             network_id: None,
             network_name: None,
+            is_founder: false,
             person: String::new(),
             machine: String::new(),
             members: Vec::new(),
@@ -717,6 +738,11 @@ pub fn snapshot(home: &Path, local: Option<&str>, peer: Option<&str>) -> Result<
 
     // 后台失败时仍然展示只读历史。
     let mut hint = None;
+    let endpoint = team_json
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("endpoint").and_then(Value::as_str));
+    let is_founder = team.founder.is_some() && team.founder.as_deref() == endpoint;
     let (person, machine, members) = match team_json {
         Ok(value) => (
             value
@@ -805,6 +831,7 @@ pub fn snapshot(home: &Path, local: Option<&str>, peer: Option<&str>) -> Result<
         joined: true,
         network_id: Some(team.id),
         network_name: Some(team.name),
+        is_founder,
         person,
         machine,
         members,

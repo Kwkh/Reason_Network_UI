@@ -8,19 +8,34 @@ import {
   createNetwork,
   createWorkspace,
   deleteWorkspace,
+  dissolveNetwork,
   inspectAttachments,
+  inviteCode,
   joinNetwork,
   joinSessionNetwork,
   joinWorkspace,
+  leaveNetwork,
   listNetworks,
   loadSnapshot,
   networkLink,
   openDataFolder,
+  removeDevice,
   saveAttachment,
   sendMessage,
+  setReceiveMode,
   setSessionParticipation,
+  setSessionsParticipation,
 } from "./api";
-import type { Attachment, AttachmentDraft, ChatMessage, LocalSession, NetworkSummary, Snapshot } from "./types";
+import type {
+  Attachment,
+  AttachmentDraft,
+  ChatMessage,
+  LocalSession,
+  Member,
+  NetworkSummary,
+  ReceiveMode,
+  Snapshot,
+} from "./types";
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import Composer from "./components/Composer";
@@ -29,7 +44,7 @@ import OverviewDialog from "./components/OverviewDialog";
 import AttachmentPreview from "./components/AttachmentPreview";
 import SetupDialog from "./components/SetupDialog";
 import UpdateDialog from "./components/UpdateDialog";
-import { splitAddress } from "./lib/format";
+import { splitAddress, receiveModeLabel } from "./lib/format";
 import { draftKey, persistDraft, readDraft, removeDraft, removeNetworkDrafts } from "./lib/drafts";
 import { ensureNotificationPermission, showIncomingToast } from "./lib/notify";
 import { findUpdate, installUpdate, type AvailableUpdate } from "./lib/updater";
@@ -595,6 +610,112 @@ export default function App() {
     }
   };
 
+  // 退出/解散后重新选择仍已加入的 Network，并加载它的快照。
+  const reloadAfterExit = async () => {
+    setLocal(null);
+    setPeer(null);
+    setPreview(null);
+    setSnapshot(null);
+    const items = await listNetworks();
+    setNetworks(items);
+    const next = items.find((item) => item.joined)?.id ?? items[0]?.id ?? null;
+    setNetwork(next);
+    if (!next) return;
+    const nextSnapshot = await loadSnapshot(next, null, null);
+    setSnapshot(nextSnapshot);
+    if (nextSnapshot.selectedLocal) setLocal(nextSnapshot.selectedLocal);
+    setPeer(nextSnapshot.selectedPeer ?? null);
+  };
+
+  const handleInviteCode = async () => {
+    setBusy(true);
+    try {
+      const code = await inviteCode(network);
+      await copyText(code);
+      setNotice(`一次性邀请码已复制：${code}`);
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleLeaveNetwork = async () => {
+    setBusy(true);
+    try {
+      await leaveNetwork(network, false);
+      await reloadAfterExit();
+      setNotice("已退出 Network");
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDissolveNetwork = async () => {
+    setBusy(true);
+    try {
+      await dissolveNetwork(network);
+      await reloadAfterExit();
+      setNotice("Network 已解散");
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRemoveDevice = async (member: Member) => {
+    setBusy(true);
+    try {
+      await removeDevice(network, member.endpoint);
+      setNotice(`已移除设备：${member.machine}`);
+      await refresh();
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleReceiveMode = async (session: LocalSession, mode: ReceiveMode) => {
+    setBusy(true);
+    try {
+      await setReceiveMode(network, session.key, mode);
+      setNotice(`${session.name} 已设为${receiveModeLabel(mode)}`);
+      await refresh();
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleAllParticipation = async (paused: boolean) => {
+    const keys = (paused ? snapshot?.locals ?? [] : snapshot?.pausedSessions ?? []).map(
+      (session) => session.key,
+    );
+    if (keys.length === 0) return;
+    setBusy(true);
+    try {
+      const result = await setSessionsParticipation(network, keys, paused);
+      const verb = paused ? "暂停" : "恢复";
+      if (result.failures.length === 0) {
+        setNotice(`已${verb} ${result.changed} 个会话`);
+      } else {
+        setError(
+          `已${verb} ${result.changed} 个会话，${result.failures.length} 个失败：${result.failures[0].error}`,
+        );
+      }
+      await refresh();
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleCheckUpdate = async () => {
     setBusy(true);
     try {
@@ -710,6 +831,12 @@ export default function App() {
             void handleSessionParticipation(session, paused)
           }
           onJoinSession={(session, target) => handleJoinSession(session, target)}
+          onInviteCode={() => void handleInviteCode()}
+          onLeaveNetwork={() => void handleLeaveNetwork()}
+          onDissolveNetwork={() => void handleDissolveNetwork()}
+          onRemoveDevice={(member) => void handleRemoveDevice(member)}
+          onReceiveMode={(session, mode) => void handleReceiveMode(session, mode)}
+          onAllParticipation={(paused) => void handleAllParticipation(paused)}
           onSetup={() => {
             setOverviewOpen(false);
             setSetupOpen(true);

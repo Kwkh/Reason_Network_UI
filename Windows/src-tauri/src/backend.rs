@@ -3,9 +3,11 @@
 //! 客户端不自己实现命名管道协议：所有收发、入网、目录都走后台 CLI，
 //! 与 macOS 客户端使用同一条命令路径，历史消息则只读引擎数据库。
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -13,7 +15,8 @@ use crate::attachments;
 use crate::daemon_ipc;
 use crate::store;
 use crate::types::{
-    AttachmentDraft, BackendInfo, JoinResult, NativeEntry, NetworkSummary, SendOutcome, Snapshot,
+    AttachmentDraft, BackendInfo, JoinResult, NativeEntry, NetworkSummary, ParticipationBatch,
+    ParticipationFailure, SendOutcome, Snapshot,
 };
 
 /// 安装包内置的后台路径；由 `setup` 在启动时解析资源目录后写入。
@@ -150,8 +153,43 @@ pub fn run_cli_with_input(
     check_output(output)
 }
 
-pub fn run_json(home: &Path, args: &[&str]) -> Result<Value, String> {
-    let bin = backend_binary()?;
+/// 带超时的 CLI 调用：`leave` 需要等在线的队友确认，不能无限阻塞界面。
+fn run_cli_timeout(bin: &Path, home: &Path, args: &[&str], limit: Duration) -> Result<Output, String> {
+    let mut child = backend_command(bin, home, args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("启动后台失败：{error}"))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait().map_err(|error| error.to_string())? {
+            Some(status) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = out.read_to_end(&mut stdout);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = err.read_to_end(&mut stderr);
+                }
+                return check_output(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            None if started.elapsed() >= limit => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("后台操作超时，请检查网络后重试。".into());
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+pub fn run_json(home: &Path, args: &[&str]) -> Result<Value, String> {    let bin = backend_binary()?;
     let output = run_cli(&bin, home, args)?;
     serde_json::from_slice(&output.stdout).map_err(|error| format!("解析后台 JSON 失败：{error}"))
 }
@@ -482,6 +520,167 @@ pub async fn join_session_network(
             .to_string(),
         online: value.get("online").and_then(Value::as_bool).unwrap_or(false),
     })
+}
+
+fn friendly_admin_error(error: String) -> String {
+    let text = error.trim().trim_start_matches("Error: ");
+    if text.contains("founder") && (text.contains("only") || text.contains("not")) {
+        "只有 Network 创建者可以执行这个操作。".into()
+    } else if text.contains("no teammate is online") {
+        "当前没有在线队友可以接收退出通知；等队友上线后再试。".into()
+    } else if text.contains("not in a team") || text.contains("No Network") {
+        "这台机器还没有加入这个 Network。".into()
+    } else {
+        format!("操作失败：{text}")
+    }
+}
+
+/// 一次性邀请码（四词代码，默认 24 小时有效）。
+#[tauri::command]
+pub async fn invite_code(network: Option<String>) -> Result<String, String> {
+    let home = store::home_for(network.as_deref())?;
+    if store::team_id(&home)?.is_none() {
+        return Err("这台机器还没有加入这个 Network。".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let bin = backend_binary()?;
+        let output = run_cli(&bin, &home, &["invite", "--code"])?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        let code = text
+            .lines()
+            .find_map(|line| line.split_once("code for a teammate:").map(|(_, rest)| rest.trim()))
+            .filter(|code| !code.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| text.trim().to_string());
+        if code.is_empty() {
+            return Err("后台没有返回邀请码。".into());
+        }
+        Ok(code)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 退出当前 Network（工作区或主工作区）。没有在线队友时后台会拒绝，可等队友上线。
+#[tauri::command]
+pub async fn leave_network(network: Option<String>, force: bool) -> Result<(), String> {
+    let home = store::home_for(network.as_deref())?;
+    if store::team_id(&home)?.is_none() {
+        return Err("这台机器还没有加入这个 Network。".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let bin = backend_binary()?;
+        let args: &[&str] = if force { &["leave", "--force"] } else { &["leave"] };
+        run_cli_timeout(&bin, &home, args, Duration::from_secs(45)).map_err(friendly_admin_error)?;
+        if store::team_id(&home)?.is_some() {
+            return Err("后台还没有确认退出，请刷新后重试。".into());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 解散 Network（仅创建者）。等 daemon 清掉本地团队状态后再返回。
+#[tauri::command]
+pub async fn dissolve_network(network: Option<String>) -> Result<(), String> {
+    let home = store::home_for(network.as_deref())?;
+    let team = store::team_id(&home)?.ok_or_else(|| "这台机器还没有加入这个 Network。".to_string())?;
+    ensure_daemon(home.clone()).await?;
+    daemon_ipc::request(
+        &home,
+        serde_json::json!({ "op": "dissolve_network", "network": team }),
+    )
+    .await
+    .map_err(friendly_admin_error)?;
+    for _ in 0..40 {
+        if store::team_id(&home)?.is_none() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Err("后台还没有确认解散，请刷新后重试。".into())
+}
+
+/// 移除一台设备（仅创建者）。
+#[tauri::command]
+pub async fn remove_device(network: Option<String>, endpoint: String) -> Result<(), String> {
+    let endpoint = endpoint.trim().to_string();
+    if endpoint.is_empty() {
+        return Err("设备标识为空。".into());
+    }
+    let home = store::home_for(network.as_deref())?;
+    let team = store::team_id(&home)?.ok_or_else(|| "这台机器还没有加入这个 Network。".to_string())?;
+    ensure_daemon(home.clone()).await?;
+    daemon_ipc::request(
+        &home,
+        serde_json::json!({ "op": "remove_device", "network": team, "endpoint": endpoint }),
+    )
+    .await
+    .map_err(friendly_admin_error)?;
+    Ok(())
+}
+
+/// 设置本机会话的接收模式：push（即时推送）/ turn（回合接收）/ pull（手动收件）。
+#[tauri::command]
+pub async fn set_receive_mode(
+    network: Option<String>,
+    key: String,
+    mode: String,
+) -> Result<(), String> {
+    if !matches!(mode.as_str(), "push" | "turn" | "pull") {
+        return Err("接收模式不合法。".into());
+    }
+    let home = store::home_for(network.as_deref())?;
+    let team = store::team_id(&home)?.ok_or_else(|| "这台机器还没有加入这个 Network。".to_string())?;
+    ensure_daemon(home.clone()).await?;
+    daemon_ipc::request(
+        &home,
+        serde_json::json!({ "op": "set_receive_mode", "key": key, "network": team, "mode": mode }),
+    )
+    .await
+    .map_err(|error| {
+        let text = error.trim().trim_start_matches("Error: ");
+        if text.contains("该会话不支持此接收模式") {
+            "这个会话不支持所选的接收模式。".into()
+        } else if text.contains("尚未建立回合接收通道") {
+            "这个会话还没有可用的回合接收通道，请先让它在工具里运行一个回合。".into()
+        } else {
+            format!("设置接收模式失败：{text}")
+        }
+    })?;
+    Ok(())
+}
+
+/// 批量暂停或恢复本机会话，逐项返回失败原因。
+#[tauri::command]
+pub async fn set_sessions_participation(
+    network: Option<String>,
+    keys: Vec<String>,
+    paused: bool,
+) -> Result<ParticipationBatch, String> {
+    let home = store::home_for(network.as_deref())?;
+    if keys.is_empty() {
+        return Ok(ParticipationBatch {
+            changed: 0,
+            failures: Vec::new(),
+        });
+    }
+    ensure_daemon(home.clone()).await?;
+    let mut changed = 0usize;
+    let mut failures = Vec::new();
+    for key in keys {
+        let result = daemon_ipc::request(
+            &home,
+            serde_json::json!({ "op": "set_session_participation", "key": key, "paused": paused }),
+        )
+        .await;
+        match result {
+            Ok(_) => changed += 1,
+            Err(error) => failures.push(ParticipationFailure { key, error }),
+        }
+    }
+    Ok(ParticipationBatch { changed, failures })
 }
 
 #[tauri::command]

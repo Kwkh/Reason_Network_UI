@@ -107,6 +107,8 @@ export interface Snapshot {
   joined: boolean;
   networkId: string | null;
   networkName: string | null;
+  /** 当前机器是否是 Network 创建者（决定能否解散、移除设备）。 */
+  isFounder: boolean;
   person: string;
   machine: string;
   members: Member[];
@@ -139,3 +141,12 @@ export interface NativeEntry {
   title: string | null;
   updated: number;
 }
+
+/** 批量暂停/恢复的结果。 */
+export interface ParticipationBatch {
+  changed: number;
+  failures: { key: string; error: string }[];
+}
+
+/** 本机会话的接收模式。 */
+export type ReceiveMode = "push" | "turn" | "pull";

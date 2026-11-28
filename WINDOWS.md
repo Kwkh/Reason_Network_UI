@@ -108,6 +108,10 @@ Remove-Item Env:\REASON_NETWORK_HOME, Env:\REASON_NETWORK_LOCAL_PARTICIPATION
 结果、Network 与会话状态，并用 `setup --dry-run` 预览写入内容。必须再点一次
 “确认写入”才执行 `setup --no-service`；不会安装服务，也不会未经确认改工具配置。
 
+概览还提供 Network 管理（一次性邀请码、退出 Network、创建者解散 Network 与移除设备，
+危险操作都有二次确认）和本机会话管理（Codex 接收模式：即时推送 / 回合接收 / 手动收件，
+以及全部暂停 / 全部恢复）。
+
 安装包：基础 `tauri.conf.json` 只保留开发/`cargo check` 需要的配置，内置后台和 NSIS
 钩子在 `tauri.release.conf.json`，由 `npm run tauri:build` 合并。安装包会把后台放进
 资源 `backend\`，运行时优先使用；NSIS 安装/升级/卸载前会结束本机 daemon。CI 的

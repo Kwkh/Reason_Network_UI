@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import type { LocalSession, NetworkSummary, Snapshot } from "../types";
+import type { LocalSession, Member, NetworkSummary, ReceiveMode, Snapshot } from "../types";
+import { receiveModeLabel } from "../lib/format";
 import {
   CheckIcon,
   CopyIcon,
@@ -28,6 +29,12 @@ interface Props {
     paused: boolean,
   ) => void;
   onJoinSession: (session: LocalSession, target: string) => Promise<void>;
+  onInviteCode: () => void;
+  onLeaveNetwork: () => void;
+  onDissolveNetwork: () => void;
+  onRemoveDevice: (member: Member) => void;
+  onReceiveMode: (session: LocalSession, mode: ReceiveMode) => void;
+  onAllParticipation: (paused: boolean) => void;
   onSetup: () => void;
   onCheckUpdate: () => void;
   onRefresh: () => void;
@@ -49,6 +56,12 @@ export default function OverviewDialog({
   onDeleteWorkspace,
   onSessionParticipation,
   onJoinSession,
+  onInviteCode,
+  onLeaveNetwork,
+  onDissolveNetwork,
+  onRemoveDevice,
+  onReceiveMode,
+  onAllParticipation,
   onSetup,
   onCheckUpdate,
   onRefresh,
@@ -59,17 +72,24 @@ export default function OverviewDialog({
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
   const [joiningKey, setJoiningKey] = useState<string | null>(null);
+  const [adminConfirm, setAdminConfirm] = useState<"leave" | "dissolve" | null>(null);
+  const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
+  const [modeKey, setModeKey] = useState<string | null>(null);
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        if (confirmId) setConfirmId(null);
+        if (adminConfirm) setAdminConfirm(null);
+        else if (confirmRemove) setConfirmRemove(null);
+        else if (modeKey) setModeKey(null);
+        else if (joiningKey) setJoiningKey(null);
+        else if (confirmId) setConfirmId(null);
         else onClose();
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [onClose, confirmId]);
+  }, [onClose, adminConfirm, confirmRemove, modeKey, joiningKey, confirmId]);
 
   const confirmDelete = async (item: NetworkSummary) => {
     setRemoving(item.id);
@@ -260,6 +280,88 @@ export default function OverviewDialog({
             </div>
 
             <div className="overview-devices">
+              <h2>Network 管理</h2>
+              <div className="overview-actions">
+                <button type="button" onClick={onInviteCode} disabled={busy}>
+                  <LinkIcon size={14} /> 一次性邀请码
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAdminConfirm("leave")}
+                  disabled={busy}
+                >
+                  退出 Network…
+                </button>
+                {snapshot?.isFounder && (
+                  <button
+                    type="button"
+                    className="session-action danger"
+                    onClick={() => setAdminConfirm("dissolve")}
+                    disabled={busy}
+                  >
+                    解散 Network…
+                  </button>
+                )}
+              </div>
+              {adminConfirm === "leave" && (
+                <>
+                  <p className="overview-warn">
+                    退出后这台机器会离开当前 Network，本机记录保留；需要至少一位在线队友确认退出。
+                  </p>
+                  <div className="overview-actions">
+                    <button
+                      type="button"
+                      className="session-action danger"
+                      disabled={busy}
+                      onClick={() => {
+                        setAdminConfirm(null);
+                        onLeaveNetwork();
+                      }}
+                    >
+                      确认退出
+                    </button>
+                    <button
+                      type="button"
+                      className="session-action"
+                      disabled={busy}
+                      onClick={() => setAdminConfirm(null)}
+                    >
+                      取消
+                    </button>
+                  </div>
+                </>
+              )}
+              {adminConfirm === "dissolve" && (
+                <>
+                  <p className="overview-warn">
+                    解散后所有设备都会退出，本机和其他成员的记录不可再同步；此操作无法撤销。
+                  </p>
+                  <div className="overview-actions">
+                    <button
+                      type="button"
+                      className="session-action danger"
+                      disabled={busy}
+                      onClick={() => {
+                        setAdminConfirm(null);
+                        onDissolveNetwork();
+                      }}
+                    >
+                      确认解散
+                    </button>
+                    <button
+                      type="button"
+                      className="session-action"
+                      disabled={busy}
+                      onClick={() => setAdminConfirm(null)}
+                    >
+                      取消
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="overview-devices">
               <h2>本机会话接入</h2>
               {locals.length + paused.length === 0 ? (
                 <p className="overview-empty-line">暂无本机会话</p>
@@ -270,14 +372,64 @@ export default function OverviewDialog({
                       可以把原生 agent 会话接入另一个 Network；接入后会话会同时出现在两边。
                     </p>
                   )}
+                  <div className="overview-actions">
+                    {locals.length > 0 && (
+                      <button
+                        type="button"
+                        className="session-action"
+                        disabled={busy}
+                        onClick={() => onAllParticipation(true)}
+                      >
+                        全部暂停
+                      </button>
+                    )}
+                    {paused.length > 0 && (
+                      <button
+                        type="button"
+                        className="session-action"
+                        disabled={busy}
+                        onClick={() => onAllParticipation(false)}
+                      >
+                        全部恢复
+                      </button>
+                    )}
+                  </div>
                   {locals.map((session) => (
                     <div className="device-row" key={session.key}>
                       <TerminalIcon size={16} />
                       <div className="device-main">
                         <span className="device-name">{session.name}</span>
-                        <span className="device-sub">{session.agent} · 接入中</span>
+                        <span className="device-sub">
+                          {session.agent} · 接入中
+                          {session.tier ? ` · ${receiveModeLabel(session.tier)}` : ""}
+                        </span>
                       </div>
-                      {joiningKey === session.key ? (
+                      {modeKey === session.key ? (
+                        <div className="workspace-actions">
+                          {(["push", "turn", "pull"] as ReceiveMode[]).map((mode) => (
+                            <button
+                              key={mode}
+                              type="button"
+                              className="session-action"
+                              disabled={busy || session.tier === mode}
+                              onClick={() => {
+                                setModeKey(null);
+                                onReceiveMode(session, mode);
+                              }}
+                            >
+                              {receiveModeLabel(mode)}
+                            </button>
+                          ))}
+                          <button
+                            type="button"
+                            className="session-action"
+                            disabled={busy}
+                            onClick={() => setModeKey(null)}
+                          >
+                            取消
+                          </button>
+                        </div>
+                      ) : joiningKey === session.key ? (
                         <div className="workspace-actions">
                           {joinTargets.length === 0 ? (
                             <span className="device-sub">没有其它 Network</span>
@@ -308,13 +460,27 @@ export default function OverviewDialog({
                           <button
                             type="button"
                             className="session-action"
+                            disabled={busy}
+                            onClick={() => {
+                              setJoiningKey(null);
+                              setModeKey(session.key);
+                            }}
+                          >
+                            接收…
+                          </button>
+                          <button
+                            type="button"
+                            className="session-action"
                             disabled={busy || joinTargets.length === 0}
                             title={
                               joinTargets.length === 0
                                 ? "没有其它已加入的 Network"
                                 : "接入另一个 Network"
                             }
-                            onClick={() => setJoiningKey(session.key)}
+                            onClick={() => {
+                              setModeKey(null);
+                              setJoiningKey(session.key);
+                            }}
                           >
                             接入 Network…
                           </button>
@@ -368,7 +534,45 @@ export default function OverviewDialog({
                         {member.isMe ? " · 本机" : ""}
                       </span>
                     </div>
-                    <span className="device-state">{member.online ? "在线" : "离线"}</span>
+                    {confirmRemove === member.endpoint ? (
+                      <div className="workspace-actions">
+                        <button
+                          type="button"
+                          className="session-action danger"
+                          disabled={busy}
+                          onClick={() => {
+                            setConfirmRemove(null);
+                            onRemoveDevice(member);
+                          }}
+                        >
+                          确认移除
+                        </button>
+                        <button
+                          type="button"
+                          className="session-action"
+                          disabled={busy}
+                          onClick={() => setConfirmRemove(null)}
+                        >
+                          取消
+                        </button>
+                      </div>
+                    ) : (
+                      <>
+                        <span className="device-state">
+                          {member.online ? "在线" : "离线"}
+                        </span>
+                        {snapshot?.isFounder && !member.isMe && (
+                          <button
+                            type="button"
+                            className="session-action"
+                            disabled={busy}
+                            onClick={() => setConfirmRemove(member.endpoint)}
+                          >
+                            移除…
+                          </button>
+                        )}
+                      </>
+                    )}
                   </div>
                 ))
               )}

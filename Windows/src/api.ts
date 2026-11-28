@@ -5,6 +5,8 @@ import type {
   JoinResult,
   NativeEntry,
   NetworkSummary,
+  ParticipationBatch,
+  ReceiveMode,
   SendOutcome,
   Snapshot,
 } from "./types";
@@ -94,8 +96,39 @@ export function joinSessionNetwork(
   });
 }
 
-export function enableWorkspaces(network: string | null): Promise<void> {
-  return invoke<void>("enable_workspaces", { network });
+export function inviteCode(network: string | null): Promise<string> {
+  return invoke<string>("invite_code", { network });
+}
+
+export function leaveNetwork(network: string | null, force = false): Promise<void> {
+  return invoke<void>("leave_network", { network, force });
+}
+
+export function dissolveNetwork(network: string | null): Promise<void> {
+  return invoke<void>("dissolve_network", { network });
+}
+
+export function removeDevice(network: string | null, endpoint: string): Promise<void> {
+  return invoke<void>("remove_device", { network, endpoint });
+}
+
+export function setReceiveMode(
+  network: string | null,
+  key: string,
+  mode: ReceiveMode,
+): Promise<void> {
+  return invoke<void>("set_receive_mode", { network, key, mode });
+}
+
+export function setSessionsParticipation(
+  network: string | null,
+  keys: string[],
+  paused: boolean,
+): Promise<ParticipationBatch> {
+  return invoke<ParticipationBatch>("set_sessions_participation", { network, keys, paused });
+}
+
+export function enableWorkspaces(network: string | null): Promise<void> {  return invoke<void>("enable_workspaces", { network });
 }
 
 export function createWorkspace(name: string, person: string): Promise<NetworkSummary> {

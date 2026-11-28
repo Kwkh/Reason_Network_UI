@@ -136,6 +136,8 @@ pub struct Snapshot {
     pub joined: bool,
     pub network_id: Option<String>,
     pub network_name: Option<String>,
+    /// 当前机器是否是 Network 创建者（创建者才能解散、移除设备）。
+    pub is_founder: bool,
     pub person: String,
     pub machine: String,
     pub members: Vec<Member>,
@@ -177,4 +179,19 @@ pub struct NativeEntry {
     pub project: Option<String>,
     pub title: Option<String>,
     pub updated: f64,
+}
+
+/// 批量暂停/恢复的结果：成功的数量和失败原因。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParticipationBatch {
+    pub changed: usize,
+    pub failures: Vec<ParticipationFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParticipationFailure {
+    pub key: String,
+    pub error: String,
 }

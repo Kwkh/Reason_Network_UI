@@ -31,8 +31,7 @@ export function withoutMachine(address: string): string {
   return at === -1 ? address : address.slice(0, at);
 }
 
-export function splitAddress(address: string): { person: string; name: string } {
-  const clean = withoutMachine(address);
+export function splitAddress(address: string): { person: string; name: string } {  const clean = withoutMachine(address);
   const slash = clean.lastIndexOf("/");
   if (slash === -1) {
     return { person: "", name: clean };
@@ -88,4 +87,12 @@ export function dayLabel(ms: number): string {
     month: "long",
     day: "numeric",
   });
+}
+
+/** 接收模式的中文名。 */
+export function receiveModeLabel(mode: string): string {
+  if (mode === "push") return "即时推送";
+  if (mode === "turn") return "回合接收";
+  if (mode === "pull") return "手动收件";
+  return mode;
 }
