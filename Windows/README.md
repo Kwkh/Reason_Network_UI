@@ -103,7 +103,8 @@ npm run tauri:build
   `npm run latest-json -- --version <版本> --tag windows-v<版本>` 生成 `latest.json`。
   没有私钥时构建自动退化为只出普通安装包。
 - CI：`windows-release.yml` 上传 `.exe`、`.exe.sig`、`latest.json`，标签触发时创建
-  草稿 Release；`latest.json` 的下载地址按 Release 资产名生成。
+  草稿 Release；`latest.json` 的下载地址按 Release 资产名生成。草稿 Release 不会
+  被 `releases/latest` 命中，检查更新前需要先把 Release 正式发布。
 
 ## 数据与安全
 
