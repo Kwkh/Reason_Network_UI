@@ -29,5 +29,13 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/Kwkh/Reason_Network_UI/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZGNEQyNzRERjc1NDk3RDcKUldUWGwxVDNUU2ROLzdnWklINzhEYjlrZUtzVUt3UU5aWE1LVWQ0MGdHNjNVUVBEOU5PaVdiUHkK"
+    }
   }
 }

@@ -110,11 +110,17 @@ Remove-Item Env:\REASON_NETWORK_HOME, Env:\REASON_NETWORK_LOCAL_PARTICIPATION
 
 安装包：基础 `tauri.conf.json` 只保留开发/`cargo check` 需要的配置，内置后台和 NSIS
 钩子在 `tauri.release.conf.json`，由 `npm run tauri:build` 合并。安装包会把后台放进
-资源 `backend\`，运行时优先使用；NSIS 安装/升级/卸载前会结束本机 daemon。未签名、
-未接自动更新，发布凭据就绪后再补。CI 的 `windows-release.yml` 在手动触发或
-`windows-v*` 标签时构建 NSIS 并上传产物。
+资源 `backend\`，运行时优先使用；NSIS 安装/升级/卸载前会结束本机 daemon。CI 的
+`windows-release.yml` 在手动触发或 `windows-v*` 标签时构建 NSIS，按 Secrets 是否
+配置生成更新签名（`.exe.sig` + `latest.json`）、用 signtool 做 Authenticode 签名，
+并在标签触发时创建草稿 Release。
 
-当前限制：附件只支持 UTF-8 文本（不支持二进制），工作区归档/删除未提供；Mac ↔
+自动更新：客户端内置 `tauri-plugin-updater`，端点指向仓库 Releases 的
+`latest.json`；概览里「检查更新」会显示新版本和说明，二次确认后下载、安装并重启。
+仓库里提交的是开发用公钥（私钥只在 `%USERPROFILE%\.tauri\reason-network-windows.key`），
+正式发布前必须换成正式密钥并更新 `tauri.conf.json` 的 `pubkey`。
+
+当前限制：附件只支持 UTF-8 文本（不支持二进制），工作区归档未提供；Mac ↔
 Windows 的实际验收仍按下方联调清单执行。
 
 ## 实现顺序

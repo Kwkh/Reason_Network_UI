@@ -24,6 +24,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // 安装包把后台放在可执行文件旁的 backend/ 下；开发构建没有这个目录，
             // 会回落到仓库 Engine/Bin。

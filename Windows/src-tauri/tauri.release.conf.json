@@ -4,6 +4,7 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"],
+    "createUpdaterArtifacts": true,
     "resources": {
       "../../Engine/Bin/reason-network-backend.exe": "backend/reason-network-backend.exe",
       "nsis/stop-daemons.ps1": "backend/stop-daemons.ps1"

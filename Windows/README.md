@@ -86,8 +86,24 @@ npm run tauri:build
 先运行 `backend\stop-daemons.ps1`，结束主工作区和各工作区的 daemon，避免占用或
 留在已删除的路径。
 
-当前安装包未签名，也没有接入自动更新：签名需要 Windows 代码签名证书，更新需要
-`tauri-plugin-updater`、密钥和 `latest.json` 托管，凭据就绪后再补。
+当前安装包未做 Authenticode 签名（需要 Windows 代码签名证书，CI 配
+`WINDOWS_CERTIFICATE_BASE64` / `WINDOWS_CERTIFICATE_PASSWORD` 后自动用 signtool
+签名）；未配证书时安装包仍可安装，只是 SmartScreen 会提示未知发布者。
+
+### 自动更新
+
+客户端内置 `tauri-plugin-updater`，检查仓库 Releases 里最新的 `latest.json`；概览的
+「检查更新」在有新版本时显示说明，点击“下载并安装”后由 NSIS 安装器接管并重启。
+
+- 更新密钥：本地用 `npx tauri signer generate -w %USERPROFILE%\.tauri\reason-network-windows.key`
+  生成。仓库只提交公钥（`tauri.conf.json` 的 `plugins.updater.pubkey`），私钥和密码
+  放 CI Secrets：`TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。
+- 当前提交的是开发用公钥，正式发布前必须换正式密钥。
+- 有私钥时 `npm run tauri:build` 生成 `*-setup.exe.sig`；再用
+  `npm run latest-json -- --version <版本> --tag windows-v<版本>` 生成 `latest.json`。
+  没有私钥时构建自动退化为只出普通安装包。
+- CI：`windows-release.yml` 上传 `.exe`、`.exe.sig`、`latest.json`，标签触发时创建
+  草稿 Release；`latest.json` 的下载地址按 Release 资产名生成。
 
 ## 数据与安全
 

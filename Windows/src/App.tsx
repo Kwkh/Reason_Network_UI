@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { onAction } from "@tauri-apps/plugin-notification";
@@ -26,9 +27,11 @@ import JoinDialog from "./components/JoinDialog";
 import OverviewDialog from "./components/OverviewDialog";
 import AttachmentPreview from "./components/AttachmentPreview";
 import SetupDialog from "./components/SetupDialog";
+import UpdateDialog from "./components/UpdateDialog";
 import { splitAddress } from "./lib/format";
 import { draftKey, persistDraft, readDraft, removeDraft, removeNetworkDrafts } from "./lib/drafts";
 import { ensureNotificationPermission, showIncomingToast } from "./lib/notify";
+import { findUpdate, installUpdate, type AvailableUpdate } from "./lib/updater";
 
 type DialogMode = "join" | "create" | null;
 
@@ -59,8 +62,19 @@ function errorText(cause: unknown): string {
   }
 }
 
-function summarize(output: string, fallback: string): string {
-  try {
+/** 更新检查的常见失败换成可操作的中文提示，其余保留原始错误便于排查。 */
+function updateErrorText(cause: unknown): string {
+  const text = errorText(cause);
+  if (/error sending request|timed out|dns error|connection refused/i.test(text)) {
+    return "检查更新失败：无法连接更新服务器，请检查网络后重试。";
+  }
+  if (/valid release JSON|404|not found/i.test(text)) {
+    return "检查更新失败：更新源暂时没有可用的版本信息。";
+  }
+  return `检查更新失败：${text}`;
+}
+
+function summarize(output: string, fallback: string): string {  try {
     const value = JSON.parse(output) as { team_name?: unknown };
     if (typeof value.team_name === "string" && value.team_name) {
       return `${fallback}：${value.team_name}`;
@@ -90,6 +104,20 @@ export default function App() {
   const [dialogScope, setDialogScope] = useState<"primary" | "workspace">("primary");
   const [overviewOpen, setOverviewOpen] = useState(false);
   const [setupOpen, setSetupOpen] = useState(false);
+  const [version, setVersion] = useState("0.1.0");
+  const [updateInfo, setUpdateInfo] = useState<AvailableUpdate | null>(null);
+  const [updateOpen, setUpdateOpen] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [updatePercent, setUpdatePercent] = useState<number | null>(null);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void getVersion()
+      .then(setVersion)
+      .catch(() => {
+        // 读不到版本号时保留打包时的默认值。
+      });
+  }, []);
 
   // 选中的本机会话可能已经离线消失；此时回退到后台给出的默认会话。
   const localStillThere =
@@ -550,6 +578,45 @@ export default function App() {
     }
   };
 
+  const handleCheckUpdate = async () => {
+    setBusy(true);
+    try {
+      const found = await findUpdate();
+      if (!found) {
+        setNotice(`已是最新版本（${version}）`);
+      } else {
+        setUpdateInfo(found);
+        setUpdateError(null);
+        setUpdateOpen(true);
+      }
+    } catch (cause) {
+      setError(updateErrorText(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleInstallUpdate = async () => {
+    if (!updateInfo) return;
+    setInstallingUpdate(true);
+    setUpdatePercent(null);
+    setUpdateError(null);
+    try {
+      await installUpdate(updateInfo.update, setUpdatePercent);
+    } catch (cause) {
+      setUpdateError(errorText(cause));
+      setInstallingUpdate(false);
+    }
+  };
+
+  const closeUpdate = () => {
+    if (installingUpdate) return;
+    setUpdateOpen(false);
+    if (updateInfo) void updateInfo.update.close().catch(() => {});
+    setUpdateInfo(null);
+    setUpdateError(null);
+  };
+
   const canCompose = Boolean(snapshot?.joined && effectiveLocal && effectivePeer);
 
 
@@ -629,6 +696,7 @@ export default function App() {
             setOverviewOpen(false);
             setSetupOpen(true);
           }}
+          onCheckUpdate={() => void handleCheckUpdate()}
           onRefresh={() => void refresh()}
           onOpenFolder={handleOpenFolder}
           onCopyInvite={() => void handleCopyInvite()}
@@ -638,6 +706,19 @@ export default function App() {
 
       {setupOpen && (
         <SetupDialog snapshot={snapshot} onClose={() => setSetupOpen(false)} />
+      )}
+
+      {updateOpen && updateInfo && (
+        <UpdateDialog
+          currentVersion={updateInfo.currentVersion}
+          version={updateInfo.version}
+          notes={updateInfo.body}
+          installing={installingUpdate}
+          percent={updatePercent}
+          error={updateError}
+          onInstall={() => void handleInstallUpdate()}
+          onClose={closeUpdate}
+        />
       )}
 
       {preview && (

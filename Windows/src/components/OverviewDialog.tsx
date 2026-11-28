@@ -28,6 +28,7 @@ interface Props {
     paused: boolean,
   ) => void;
   onSetup: () => void;
+  onCheckUpdate: () => void;
   onRefresh: () => void;
   onOpenFolder: () => void;
   onCopyInvite: () => void;
@@ -47,6 +48,7 @@ export default function OverviewDialog({
   onDeleteWorkspace,
   onSessionParticipation,
   onSetup,
+  onCheckUpdate,
   onRefresh,
   onOpenFolder,
   onCopyInvite,
@@ -228,6 +230,9 @@ export default function OverviewDialog({
               <button type="button" onClick={onSetup}>
                 <GearIcon size={14} /> 环境配置
               </button>
+              <button type="button" onClick={onCheckUpdate} disabled={busy}>
+                <RefreshIcon size={14} /> 检查更新
+              </button>
             </div>
 
             <div className="overview-metrics">
@@ -317,6 +322,9 @@ export default function OverviewDialog({
               </button>
               <button type="button" className="button" onClick={onCreate}>
                 新建 Network
+              </button>
+              <button type="button" className="button" onClick={onCheckUpdate} disabled={busy}>
+                检查更新
               </button>
             </div>
           </div>

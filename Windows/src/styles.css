@@ -1450,6 +1450,60 @@ button:disabled {
   line-height: 1.45;
 }
 
+.update-sheet {
+  max-width: 460px;
+}
+
+.update-versions {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 4px 0 10px;
+}
+
+.update-versions strong {
+  font-size: 17px;
+}
+
+.update-versions span {
+  color: var(--secondary);
+  font-size: 12px;
+}
+
+.update-notes {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--control-bg);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  max-height: 180px;
+  overflow: auto;
+}
+
+.update-progress {
+  margin: 8px 0 4px;
+}
+
+.update-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--control-border);
+  overflow: hidden;
+}
+
+.update-bar span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent, #2f7cf6);
+  transition: width 0.2s ease;
+}
+
+
 @media (prefers-color-scheme: dark) {
   .session-action.danger {
     color: #ff7b7f;
