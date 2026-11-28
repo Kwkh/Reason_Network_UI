@@ -214,22 +214,37 @@ struct SetupView: View {
                 .accessibilityLabel(L10n.text("Network 邀请链接或一次性代码"))
             NetworkPersonField(person: $model.name)
             if model.snapshot.needsBackendUpdate { action(L10n.text("更新兼容后台")) { await model.configure() } }
-            Button(L10n.text("新建 Network")) { creating = true }
+            networkAction(L10n.text("新建 Network")) { creating = true }
                 .sheet(isPresented: $creating) { WorkspaceForm(action: .create, person: model.name, onComplete: completion) }
             if let joinError { Text(joinError.text).font(.callout).foregroundStyle(.red) }
-            action(joining ? L10n.text("正在加入…") : L10n.text("加入 Network")) {
-                joining = true
-                defer { joining = false }
-                do {
-                    try await workspaces.add(name: "", invitation: model.invitation, person: model.name)
-                    model.invitation = ""
-                    await model.check()
-                    completion()
-                } catch { joinError = InterfaceMessage { error.localizedDescription } }
+            networkAction(joining ? L10n.text("正在加入…") : L10n.text("加入 Network")) {
+                Task {
+                    joining = true
+                    defer { joining = false }
+                    do {
+                        try await workspaces.add(name: "", invitation: model.invitation, person: model.name)
+                        model.invitation = ""
+                        await model.check()
+                        completion()
+                    } catch { joinError = InterfaceMessage { error.localizedDescription } }
+                }
             }
                 .disabled(model.invitation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.snapshot.issue != nil)
         }.disabled(model.busy || joining)
     }
+    private func networkAction(_ title: String, perform: @escaping () -> Void) -> some View {
+        Button(action: perform) {
+            ZStack {
+                ForEach(["新建 Network", "加入 Network", "正在加入…"], id: \.self) { key in
+                    Text(L10n.text(key)).hidden().accessibilityHidden(true)
+                }
+                Text(title)
+            }
+        }
+        .buttonStyle(SetupActionStyle())
+        .accessibilityLabel(title)
+    }
+
     private var connected: some View {
         let active = workspaces.current.directory
         let team = active?.team ?? model.snapshot.team

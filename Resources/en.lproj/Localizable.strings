@@ -372,3 +372,5 @@
 "会话已加入。请在原工具中打开该对话，等待上线。" = "The session has joined. Open the conversation in its original tool to bring it online.";
 "删除此会话的本机记录" = "Delete This Session’s Local History";
 "将清除这台 Mac 上「%@」中，会话「%@」与所有联系人的聊天记录。此操作无法撤销。" = "This clears chats with all contacts for this session in “%1$@” on this Mac. Session: “%2$@”. This cannot be undone.";
+
+"无法启动 Codex 命令行工具。" = "Unable to start the Codex CLI.";

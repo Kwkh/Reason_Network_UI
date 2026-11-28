@@ -243,6 +243,30 @@ fi
             time.sleep(.05)
         else:
             raise AssertionError("stale wake warning after successful resume")
+        # Saved Push, manual Pull and an automatic newcomer share the old CLI after restart.
+        assert call("set_receive_mode", key="codex:beta", network=network, mode="pull")["effective"] == "pull"
+        stop()
+        (home / "old-cli").touch()
+        start()
+        hook("alpha")
+        hook("beta")
+        hook("newcomer")
+        assert tiers()["alpha"] == tiers()["newcomer"] == "turn" and tiers()["beta"] == "pull"
+        problem = call("session_participation")["codex_queue_problem"]
+        assert "更新 Codex" in problem
+        assert request("set_receive_mode", key="codex:alpha", network=network, mode="push")["error"] == problem
+        send("legacy hook delivery")
+        mail = hook("alpha", mail=True)
+        assert mail["text"].count("legacy hook delivery") == 1
+        call("delivered", key="codex:alpha", ids=mail["ids"])
+        assert not hook("alpha", mail=True).get("ids") and "legacy hook delivery" not in (home / "pushed").read_text()
+        (home / "old-cli").unlink()
+        stub.touch()  # Detect an in-place CLI upgrade without restarting the daemon.
+        hook("newcomer")
+        assert not call("session_participation")["codex_queue_problem"]
+        assert tiers()["alpha"] == tiers()["newcomer"] == "push" and tiers()["beta"] == "pull"
+        before = "pull"
+        print("PASS: legacy CLI on join and restart, matching diagnostics, one hook delivery, saved modes after upgrade")
         assert mode("pull") == "pull"
         assert not request("set_receive_mode", network="previous", key="codex:alpha", mode="turn")["ok"]
         stop()

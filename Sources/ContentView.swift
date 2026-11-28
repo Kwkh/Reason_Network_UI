@@ -1759,6 +1759,11 @@ struct StatusView: View {
                                     busy: model.changingSession != nil) { mode in
                         Task { await model.changeReceiveMode(mode, local: local, network: network) }
                     }
+                    if local.agent == "codex", let problem = model.directory?.codexQueueProblem {
+                        Text(L10n.text(problem))
+                            .font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 ForEach(model.directory?.machines ?? []) { device in
                     VStack(alignment: .leading, spacing: 7) {

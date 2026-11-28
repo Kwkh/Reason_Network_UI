@@ -72,6 +72,7 @@ struct Device: Decodable, Identifiable, Equatable {
     }
 }
 struct Directory: Decodable, Equatable {
+    var codexQueueProblem: String?
     var managesNetwork: Bool?
     func removableDevices(for person: String) -> [Device] {
         guard managesNetwork == true else { return [] }

@@ -1,0 +1,129 @@
+--- a/src/agent.rs
++++ b/src/agent.rs
+@@ -179,7 +179,7 @@
+ }
+ 
+ /// [`command_for`] for the program at `bin`.
+-fn command_at(bin: &Path) -> std::process::Command {
++pub(crate) fn command_at(bin: &Path) -> std::process::Command {
+     #[cfg(windows)]
+     if bin.extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd"))
+         && let Some(dir) = bin.parent()
+--- a/src/codex.rs
++++ b/src/codex.rs
+@@ -11,6 +11,45 @@
+     path::{Path, PathBuf},
+     sync::{Mutex, OnceLock},
+ };
++
++/// The registered tier is only a candidate until the installed CLI has been probed.
++const UPDATE_CODEX: &str = "当前 Codex 命令行工具不支持按线程投递并唤醒，请更新 Codex。";
++static QUEUE_ERROR: std::sync::RwLock<Option<&'static str>> =
++    std::sync::RwLock::new(Some("正在检查 Codex 推送通道。"));
++
++pub(crate) fn queue_problem() -> Option<&'static str> { *QUEUE_ERROR.read().unwrap() }
++
++pub(crate) async fn check_queue(force: bool) -> Option<&'static str> {
++    use std::time::{Duration, Instant, SystemTime};
++    type Signature = (PathBuf, u64, SystemTime);
++    static LAST: tokio::sync::Mutex<Option<(Option<Signature>, Instant)>> = tokio::sync::Mutex::const_new(None);
++    let mut last = LAST.lock().await;
++    let program = crate::agent::find_bin("codex");
++    let signature = program.as_ref().and_then(|path| {
++        let meta = path.metadata().ok()?;
++        Some((path.clone(), meta.len(), meta.modified().ok()?))
++    });
++    if !force && last.as_ref().is_some_and(|(sig, time)| sig == &signature && time.elapsed() < Duration::from_secs(60)) {
++        return queue_problem();
++    }
++    let problem = if let Some(path) = program {
++        let mut command = tokio::process::Command::from(crate::agent::command_at(&path));
++        match tokio::time::timeout(Duration::from_secs(3), command.args(["queue", "--help"])
++            .stdin(std::process::Stdio::null()).kill_on_drop(true).output()).await {
++            Err(_) => Some("检查 Codex 推送通道超时。"),
++            Ok(Err(_)) => Some("无法启动 Codex 命令行工具。"),
++            Ok(Ok(out)) => {
++                let help = String::from_utf8_lossy(&out.stdout);
++                let supports = ["--thread", "--message", "--resume"].iter().all(|flag|
++                    help.split_whitespace().any(|word| word.trim_matches(|c| matches!(c, '[' | ']' | ',')) == *flag));
++                (!out.status.success() || !supports).then_some(UPDATE_CODEX)
++            }
++        }
++    } else { Some("后台找不到 Codex 命令行工具。") };
++    *last = Some((signature, Instant::now()));
++    *QUEUE_ERROR.write().unwrap() = problem;
++    problem
++}
+ 
+ /// Ask the same CLI used for queueing to connect to its default per-user endpoint.
+ pub(crate) async fn ensure_resume_server() -> anyhow::Result<()> {
+--- a/src/daemon/mod.rs
++++ b/src/daemon/mod.rs
+@@ -60,6 +60,7 @@
+     };
+     let mut listener = ipc::Listener::bind()?;
+     let daemon = Arc::new(Daemon::open()?);
++    crate::codex::check_queue(false).await;
+     if daemon.cfg.debug_log {
+         daemon.known_to_debug_log(daemon.team_state().as_ref());
+         match crate::debuglog::start() {
+@@ -441,6 +442,12 @@
+     }
+ 
+     async fn handle(self: &Arc<Self>, conn: u64, req: Request) -> Result<Value> {
++        if matches!(&req, Request::Register { session, .. } if session.agent == "codex")
++            || matches!(&req, Request::Hook(h) if h.agent == "codex")
++            || matches!(&req, Request::SessionParticipation) {
++            let previous = crate::codex::queue_problem();
++            if previous != crate::codex::check_queue(false).await { self.presence_changed(); }
++        }
+         let operation = match &req {
+             Request::Who { .. } => Some("who"),
+             Request::Send { .. } => Some("send"),
+@@ -474,7 +481,7 @@
+                 let g = self.inner.lock().unwrap();
+                 let pending: Vec<_> = g.live.iter().filter(|(_, l)| l.codex_resume_pending).map(|(key, _)| key).collect();
+                 json!({ "version": 1, "paused": g.paused, "receive_modes": true, "codex_queue_resume": true, "connection_recovery": true, "native_thread_guard": true, "workspaces": true, "agent_session_join": true, "session_join_diagnostics": true, "agent_join_setup": true, "compact_reply_addresses": true, "dsh_presence_recovery": cfg!(target_os = "macos"), "harness_presence": cfg!(target_os = "macos"), "native_titles": true, "native_agent_wake": true, "multi_agent_sessions": true, "departure_notices": true, "admin_network": g.team.as_ref().filter(|t| t.founder == self.key.public()).map(|t| &t.id),
+-                        "resume_pending": pending })
++                        "codex_queue_problem": crate::codex::queue_problem(), "resume_pending": pending })
+             }
+             Request::SetReceiveMode { key, network, mode } => {
+                 json!({ "effective": self.set_receive_mode(&key, &network, mode).await? })
+--- a/src/daemon/sessions.rs
++++ b/src/daemon/sessions.rs
+@@ -45,6 +45,8 @@
+         }
+         if self.reg.agent_session_id.as_deref().is_none_or(str::is_empty) {
+             Some("后台没有收到这个 Codex 对话的线程 ID。")
++        } else if self.reg.agent == "codex" && let Some(problem) = crate::codex::queue_problem() {
++            Some(problem)
+         } else if self.push_failed {
+             Some("这个会话上一次即时投递失败，请在 Codex 中重新打开该对话后再试。")
+         } else if agent::find_bin("codex").is_none() {
+@@ -67,6 +69,7 @@
+                 else if self.reg.tier == Tier::Push { self.hook_mode() }
+                 else { self.reg.tier }
+             }
++            None if self.reg.agent == "codex" && self.reg.tier == Tier::Push && self.push_problem().is_some() => self.hook_mode(),
+             None => self.reg.tier,
+         }
+     }
+@@ -84,15 +87,9 @@
+                 if live.reg.agent != "codex" { bail!("该会话不支持此接收模式。"); }
+                 if live.reg.agent_session_id.as_deref().is_none_or(str::is_empty) { bail!("后台没有收到这个 Codex 对话的线程 ID。"); }
+             }
+-            let cmd = agent::command_for("codex").ok_or_else(|| anyhow!("后台找不到 Codex 命令行工具。"))?;
+-            let mut cmd = tokio::process::Command::from(cmd);
+-            let output = tokio::time::timeout(std::time::Duration::from_secs(3),
+-                cmd.args(["queue", "--help"]).stdin(std::process::Stdio::null()).kill_on_drop(true).output())
+-                .await.map_err(|_| anyhow!("检查 Codex 推送通道超时。"))?
+-                .map_err(|e| anyhow!("无法启动 Codex 检查推送通道：{e}"))?;
+-            let help = String::from_utf8_lossy(&output.stdout);
+-            if !output.status.success() || !help.contains("--thread") || !help.contains("--message") || !help.contains("--resume") {
+-                bail!("当前 Codex 命令行工具不支持按线程投递并唤醒，请更新 Codex。");
++            if let Some(problem) = crate::codex::check_queue(true).await {
++                self.presence_changed();
++                bail!("{problem}");
+             }
+             crate::codex::ensure_resume_server().await?;
+         }

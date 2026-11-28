@@ -16,6 +16,13 @@ SwiftUI 原生消息控制台。界面不使用 WebView，不启动浏览器、H
 
 同时支持 `~/.local/bin/reason-network` 和官方 Reason CLI 的 `~/.reason/bin/reason-network`；配置时保留已有同版本 CLI，并备份原登录服务。App 不创建 UI 专属会话，不迁移旧机器的会话或聊天缓存。dsh 会话首次切换即时推送时，App 会在需要时补装唤醒插件并向后台确认该对话的生效模式。
 
+### Codex 桌面版兼容性
+
+在 macOS 上，Reason Network 默认优先使用 ChatGPT 或 Codex 桌面 App 随附的 Codex CLI。即使终端的 `codex --version` 显示了更新的独立版本，后台也可能仍在使用桌面 App 内置的版本。
+
+- **无法开启即时推送**：唤醒空闲的 Codex 原对话需要内置 CLI 支持 `codex queue --resume`。例如，已实测 `0.163.0-alpha.10.2` 支持排队，但缺少 `--resume`。遇到这种情况，请更新提供该 CLI 的桌面 App，再尝试开启即时推送。仅升级独立 CLI 通常无效。可以用内置 `codex` 的完整路径运行 `queue --help`，检查选项中是否列出 `--resume`。
+- **能收到消息但无法回信**：请在收到消息的原对话中检查 Reason Network 的 MCP 工具 `list_team` 和 `send_message` 是否已加载。回信依赖这些工具；收到来信本身只能证明收信链路可用。
+
 ## 从源码运行
 
 打开 `Reason Network.xcodeproj`，选择共享 Scheme **Reason Network**，Run。工程使用本机临时签名，不需要 Apple Developer 账号；Icon Composer 资源使用 Xcode 26.5 验证。

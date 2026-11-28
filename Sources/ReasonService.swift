@@ -63,7 +63,9 @@ actor ReasonService {
         }
         guard network == expectedNetwork, expectedTeam == nil || expectedTeam == network else { throw NetworkError("Network 正在切换，稍后将重新同步。") }
         directory.networkID = network
-        directory.managesNetwork = (try? participationState().adminNetwork) == network
+        let participation = try? participationState()
+        directory.managesNetwork = participation?.adminNetwork == network
+        directory.codexQueueProblem = participation?.codexQueueProblem
         let cache = try store()
         try selectNetwork(network, in: cache)
         let paused = try pausedKeys(in: engine)
@@ -700,8 +702,9 @@ actor ReasonService {
         let version: Int
         let paused: Set<String>
         let adminNetwork: String?
+        let codexQueueProblem: String?
         let resumePending: Set<String>?
-        enum CodingKeys: String, CodingKey { case adminNetwork = "admin_network", version, paused, resumePending = "resume_pending" }
+        enum CodingKeys: String, CodingKey { case codexQueueProblem = "codex_queue_problem", adminNetwork = "admin_network", version, paused, resumePending = "resume_pending" }
     }
     private func participationState() throws -> ParticipationState {
         let state = try console.decode(["op": "session_participation"], as: ParticipationState.self)
